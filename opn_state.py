@@ -15,6 +15,7 @@ from gmpy2 import mpz
 
 from opn_core import (
     _SIG_FACTORS,
+    MAX_EXP,
     RESONANCE_REUSE_W,
     RESONANCE_NEWF_W,
     RESONANCE_GIANT_W,
@@ -138,12 +139,14 @@ def assign_prime(
     if exp % 2 == 1:
         ns.euler_prime = p
 
-    # ── resonance score ──
-    _update_resonance(ns, st, p, exp)
-
-    ns.priority = _compute_priority(
-        ns.ratio_num, ns.ratio_den, ns.resonance, len(ns.assigned),
-    )
+    # ── resonance score (factor-chain mode only) ──
+    if propagate:
+        _update_resonance(ns, st, p, exp)
+        ns.priority = _compute_priority(
+            ns.ratio_num, ns.ratio_den, ns.resonance, len(ns.assigned),
+        )
+    else:
+        ns.priority = 0.0
 
     if not propagate:
         return ns
@@ -156,10 +159,34 @@ def assign_prime(
             return None                     # contradiction
 
         ns.required_v[q] = ns.required_v.get(q, 0) + e
+
+        # ── valuation contradiction detection ──
+        if q in ns.assigned:
+            # q's exponent in N is already fixed; σ-side cannot demand more
+            if ns.required_v[q] > ns.current_v[q]:
+                return None
+        else:
+            # q not yet assigned: check if σ demand exceeds what N can supply
+            if ns.required_v[q] > _max_possible_valuation(q, ns.euler_prime):
+                return None
+
         if ns.required_v[q] > ns.current_v.get(q, 0):
             _enqueue_pending(ns, q)
 
     return ns
+
+
+def _max_possible_valuation(q: int, euler_prime: int | None) -> int:
+    """Maximum exponent that prime *q* could receive in N."""
+    if q == euler_prime:
+        # Euler prime: largest exponent ≡ 1 (mod 4) ≤ MAX_EXP
+        x = MAX_EXP
+        while x % 4 != 1 and x > 0:
+            x -= 1
+        return max(x, 1)
+    else:
+        # non-Euler: largest even exponent ≤ MAX_EXP
+        return MAX_EXP if MAX_EXP % 2 == 0 else MAX_EXP - 1
 
 
 # ── resonance update ──────────────────────────────────────────

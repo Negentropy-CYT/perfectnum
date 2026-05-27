@@ -11,6 +11,7 @@ Supports two search strategies, selected by the *propagate* flag:
                      resonance score and ratio proximity to 2)
 """
 
+import gmpy2
 import heapq
 import time
 from typing import List, Optional
@@ -48,8 +49,14 @@ def _check_pseudo(st: State) -> bool:
        (r+1)·∏σ(p^a) = 2r·∏p^a.   Sets ``st.pseudo = True`` on match."""
     if len(st.assigned) < 1 or st.ratio_num >= 2 * st.ratio_den:
         return False
+    # threshold: ratio must exceed 1.9 for r to be >= 19
+    if 10 * st.ratio_num < 19 * st.ratio_den:
+        return False
     denom = 2 * st.ratio_den - st.ratio_num
-    if denom <= 0 or st.ratio_num % denom != 0:
+    if denom <= 0:
+        return False
+    # use C-level divisibility check (avoids constructing remainder object)
+    if not gmpy2.is_divisible(st.ratio_num, denom):
         return False
     r = st.ratio_num // denom
     if r <= 1:
@@ -88,8 +95,9 @@ def search_opn(
     """
     n = len(primes)
 
-    # ── precompute σ-factor sets for resonance heuristic ──
-    precompute_sig_factors(primes, max_exp)
+    # ── precompute σ-factor sets (only needed for factor-chain mode) ──
+    if propagate:
+        precompute_sig_factors(primes, max_exp)
 
     # ── init container & stats ──
     use_heap = propagate

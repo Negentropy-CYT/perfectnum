@@ -311,11 +311,14 @@ For each candidate prime *p* with exponent *a*, the σ(p^a) factor set is
 compared against the primes already in N:
 
 $$\begin{aligned}
-\mathrm{reuse} &= \bigl|\Sigma_{\sigma} \cap N\bigr| \qquad\text{(already explained)} \\[2pt]
-\mathrm{newf}  &= \bigl|\Sigma_{\sigma} \setminus N\bigr| \qquad\text{(newly introduced)} \\[4pt]
-\mathrm{resonance} &\mathrel{+}= \mathrm{reuse} \times 1.5 \;-\; \mathrm{newf} \times 0.7 \\
-                 &\quad\;-\; \log_{10}(\mathrm{largest} + 1) \times 0.15
+\mathrm{reuse} &= \bigl|\Sigma_{\sigma} \cap N\bigr| \\[2pt]
+\mathrm{newf}  &= \bigl|\Sigma_{\sigma} \setminus N\bigr| \\[4pt]
+\mathrm{resonance} &\mathrel{+}= \mathrm{reuse} \times 1.5 - \mathrm{newf} \times 0.7 \\
+                 &\qquad - \log_{10}(\mathrm{largest} + 1) \times 0.15
 \end{aligned}$$
+
+where $\Sigma_{\sigma}$ is the set of odd prime factors of $\sigma(p^{a})$, and
+*reuse* / *newf* count how many of them are already in $N$ versus newly introduced.
 
 States with high resonance (σ-factor recycling, characteristic of
 Descartes-type structures) are explored first via a priority heap.

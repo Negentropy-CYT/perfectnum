@@ -90,12 +90,25 @@ def main() -> None:
     found_true   = 0
     found_pseudo = 0
 
+    # ── progress callback (decoupled from search engine) ──
+    def _show_progress(total_states: int, st, elapsed: float) -> None:
+        rate = total_states / elapsed if elapsed > 0 else 0
+        sys.stdout.write(
+            f"\r[Progress] States: {total_states:>12,} | "
+            f"Time: {elapsed:>7.1f}s | Rate: {rate:>8.0f}/s | "
+            f"|f|={len(st.assigned)} "
+            f"ratio={float(st.ratio_num) / float(st.ratio_den):.8f} "
+            f"reson={st.resonance:+.2f}"
+        )
+        sys.stdout.flush()
+
     try:
         for st in search_opn(
             primes, max_factors, max_exp,
             state_holder=state_holder,
             resume_state=resume_state,
             propagate=PROPAGATE,
+            progress_callback=_show_progress,
         ):
             if st.pseudo:
                 found_pseudo += 1

@@ -12,7 +12,6 @@ Supports two search strategies, selected by the *propagate* flag:
 """
 
 import heapq
-import sys
 import time
 from typing import List, Optional
 
@@ -71,6 +70,7 @@ def search_opn(
     resume_state: Optional[dict] = None,
     *,
     propagate: bool = True,
+    progress_callback=None,
 ):
     """Generator that yields ``State`` objects for each candidate found.
 
@@ -79,10 +79,12 @@ def search_opn(
     primes:        sorted list of odd primes constituting the search alphabet.
     max_factors:   maximum number of distinct prime factors in N.
     max_exp:       maximum exponent to consider for any prime.
-    state_holder:  mutable dict updated each iteration for checkpoint saves.
-    resume_state:  dict from a previous checkpoint (or ``None``).
-    propagate:     ``True``  → factor-chain true-OPN search (best-first).
-                   ``False`` → independent-prime pseudo-solution search (DFS).
+    state_holder:      mutable dict updated each iteration for checkpoint saves.
+    resume_state:      dict from a previous checkpoint (or ``None``).
+    propagate:         ``True``  → factor-chain true-OPN search (best-first).
+                       ``False`` → independent-prime pseudo-solution search (DFS).
+    progress_callback: called as ``f(total_states, state, elapsed)`` each
+                       ``PROGRESS_INTERVAL`` iterations, or ``None``.
     """
     n = len(primes)
 
@@ -158,17 +160,8 @@ def search_opn(
             state_holder["elapsed"]       = time.time() - t0
 
         total_states += 1
-        if total_states % PROGRESS_INTERVAL == 0:
-            elapsed = time.time() - t0
-            rate = total_states / elapsed if elapsed > 0 else 0
-            sys.stdout.write(
-                f"\r[Progress] States: {total_states:>12,} | "
-                f"Time: {elapsed:>7.1f}s | Rate: {rate:>8.0f}/s | "
-                f"|f|={len(st.assigned)} "
-                f"ratio={float(st.ratio_num) / float(st.ratio_den):.8f} "
-                f"reson={st.resonance:+.2f}"
-            )
-            sys.stdout.flush()
+        if total_states % PROGRESS_INTERVAL == 0 and progress_callback is not None:
+            progress_callback(total_states, st, time.time() - t0)
 
         # ── true-OPN check ──────────────────────────────────
         if (

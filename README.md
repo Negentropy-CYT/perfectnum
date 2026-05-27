@@ -127,11 +127,7 @@ legacy/
 python legacy/main.py          # runs the original searcher
 ```
 
-An early factor-chain prototype is also retained at the project root:
-
-| file | description |
-|------|-------------|
-| `opn_factor_chain.py` | first factor-chain engine prototype |
+An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_chain.py`.
 
 ---
 

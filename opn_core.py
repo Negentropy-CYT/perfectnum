@@ -21,7 +21,7 @@ SOLUTIONS_FILE   = "solutions_merged.txt"
 MAX_PRIME         = 500
 MAX_FACTORS       = 8
 MAX_EXP           = 4          # 2 = original a_i=1; 6+ for variable exponents
-PROPAGATE         = False      # False = pseudo-solution; True = true OPN
+PROPAGATE         = False     # False = pseudo-solution; True = true OPN
 PROGRESS_INTERVAL = 100_000
 
 # resonance heuristic weights

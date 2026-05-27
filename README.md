@@ -202,9 +202,11 @@ An early factor-chain prototype is also retained at the project root:
 pip install gmpy2
 ```
 
-**Windows note:** gmpy2 wheels are available via `pip`.  If you
-encounter issues, install from [Christoph Gohlke's page](https://www.lfd.uci.edu/~gohlke/pythonlibs/#gmpy2)
-or use `conda install -c conda-forge gmpy2`.
+Or via conda:
+
+```bash
+conda install -c conda-forge gmpy2
+```
 
 ---
 

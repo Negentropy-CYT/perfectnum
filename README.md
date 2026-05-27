@@ -294,8 +294,8 @@ Delete `checkpoint_merged.pkl` to force a fresh start.
 When $p^{a}$ is assigned and $\sigma(p^{a})$ contains factor $q^{e}$, we track
 
 $$\begin{aligned}
-\text{required\_v}[q] &\mathrel{+}= e \qquad &\text{(total $q$-demand from the $\sigma$ side)} \\
-\text{current\_v}[q]  &\mathrel{+}= a_q \qquad &\text{($q$'s exponent in $N$)}
+\mathrm{req}_v[q] &\mathrel{+}= e \qquad &\text{(total $q$-demand from the $\sigma$ side)} \\
+\mathrm{cur}_v[q]  &\mathrel{+}= a_q \qquad &\text{($q$'s exponent in $N$)}
 \end{aligned}$$
 
 If `required_v[q] > current_v[q]`, the prime q is **forced** into the
@@ -314,7 +314,7 @@ $$\begin{aligned}
 \text{reuse} &= \bigl|\sigma\text{-factors} \cap N\bigr| \qquad &\text{(factors already explained)} \\
 \text{newf}  &= \bigl|\sigma\text{-factors} \setminus N\bigr| \qquad &\text{(new primes introduced)} \\[4pt]
 \text{resonance} &\mathrel{+}= \text{reuse} \times 1.5 - \text{newf} \times 0.7 \\
-                 &\qquad - \log_{10}(\text{largest\_new} + 1) \times 0.15
+                 &\qquad - \log_{10}(\mathrm{largest} + 1) \times 0.15
 \end{aligned}$$
 
 States with high resonance (σ-factor recycling, characteristic of
@@ -324,7 +324,7 @@ Descartes-type structures) are explored first via a priority heap.
 
 Before cloning a state to assign p^a, the code checks
 
-$$\sigma(p^{a}) \times \text{current\_num} \;\geq\; 2 \times p^{a} \times \text{current\_den}$$
+$$\sigma(p^{a}) \times \mathrm{num} \;\geq\; 2 \times p^{a} \times \mathrm{den}$$
 
 If true, the new state would be immediately pruned (ratio ≥ 2),
 avoiding the cost of clone + factorisation.

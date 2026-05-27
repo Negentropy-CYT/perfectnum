@@ -311,10 +311,10 @@ For each candidate prime *p* with exponent *a*, the σ(p^a) factor set is
 compared against the primes already in N:
 
 $$\begin{aligned}
-\mathrm{reuse} &= \bigl|\Sigma_{\sigma} \cap N\bigr| \qquad &\text{(factors already explained)} \\
-\mathrm{newf}  &= \bigl|\Sigma_{\sigma} \setminus N\bigr| \qquad &\text{(new primes introduced)} \\[4pt]
-\mathrm{resonance} &\mathrel{+}= \mathrm{reuse} \times 1.5 - \mathrm{newf} \times 0.7 \\
-                 &\qquad - \log_{10}(\mathrm{largest} + 1) \times 0.15
+\mathrm{reuse} &= \bigl|\Sigma_{\sigma} \cap N\bigr| \qquad\text{(already explained)} \\[2pt]
+\mathrm{newf}  &= \bigl|\Sigma_{\sigma} \setminus N\bigr| \qquad\text{(newly introduced)} \\[4pt]
+\mathrm{resonance} &\mathrel{+}= \mathrm{reuse} \times 1.5 \;-\; \mathrm{newf} \times 0.7 \\
+                 &\quad\;-\; \log_{10}(\mathrm{largest} + 1) \times 0.15
 \end{aligned}$$
 
 States with high resonance (σ-factor recycling, characteristic of

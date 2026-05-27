@@ -145,6 +145,65 @@ An early factor-chain prototype is also retained at the project root:
 
 ---
 
+## Comparison: Legacy vs Current Engine
+
+### Search Space
+
+| | Legacy (`legacy/`) | Current (`opn_*.py`) |
+|---|---|---|
+| **Candidate form** | N = r · ∏ p_i² | N = q^{4k+1} · ∏ p_i^{2a_i} |
+| **Exponents** | fixed: all a_i = 1 | variable: a_i ∈ {2, 4, 6, 8, 10} |
+| **Euler prime** | folded into composite r | explicitly tracked (q ≡ 1 mod 4, exp ≡ 1 mod 4) |
+| **Factor coupling** | none — primes are independent | factor chains propagate via σ(p^a) factorisation |
+| **Search strategy** | DFS (stack, fixed order) | DFS for pseudo-solution; best-first heap for true OPN |
+| **Pseudo-solutions** | primary output (composite r) | found in `propagate=False` mode |
+
+### Performance
+
+| | Legacy | Current (DFS mode) | Current (factor chain) |
+|---|---|---|---|
+| **Max rate** | ~1.5M states/s | ~350K states/s | ~140K states/s |
+| **Per-state cost** | O(1) — stack push + mpz multiply | O(1) — same core operations | O(log(d)) — Brent-Rho factorisation of σ(p^a) |
+| **Memory** | ~1 MB (stack only) | ~10 MB (stack + caches) | ~50 MB (heap + factor/sigma/power caches) |
+| **Time to first pseudo-solution** (PRIME=397) | ~7 min | ~7 min | N/A (not applicable) |
+
+### Why the Current Engine Is Slower Per State
+
+1. **Brent Pollard-Rho factorisation** — each σ(p^a) must be fully factorised to
+   propagate factor chains.  The legacy engine never factorises σ values — it only
+   multiplies them into the running product.
+2. **State cloning** — the `State` dataclass carries 10 fields (7 collections);
+   `clone()` deep-copies all of them.  The legacy engine reuses 5-element tuples.
+3. **Resonance computation** — computing σ-factor overlap via set intersections on
+   every `assign_prime` call adds measurable overhead.
+4. **Best-first heap** — `heapq.heappush`/`heappop` are O(log heap_size) vs
+   O(1) stack operations.  With HEAP_MAX_SIZE = 200 000, each push costs ~18
+   comparisons.
+
+### Why the Current Engine Matters Despite the Slowdown
+
+- **The legacy engine cannot search beyond a_i = 1.**  Adding variable exponents
+  requires the factor-chain framework — factorising σ(p^a) is mandatory to
+  determine which new primes are forced into N.
+- **Resonance guidance reduces the state count to the first solution.**  In
+  factor-chain mode, the best-first heap explores high-resonance branches
+  first, often reaching candidates in thousands of states instead of hundreds
+  of millions.
+- **The additive q-adic valuation** provides a correctness guarantee that the
+  legacy `max()` heuristic lacks: tracking Σ v_q(σ(·)) against v_q(N) enables
+  precise contradiction detection.
+
+### When to Use Which
+
+| Goal | Recommended |
+|------|-------------|
+| Find known Descartes-type spoofs quickly | Legacy (`legacy/main.py`) |
+| Explore the full Euler-form search space | Current, `PROPAGATE=True` |
+| Verify results against prior work | Legacy (reference implementation) |
+| Extend to new exponent ranges or factor-chain depth | Current |
+
+---
+
 ## Installation
 
 **Requirements:** Python 3.10+, [gmpy2](https://github.com/aleaxit/gmpy)

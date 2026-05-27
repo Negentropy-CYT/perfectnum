@@ -313,12 +313,12 @@ compared against the primes already in N:
 $$\begin{aligned}
 \mathrm{reuse} &= \bigl|\Sigma_{\sigma} \cap N\bigr| \\[2pt]
 \mathrm{newf}  &= \bigl|\Sigma_{\sigma} \setminus N\bigr| \\[4pt]
-\mathrm{resonance} &\mathrel{+}= \mathrm{reuse} \times 1.5 - \mathrm{newf} \times 0.7 \\
-                 &\qquad - \log_{10}(\mathrm{largest} + 1) \times 0.15
+\Delta\mathrm{res} &= 1.5 \times \mathrm{reuse} \;-\; 0.7 \times \mathrm{newf} \\
+                   &\;-\; 0.15 \times \log_{10}(\mathrm{largest} + 1)
 \end{aligned}$$
 
 where $\Sigma_{\sigma}$ is the set of odd prime factors of $\sigma(p^{a})$, and
-*reuse* / *newf* count how many of them are already in $N$ versus newly introduced.
+$\Delta\mathrm{res}$ is added to the running resonance score.
 
 States with high resonance (σ-factor recycling, characteristic of
 Descartes-type structures) are explored first via a priority heap.

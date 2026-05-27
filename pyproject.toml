@@ -1,0 +1,32 @@
+[project]
+name = "opn-search"
+version = "1.0.0"
+description = "Odd perfect number constraint-propagation search engine"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Chengyuan Tang", email = "chengyuantang37@gmail.com" },
+]
+keywords = [
+    "odd-perfect-number",
+    "number-theory",
+    "descartes-number",
+    "factor-chain",
+    "constraint-propagation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "gmpy2>=2.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Negentropy-CYT/perfectnum"

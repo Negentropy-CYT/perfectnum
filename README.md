@@ -1,0 +1,337 @@
+# opn-search — Odd Perfect Number Constraint Engine
+
+A constraint-propagation factor-chain search engine for exploring
+structured subspaces of odd perfect numbers and Descartes-type
+pseudo-candidates.
+
+```
+N = q^{4k+1} · ∏ p_i^{2a_i}    (Euler form)
+σ(N) = 2N                        (perfect number condition)
+```
+
+---
+
+## Quick Start
+
+```bash
+pip install gmpy2
+python opn_main.py
+```
+
+Default configuration searches for **pseudo-OPN candidates** (composite
+"Euler factor") with primes ≤ 500, up to 8 distinct factors, exponent 2.
+A 12-digit Descartes-type pseudo-candidate is found in ~7 minutes.
+
+---
+
+## Background
+
+### Odd Perfect Numbers
+
+A perfect number *N* satisfies σ(N) = 2N, where σ is the sum-of-divisors
+function.  All known perfect numbers are even (Euclid-Euler form).  Whether
+an **odd** perfect number exists is a millennial open problem.
+
+Euler proved that any odd perfect number must have the form
+
+```
+N = q^{4k+1} · ∏_{i} p_i^{2a_i}
+```
+
+where q ≡ 1 (mod 4) is the *special* (Euler) prime — the only prime
+factor with odd exponent.  All other exponents are even.
+
+### Pseudo-OPN (Descartes-type) Candidates
+
+If we relax the requirement that the "Euler factor" be a single prime
+power and instead allow a composite *r* satisfying
+
+```
+(r+1) · ∏ σ(p_i^{a_i}) = 2r · ∏ p_i^{a_i}
+```
+
+we obtain *spoofs* or *pseudo-candidates*.  The smallest known example,
+due to Descartes, has
+
+```
+N = 3² · 7² · 11² · 13² · 22021     (r = 22021 = 19² · 61)
+```
+
+where 22021 is treated *as if* it were prime — σ(22021) is replaced
+by 22021 + 1 in the perfect-number equation.
+
+This program searches for both true OPN (Euler-prime) candidates **and**
+Descartes-type pseudo-candidates.
+
+### Factor Chains
+
+A key structural constraint exploited by modern OPN research:
+
+```
+p^a | N   ⇒   σ(p^a) | σ(N) = 2N
+           ⇒   every prime factor of σ(p^a) must also divide 2N
+```
+
+Since N is odd, prime factors of σ(p^a) (excluding 2) must themselves
+appear in N.  This creates **forced chains** — including one prime
+forces others.  The search engine propagates these constraints
+additively, tracking q-adic valuations.
+
+---
+
+## Project Structure
+
+```
+opn_main.py        Entry point (configuration + main loop)
+opn_core.py        Arithmetic engine
+                     · prime generation (sieve)
+                     · Brent Pollard-Rho factorisation
+                     · σ(p^a) computation (cached)
+                     · factor / power / sigma caches
+                     · σ-factor-set precomputation
+                     · ratio upper/lower bounds
+                     · all user-configurable constants
+opn_state.py       Search state & constraint propagation
+                     · State dataclass (slots)
+                     · assign_prime() — Euler constraints,
+                       resonance score, additive valuation,
+                       factor-chain propagation
+                     · pending-queue dedup helpers
+opn_search.py      Search engine
+                     · search_opn() — generator yielding candidates
+                     · DFS (stack) for pseudo-solution mode
+                     · best-first (heap) for factor-chain mode
+                     · pending-prime processing
+                     · true-OPN & pseudo-solution checks
+opn_io.py          Display, checkpoint, file I/O
+                     · display_solution()
+                     · factor-chain trace
+                     · atomic pickle checkpoint save/load
+                     · human-readable solutions file
+```
+
+**Dependency graph** (no cycles):
+
+```
+opn_core   ← gmpy2, math, random
+opn_state  ← opn_core
+opn_search ← opn_core + opn_state
+opn_io     ← opn_core + opn_state
+opn_main   ← opn_core + opn_search + opn_io
+```
+
+### Legacy Reference Implementation
+
+The original single-process DFS searcher (a_i = 1, all exponents fixed to 2)
+is preserved under `legacy/` for reproducibility and comparison:
+
+```
+legacy/
+  main.py        entry point (configuration + main loop)
+  core.py        prime generation + trial-division factorisation
+  search.py      search_v4_safe() + verify_solution()
+  io.py          checkpoint save / load
+```
+
+```bash
+python legacy/main.py          # runs the original searcher
+```
+
+An early factor-chain prototype is also retained at the project root:
+
+| file | description |
+|------|-------------|
+| `opn_factor_chain.py` | first factor-chain engine prototype |
+
+---
+
+## Installation
+
+**Requirements:** Python 3.10+, [gmpy2](https://github.com/aleaxit/gmpy)
+
+```bash
+pip install gmpy2
+```
+
+**Windows note:** gmpy2 wheels are available via `pip`.  If you
+encounter issues, install from [Christoph Gohlke's page](https://www.lfd.uci.edu/~gohlke/pythonlibs/#gmpy2)
+or use `conda install -c conda-forge gmpy2`.
+
+---
+
+## Usage
+
+### Basic
+
+```bash
+python opn_main.py
+```
+
+### Configuration
+
+Edit the constants at the top of `opn_core.py` (or override them
+programmatically):
+
+```python
+# opn_core.py
+
+MAX_PRIME   = 500        # largest odd prime considered
+MAX_FACTORS = 8          # max distinct prime factors in N
+MAX_EXP     = 4          # max exponent for any prime
+                         #   2 = a_i=1 restriction
+                         #   6+ = variable exponents
+PROPAGATE   = False      # False → pseudo-solution search
+                         # True  → true-OPN factor-chain search
+```
+
+### Search Modes
+
+| `PROPAGATE` | Strategy | Description |
+|:-----------:|----------|-------------|
+| `False` | DFS (stack) | Independent primes. Finds pseudo-candidates via composite‑r formula. Fast per-state. |
+| `True` | best-first (heap) | Factor-chain propagation. Resonance-guided priority queue. Searches for genuine Euler-prime OPN. |
+
+### Interpreting Output
+
+**Progress line** (updates in-place every ~100K states):
+```
+[Progress] States:  884,300,000 | Time:  582.1s | Rate: 1519000/s | |f|=8 ratio=1.8486 reson=-3.42
+```
+- `|f|` — distinct primes currently assigned
+- `ratio` — current σ(N)/N (target: 2.0)
+- `reson` — resonance heuristic score (higher = more σ-factor reuse)
+
+**Pseudo-candidate:**
+```
+*** Pseudo-OPN Candidate  #1 ***
+  N              = 198585576189
+  r (composite)  = 22021  =  19^2 × 61^1
+  r ≡ 1 mod 4    = True
+  resonance      = +0.87
+  Factors:
+    3^2
+    7^2
+    11^2
+    13^2
+```
+
+**True OPN candidate** (if found — none known to exist):
+```
+*** OPN Candidate  #1 ***
+  N          = ...
+  Euler      = 5
+  σ(N)/N     = 2.000000000000
+  verified   = True
+  Factor chain (from Euler prime 5):
+    σ(5^1) = 6 = 2 × 3
+    σ(3^2) = 13 = 13
+    ...
+```
+
+### Checkpoint / Resume
+
+Press `Ctrl+C` at any time — the search state (including the full
+heap/stack) is atomically saved to `checkpoint_merged.pkl`.  Running
+`python opn_main.py` again will resume from the interruption point.
+
+Delete `checkpoint_merged.pkl` to force a fresh start.
+
+---
+
+## Key Algorithms
+
+### Additive q-adic Valuation
+
+When `p^a` is assigned and σ(p^a) contains factor q^e, we track
+
+```
+required_v[q] += e           (total q-demand from the σ side)
+current_v[q]  += a_q         (q's exponent in N)
+```
+
+If `required_v[q] > current_v[q]`, the prime q is **forced** into the
+pending queue — it must appear in N with sufficient exponent to
+satisfy the valuation balance from σ(N) = 2N.
+
+This additive formulation (summing contributions across all assigned
+primes) replaces the weaker `max()` heuristic used in earlier versions.
+
+### Resonance-Guided Best-First Search
+
+For each candidate prime *p* with exponent *a*, the σ(p^a) factor set is
+compared against the primes already in N:
+
+```
+reuse = |σ-factors ∩ N|          (factors already "explained")
+newf  = |σ-factors \ N|          (new primes introduced)
+
+resonance += reuse × 1.5  -  newf × 0.7  -  log₁₀(largest_new) × 0.15
+```
+
+States with high resonance (σ-factor recycling, characteristic of
+Descartes-type structures) are explored first via a priority heap.
+
+### Early Ratio Pruning
+
+Before cloning a state to assign p^a, the code checks
+
+```
+σ(p^a) × current_num  ≥  2 × p^a × current_den
+```
+
+If true, the new state would be immediately pruned (ratio ≥ 2),
+avoiding the cost of clone + factorisation.
+
+---
+
+## Author
+
+**Chengyuan Tang**  ·  chengyuantang37@gmail.com
+
+> This project was developed with AI-assisted tooling (Claude Code).
+> All algorithms, mathematical derivations, and code architecture were
+> reviewed and validated by the author.
+
+---
+
+## License
+
+MIT License — see [LICENSE](LICENSE) for full text.
+
+Copyright (c) 2025 Chengyuan Tang
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## References
+
+- Descartes, R. (1638).  Letter to Mersenne (manuscript).  The number
+  198585576189 = 3²·7²·11²·13²·22021 would be perfect if 22021 were
+  prime.  Reproduced in *Oeuvres de Descartes*, Vol. II.
+- Nielsen, P. P. (2007).  *Odd perfect numbers have at least nine
+  distinct prime factors*.  Math. Comp. 76, 2109–2126.
+  doi:[10.1090/S0025-5718-07-01990-4](https://doi.org/10.1090/S0025-5718-07-01990-4)
+- Ochem, P. & Rao, M. (2012).  *Odd perfect numbers are greater than
+  10^1500*.  Math. Comp. 81, 1869–1877.
+  doi:[10.1090/S0025-5718-2012-02563-4](https://doi.org/10.1090/S0025-5718-2012-02563-4)
+- Touchard, J. (1953).  *On prime numbers and perfect numbers*.
+  Scripta Math. 19, 35–39.

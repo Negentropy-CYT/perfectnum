@@ -4,10 +4,8 @@ A constraint-propagation factor-chain search engine for exploring
 structured subspaces of odd perfect numbers and Descartes-type
 pseudo-candidates.
 
-```
-N = q^{4k+1} · ∏ p_i^{2a_i}    (Euler form)
-σ(N) = 2N                        (perfect number condition)
-```
+$$N = q^{4k+1} \prod p_i^{2a_i} \qquad\text{(Euler form)}$$
+$$\sigma(N) = 2N \qquad\text{(perfect number condition)}$$
 
 ---
 
@@ -34,28 +32,22 @@ an **odd** perfect number exists is a millennial open problem.
 
 Euler proved that any odd perfect number must have the form
 
-```
-N = q^{4k+1} · ∏_{i} p_i^{2a_i}
-```
+$$N = q^{4k+1} \prod_{i} p_i^{2a_i}$$
 
-where q ≡ 1 (mod 4) is the *special* (Euler) prime — the only prime
-factor with odd exponent.  All other exponents are even.
+where $q \equiv 1 \pmod{4}$ is the *special* (Euler) prime — the only
+prime factor with odd exponent.  All other exponents are even.
 
 ### Pseudo-OPN (Descartes-type) Candidates
 
 If we relax the requirement that the "Euler factor" be a single prime
 power and instead allow a composite *r* satisfying
 
-```
-(r+1) · ∏ σ(p_i^{a_i}) = 2r · ∏ p_i^{a_i}
-```
+$$(r+1) \prod \sigma\!\left(p_i^{a_i}\right) = 2r \prod p_i^{a_i}$$
 
 we obtain *spoofs* or *pseudo-candidates*.  The smallest known example,
 due to Descartes, has
 
-```
-N = 3² · 7² · 11² · 13² · 22021     (r = 22021 = 19² · 61)
-```
+$$N = 3^{2} \cdot 7^{2} \cdot 11^{2} \cdot 13^{2} \cdot 22021 \qquad (r = 22021 = 19^{2} \cdot 61)$$
 
 where 22021 is treated *as if* it were prime — σ(22021) is replaced
 by 22021 + 1 in the perfect-number equation.
@@ -67,10 +59,8 @@ Descartes-type pseudo-candidates.
 
 A key structural constraint exploited by modern OPN research:
 
-```
-p^a | N   ⇒   σ(p^a) | σ(N) = 2N
-           ⇒   every prime factor of σ(p^a) must also divide 2N
-```
+$$p^{a} \mid N \;\Longrightarrow\; \sigma(p^{a}) \mid \sigma(N) = 2N$$
+$$\Longrightarrow\; \text{every prime factor of }\sigma(p^{a})\text{ must also divide }2N$$
 
 Since N is odd, prime factors of σ(p^a) (excluding 2) must themselves
 appear in N.  This creates **forced chains** — including one prime
@@ -151,47 +141,47 @@ An early factor-chain prototype is also retained at the project root:
 
 | | Legacy (`legacy/`) | Current (`opn_*.py`) |
 |---|---|---|
-| **Candidate form** | N = r · ∏ p_i² | N = q^{4k+1} · ∏ p_i^{2a_i} |
-| **Exponents** | fixed: all a_i = 1 | variable: a_i ∈ {2, 4, 6, 8, 10} |
-| **Euler prime** | folded into composite r | explicitly tracked (q ≡ 1 mod 4, exp ≡ 1 mod 4) |
-| **Factor coupling** | none — primes are independent | factor chains propagate via σ(p^a) factorisation |
+| **Candidate form** | $N = r \prod p_i^{2}$ | $N = q^{4k+1} \prod p_i^{2a_i}$ |
+| **Exponents** | fixed: all $a_i = 1$ | variable: $a_i \in \{2, 4, 6, 8, 10\}$ |
+| **Euler prime** | folded into composite $r$ | explicitly tracked ($q \equiv 1 \pmod{4}$, $\exp \equiv 1 \pmod{4}$) |
+| **Factor coupling** | none — primes are independent | factor chains propagate via $\sigma(p^{a})$ factorisation |
 | **Search strategy** | DFS (stack, fixed order) | DFS for pseudo-solution; best-first heap for true OPN |
-| **Pseudo-solutions** | primary output (composite r) | found in `propagate=False` mode |
+| **Pseudo-solutions** | primary output (composite $r$) | found in `propagate=False` mode |
 
 ### Performance
 
 | | Legacy | Current (DFS mode) | Current (factor chain) |
 |---|---|---|---|
 | **Max rate** | ~1.5M states/s | ~350K states/s | ~140K states/s |
-| **Per-state cost** | O(1) — stack push + mpz multiply | O(1) — same core operations | O(log(d)) — Brent-Rho factorisation of σ(p^a) |
+| **Per-state cost** | $O(1)$ — stack push + mpz multiply | $O(1)$ — same core operations | $O(\log d)$ — Brent-Rho factorisation of $\sigma(p^{a})$ |
 | **Memory** | ~1 MB (stack only) | ~10 MB (stack + caches) | ~50 MB (heap + factor/sigma/power caches) |
 | **Time to first pseudo-solution** (PRIME=397) | ~7 min | ~7 min | N/A (not applicable) |
 
 ### Why the Current Engine Is Slower Per State
 
-1. **Brent Pollard-Rho factorisation** — each σ(p^a) must be fully factorised to
-   propagate factor chains.  The legacy engine never factorises σ values — it only
-   multiplies them into the running product.
+1. **Brent Pollard-Rho factorisation** — each $\sigma(p^{a})$ must be fully
+   factorised to propagate factor chains.  The legacy engine never factorises
+   $\sigma$ values — it only multiplies them into the running product.
 2. **State cloning** — the `State` dataclass carries 10 fields (7 collections);
    `clone()` deep-copies all of them.  The legacy engine reuses 5-element tuples.
 3. **Resonance computation** — computing σ-factor overlap via set intersections on
    every `assign_prime` call adds measurable overhead.
-4. **Best-first heap** — `heapq.heappush`/`heappop` are O(log heap_size) vs
-   O(1) stack operations.  With HEAP_MAX_SIZE = 200 000, each push costs ~18
-   comparisons.
+4. **Best-first heap** — `heapq.heappush`/`heappop` are $O(\log h)$ vs
+   $O(1)$ stack operations.  With `HEAP_MAX_SIZE = 200 000`, each push costs
+   ∼18 comparisons.
 
 ### Why the Current Engine Matters Despite the Slowdown
 
-- **The legacy engine cannot search beyond a_i = 1.**  Adding variable exponents
-  requires the factor-chain framework — factorising σ(p^a) is mandatory to
-  determine which new primes are forced into N.
+- **The legacy engine cannot search beyond $a_i = 1$.**  Adding variable exponents
+  requires the factor-chain framework — factorising $\sigma(p^{a})$ is mandatory
+  to determine which new primes are forced into $N$.
 - **Resonance guidance reduces the state count to the first solution.**  In
   factor-chain mode, the best-first heap explores high-resonance branches
   first, often reaching candidates in thousands of states instead of hundreds
   of millions.
 - **The additive q-adic valuation** provides a correctness guarantee that the
-  legacy `max()` heuristic lacks: tracking Σ v_q(σ(·)) against v_q(N) enables
-  precise contradiction detection.
+  legacy `max()` heuristic lacks: tracking $\sum v_q(\sigma(\cdot))$ against
+  $v_q(N)$ enables precise contradiction detection.
 
 ### When to Use Which
 
@@ -257,8 +247,8 @@ PROPAGATE   = False      # False → pseudo-solution search
 [Progress] States:  884,300,000 | Time:  582.1s | Rate: 1519000/s | |f|=8 ratio=1.8486 reson=-3.42
 ```
 - `|f|` — distinct primes currently assigned
-- `ratio` — current σ(N)/N (target: 2.0)
-- `reson` — resonance heuristic score (higher = more σ-factor reuse)
+- `ratio` — current $\sigma(N)/N$ (target: $2.0$)
+- `reson` — resonance heuristic score (higher = more $\sigma$-factor reuse)
 
 **Pseudo-candidate:**
 ```
@@ -301,12 +291,12 @@ Delete `checkpoint_merged.pkl` to force a fresh start.
 
 ### Additive q-adic Valuation
 
-When `p^a` is assigned and σ(p^a) contains factor q^e, we track
+When $p^{a}$ is assigned and $\sigma(p^{a})$ contains factor $q^{e}$, we track
 
-```
-required_v[q] += e           (total q-demand from the σ side)
-current_v[q]  += a_q         (q's exponent in N)
-```
+$$\begin{aligned}
+\text{required\_v}[q] &\mathrel{+}= e \qquad &\text{(total $q$-demand from the $\sigma$ side)} \\
+\text{current\_v}[q]  &\mathrel{+}= a_q \qquad &\text{($q$'s exponent in $N$)}
+\end{aligned}$$
 
 If `required_v[q] > current_v[q]`, the prime q is **forced** into the
 pending queue — it must appear in N with sufficient exponent to
@@ -320,12 +310,12 @@ primes) replaces the weaker `max()` heuristic used in earlier versions.
 For each candidate prime *p* with exponent *a*, the σ(p^a) factor set is
 compared against the primes already in N:
 
-```
-reuse = |σ-factors ∩ N|          (factors already "explained")
-newf  = |σ-factors \ N|          (new primes introduced)
-
-resonance += reuse × 1.5  -  newf × 0.7  -  log₁₀(largest_new) × 0.15
-```
+$$\begin{aligned}
+\text{reuse} &= \bigl|\sigma\text{-factors} \cap N\bigr| \qquad &\text{(factors already explained)} \\
+\text{newf}  &= \bigl|\sigma\text{-factors} \setminus N\bigr| \qquad &\text{(new primes introduced)} \\[4pt]
+\text{resonance} &\mathrel{+}= \text{reuse} \times 1.5 - \text{newf} \times 0.7 \\
+                 &\qquad - \log_{10}(\text{largest\_new} + 1) \times 0.15
+\end{aligned}$$
 
 States with high resonance (σ-factor recycling, characteristic of
 Descartes-type structures) are explored first via a priority heap.
@@ -334,9 +324,7 @@ Descartes-type structures) are explored first via a priority heap.
 
 Before cloning a state to assign p^a, the code checks
 
-```
-σ(p^a) × current_num  ≥  2 × p^a × current_den
-```
+$$\sigma(p^{a}) \times \text{current\_num} \;\geq\; 2 \times p^{a} \times \text{current\_den}$$
 
 If true, the new state would be immediately pruned (ratio ≥ 2),
 avoiding the cost of clone + factorisation.
@@ -384,8 +372,9 @@ SOFTWARE.
 ## References
 
 - Descartes, R. (1638).  Letter to Mersenne (manuscript).  The number
-  198585576189 = 3²·7²·11²·13²·22021 would be perfect if 22021 were
-  prime.  Reproduced in *Oeuvres de Descartes*, Vol. II.
+  $198585576189 = 3^{2} \cdot 7^{2} \cdot 11^{2} \cdot 13^{2} \cdot 22021$
+  would be perfect if $22021$ were prime.  Reproduced in *Oeuvres de
+  Descartes*, Vol. II.
 - Nielsen, P. P. (2007).  *Odd perfect numbers have at least nine
   distinct prime factors*.  Math. Comp. 76, 2109–2126.
   doi:[10.1090/S0025-5718-07-01990-4](https://doi.org/10.1090/S0025-5718-07-01990-4)

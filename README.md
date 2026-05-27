@@ -143,7 +143,7 @@ An early factor-chain prototype is also retained at the project root:
 |---|---|---|
 | **Candidate form** | $N = r \prod p_i^{2}$ | $N = q^{4k+1} \prod p_i^{2a_i}$ |
 | **Exponents** | fixed: all $a_i = 1$ | variable: $a_i \in \{2, 4, 6, 8, 10\}$ |
-| **Euler prime** | folded into composite $r$ | explicitly tracked ($q \equiv 1 \pmod{4}$, $\exp \equiv 1 \pmod{4}$) |
+| **Euler prime** | folded into composite $r$ | explicitly tracked ($q \equiv 1 \pmod{4}$, exponent $\equiv 1 \pmod{4}$) |
 | **Factor coupling** | none — primes are independent | factor chains propagate via $\sigma(p^{a})$ factorisation |
 | **Search strategy** | DFS (stack, fixed order) | DFS for pseudo-solution; best-first heap for true OPN |
 | **Pseudo-solutions** | primary output (composite $r$) | found in `propagate=False` mode |
@@ -311,9 +311,9 @@ For each candidate prime *p* with exponent *a*, the σ(p^a) factor set is
 compared against the primes already in N:
 
 $$\begin{aligned}
-\text{reuse} &= \bigl|\sigma\text{-factors} \cap N\bigr| \qquad &\text{(factors already explained)} \\
-\text{newf}  &= \bigl|\sigma\text{-factors} \setminus N\bigr| \qquad &\text{(new primes introduced)} \\[4pt]
-\text{resonance} &\mathrel{+}= \text{reuse} \times 1.5 - \text{newf} \times 0.7 \\
+\mathrm{reuse} &= \bigl|\Sigma_{\sigma} \cap N\bigr| \qquad &\text{(factors already explained)} \\
+\mathrm{newf}  &= \bigl|\Sigma_{\sigma} \setminus N\bigr| \qquad &\text{(new primes introduced)} \\[4pt]
+\mathrm{resonance} &\mathrel{+}= \mathrm{reuse} \times 1.5 - \mathrm{newf} \times 0.7 \\
                  &\qquad - \log_{10}(\mathrm{largest} + 1) \times 0.15
 \end{aligned}$$
 

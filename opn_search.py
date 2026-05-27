@@ -233,14 +233,14 @@ def search_opn(
             # Euler-include branches
             if st.euler_prime is None and p % 4 == 1:
                 for e in reversed(valid_euler_exponents(1, max_exp)):
-                    ns = assign_prime(st, p, e, propagate=propagate)
+                    ns = assign_prime(st, p, e, propagate=propagate, max_exp=max_exp)
                     if ns is not None:
                         ns.next_idx = idx + 1
                         _push(heap, ns)
 
             # non-Euler include branches
             for e in reversed(valid_even_exponents(2, max_exp)):
-                ns = assign_prime(st, p, e, propagate=propagate)
+                ns = assign_prime(st, p, e, propagate=propagate, max_exp=max_exp)
                 if ns is not None:
                     ns.next_idx = idx + 1
                     _push(heap, ns)
@@ -283,13 +283,13 @@ def _drain_and_process_pending(
     # Euler-candidate branches
     if st.euler_prime is None and q % 4 == 1:
         for e in reversed(valid_euler_exponents(lb, max_exp)):
-            ns = assign_prime(st, q, e, propagate=propagate)
+            ns = assign_prime(st, q, e, propagate=propagate, max_exp=max_exp)
             if ns is not None:
                 _push(heap, ns)
 
     # non-Euler branches
     for e in reversed(valid_even_exponents(lb, max_exp)):
-        ns = assign_prime(st, q, e, propagate=propagate)
+        ns = assign_prime(st, q, e, propagate=propagate, max_exp=max_exp)
         if ns is not None:
             _push(heap, ns)
 

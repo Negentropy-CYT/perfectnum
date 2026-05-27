@@ -101,6 +101,7 @@ def _enqueue_pending(st: State, q: int) -> None:
 # ── constraint propagation ────────────────────────────────────
 def assign_prime(
     st: State, p: int, exp: int, *, propagate: bool = True,
+    max_exp: int = MAX_EXP,
 ) -> Optional[State]:
     """Return a new ``State`` with *p* ^ *exp* assigned, or ``None``.
 
@@ -167,7 +168,8 @@ def assign_prime(
                 return None
         else:
             # q not yet assigned: check if σ demand exceeds what N can supply
-            if ns.required_v[q] > _max_possible_valuation(q, ns.euler_prime):
+            if ns.required_v[q] > _max_possible_valuation(q, ns.euler_prime,
+                                                          max_exp):
                 return None
 
         if ns.required_v[q] > ns.current_v.get(q, 0):
@@ -176,17 +178,18 @@ def assign_prime(
     return ns
 
 
-def _max_possible_valuation(q: int, euler_prime: int | None) -> int:
+def _max_possible_valuation(q: int, euler_prime: int | None,
+                            max_exp: int) -> int:
     """Maximum exponent that prime *q* could receive in N."""
     if q == euler_prime:
-        # Euler prime: largest exponent ≡ 1 (mod 4) ≤ MAX_EXP
-        x = MAX_EXP
+        # Euler prime: largest exponent ≡ 1 (mod 4) ≤ max_exp
+        x = max_exp
         while x % 4 != 1 and x > 0:
             x -= 1
         return max(x, 1)
     else:
-        # non-Euler: largest even exponent ≤ MAX_EXP
-        return MAX_EXP if MAX_EXP % 2 == 0 else MAX_EXP - 1
+        # non-Euler: largest even exponent ≤ max_exp
+        return max_exp if max_exp % 2 == 0 else max_exp - 1
 
 
 # ── resonance update ──────────────────────────────────────────

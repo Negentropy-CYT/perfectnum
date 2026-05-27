@@ -313,8 +313,8 @@ compared against the primes already in N:
 $$\begin{aligned}
 \mathrm{reuse} &= \bigl|\Sigma_{\sigma} \cap N\bigr| \\[2pt]
 \mathrm{newf}  &= \bigl|\Sigma_{\sigma} \setminus N\bigr| \\[4pt]
-\Delta\mathrm{res} &= 1.5 \times \mathrm{reuse} \;-\; 0.7 \times \mathrm{newf} \\
-                   &\;-\; 0.15 \times \log_{10}(\mathrm{largest} + 1)
+\Delta\mathrm{res} &= 1.5 \cdot \mathrm{reuse} - 0.7 \cdot \mathrm{newf} \\
+                   &- 0.15 \cdot \log_{10}(\mathrm{largest} + 1)
 \end{aligned}$$
 
 where $\Sigma_{\sigma}$ is the set of odd prime factors of $\sigma(p^{a})$, and

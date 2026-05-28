@@ -16,8 +16,10 @@ pip install gmpy2
 python opn_main.py
 ```
 
-Default configuration searches for **pseudo-OPN candidates** (composite
-"Euler factor") with primes ≤ 300, up to 7 distinct factors, exponent 2.
+Default configuration runs **factor-chain true-OPN search** with primes ≤ 300,
+up to 10 distinct factors, exponents up to 6.  Pseudo-OPN mode is available
+by setting `PROPAGATE = False` in `opn_core.py`.  A 12-digit Descartes-type
+pseudo-candidate is found in seconds in DFS mode.
 
 ---
 
@@ -66,10 +68,13 @@ appear in N.  This creates **forced chains** — including one prime
 forces others.  The search engine propagates these constraints
 additively, tracking q-adic valuations.
 
-Engines incorporate **Touchard's theorem** ($N \equiv 1 \pmod{12}$ or
-$N \equiv 9 \pmod{36}$) as an O(1) congruence check, and an optional
-**contradiction learning cache** that remembers pruned valuation-deficit
-patterns to short-circuit isomorphic dead subtrees.
+The engine incorporates **Touchard's theorem** ($N \equiv 1 \pmod{12}$ or
+$N \equiv 9 \pmod{36}$) as an O(1) congruence check, pre-clone valuation
+contradiction detection using precomputed $\sigma(p^a)$ factor maps, and
+window-complete logical pruning of exponent-4 branches whose $\sigma(p^4)$
+factors all exceed the search window.  A comprehensive telemetry system
+(`telemetry.txt`) records prune reasons, clone economics, depth histograms,
+and obligation-signature recurrence patterns across parameter configurations.
 
 ---
 
@@ -79,12 +84,12 @@ patterns to short-circuit isomorphic dead subtrees.
 opn_main.py        Entry point (configuration + main loop)
 opn_core.py        Arithmetic engine
                      · prime generation (sieve)
-                     · Brent Pollard-Rho factorisation
-                     · σ(p^a) computation (cached)
+                     · Brent Pollard-Rho + cyclotomic factorisation
+                     · σ(p^a) computation + full valuation maps (cached)
                      · factor / power / sigma caches
-                     · σ-factor-set precomputation
-                     · ratio upper/lower bounds
-                     · all user-configurable constants
+                     · suffix-product precomputation (O(1) ratio bounds)
+                     · Touchard congruence + EXCLUDE_EXP_4 pruning
+                     · telemetry counters + all user-configurable constants
 opn_state.py       Search state & constraint propagation
                      · DFSState (8 fields, 2 collections cloned) — lightweight
                        pseudo-solution DFS
@@ -239,12 +244,10 @@ programmatically):
 ```python
 # opn_core.py
 
-MAX_PRIME   = 300        # largest odd prime considered
-MAX_FACTORS = 7          # max distinct prime factors in N
-MAX_EXP     = 2          # max exponent for any prime
-                         #   2 = a_i=1 restriction
-                         #   6+ = variable exponents
-PROPAGATE   = False      # False → pseudo-solution search
+MAX_PRIME   = 100        # largest odd prime considered
+MAX_FACTORS = 10         # max distinct prime factors in N
+MAX_EXP     = 6          # max exponent for any prime
+PROPAGATE   = True       # False → pseudo-solution search
                          # True  → true-OPN factor-chain search
 ```
 
@@ -376,6 +379,13 @@ coherence).  Issues are reported as warnings.
 Delete `checkpoint_merged.pkl` to force a fresh start (resets all
 telemetry).
 
+### Telemetry Report
+
+On completion (or Ctrl+C), a structured Markdown report is written to
+`telemetry.txt` covering prune statistics, clone economics, depth
+histograms, obligation-signature recurrence, and propagation edge analysis.
+All counters persist across checkpoint/resume cycles.
+
 ---
 
 ## Key Algorithms
@@ -414,14 +424,20 @@ $\Delta\mathrm{res}$ is added to the running resonance score.
 States with high resonance (σ-factor recycling, characteristic of
 Descartes-type structures) are explored first via a priority heap.
 
-### Early Ratio Pruning
+### Pre-Clone Valuation Check
 
-Before cloning a state to assign p^a, the code checks
+Before cloning a state in chain mode, precomputed $\{q: v_q(\sigma(p^{a}))\}$
+maps enable valuation contradiction detection *without* paying the clone cost.
+This eliminates wasted clones — the dominant structural overhead in
+factor-chain search where 49% of clones were previously discarded after
+post-clone factorisation.
 
-$$\sigma(p^{a}) \times \mathrm{num} \;\geq\; 2 \times p^{a} \times \mathrm{den}$$
+### EXCLUDE_EXP_4 Pruning
 
-If true, the new state would be immediately pruned (ratio ≥ 2),
-avoiding the cost of clone + factorisation.
+If $\sigma(p^{4})$'s every odd prime factor exceeds `MAX_PRIME`, the
+$a=4$ include branch is skipped.  This is **window-complete** logical
+pruning — the cofactor would deterministically become an unresolvable
+pending obligation.  $a=2$ is never filtered, preserving completeness.
 
 ---
 

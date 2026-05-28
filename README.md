@@ -17,7 +17,7 @@ python opn_main.py
 ```
 
 Default configuration searches for **pseudo-OPN candidates** (composite
-"Euler factor") with primes ≤ 100, up to 7 distinct factors, exponent 2.
+"Euler factor") with primes ≤ 300, up to 7 distinct factors, exponent 2.
 
 ---
 
@@ -105,6 +105,8 @@ opn_io.py          Display, checkpoint, file I/O
                      · atomic pickle checkpoint save/load + validation
                      · human-readable solutions file
                      · display_prune_stats() — per-reason prune telemetry
+                     · display_depth_histogram() — search-tree shape
+                     · display_clone_effectiveness() — clone economics
                      · export_factor_graph() — DOT + JSON σ-dependency graph
 ```
 
@@ -237,7 +239,7 @@ programmatically):
 ```python
 # opn_core.py
 
-MAX_PRIME   = 100        # largest odd prime considered
+MAX_PRIME   = 300        # largest odd prime considered
 MAX_FACTORS = 7          # max distinct prime factors in N
 MAX_EXP     = 2          # max exponent for any prime
                          #   2 = a_i=1 restriction
@@ -306,36 +308,73 @@ p forces q into N.  Cycles in this graph (e.g. 3 → 13 → 3) are the
 structural signature of Descartes-type pseudo-solutions and explain why
 the resonance heuristic works.
 
-### Prune Statistics
+### Search Telemetry
 
-On completion or `Ctrl+C`, the engine prints a summary of why states
-were rejected during `assign_prime`:
+On completion or `Ctrl+C`, the engine prints three telemetry reports.
+All counters are serialised into the checkpoint and accumulate across
+interrupt/resume cycles, giving reliable long-run statistics.
+
+**Prune Statistics** — per-reason rejection rates, normalised against
+total clones (‰ = per 1000 clones):
 
 ```
 Prune statistics:
-  ratio           412,300  ( 41.2%)
-  valuation       318,000  ( 31.8%)
-  touchard        115,000  ( 11.5%)
-  excluded         91,000  (  9.1%)
-  euler            64,000  (  6.4%)
+  ratio             182,501  (98.0% of prunes,  51.5‰ of clones)
+  touchard            3,688  ( 2.0% of prunes,   1.0‰ of clones)
 ```
 
 Each counter is incremented at the exact `return None` site inside
-`assign_prime_dfs` / `assign_prime_chain`, giving direct observability
-into which heuristic dominates pruning and where optimisation effort
-should focus.
+`assign_prime_dfs` / `assign_prime_chain`.  The ‰ rate isolates which
+heuristic dominates *per clone attempt*, enabling cross-configuration
+comparison.
+
+**Depth Histogram** — distribution of successful assign depth,
+normalised as % of all productive clones:
+
+```
+Depth histogram (successful assign):
+  depth  1:            1  ( 0.0%)  #
+  depth 14:        4,253  ( 0.2%)  #
+  depth 24:       62,408  ( 3.6%)  #######
+  depth 34:      123,405  ( 7.1%)  ##############  ← peak
+  depth 44:       15,264  ( 0.9%)  ##
+```
+
+Depth counts DFS traversal steps (include + skip branches), *not*
+number of assigned prime factors.  The bell shape reveals where the
+search tree expands and where ratio pruning begins to dominate.
+
+**Clone Effectiveness** — classifies every `clone()` call by outcome:
+
+```
+Clone effectiveness:
+  total clones     3,544,930
+  productive       1,750,000  ( 49.4%)
+  saved (pre-clone)  182,501  (  5.1%)  ratio/excluded/euler — clone avoided
+  wasted (post-cln)    3,688  (  0.1%)  touchard/valuation — clone paid, then rejected
+  overhead (other) 1,608,741  ( 45.4%)  skip branches, init
+```
+
+- **saved** = prunes that executed *before* `clone()` — these are the
+  highest-value heuristics.
+- **wasted** = prunes that executed *after* `clone()` — mathematically
+  correct but computationally expensive.
+- **overhead** = skip branches and initial states — inherent DFS
+  enumeration cost.
 
 ### Checkpoint / Resume
 
 Press `Ctrl+C` at any time — the search state (including the full
-heap/stack) is atomically saved to `checkpoint_merged.pkl`.  Running
-`python opn_main.py` again will resume from the interruption point.
+heap/stack and all telemetry counters) is atomically saved to
+`checkpoint_merged.pkl`.  Running `python opn_main.py` again will
+resume from the interruption point with cumulative statistics.
 
 On resume the checkpoint is validated for internal consistency
 (pending/pending_set agreement, non-negative valuations, heap counter
 coherence).  Issues are reported as warnings.
 
-Delete `checkpoint_merged.pkl` to force a fresh start.
+Delete `checkpoint_merged.pkl` to force a fresh start (resets all
+telemetry).
 
 ---
 

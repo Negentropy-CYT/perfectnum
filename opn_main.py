@@ -147,6 +147,7 @@ def main() -> None:
     )
     display_prune_stats()
     display_depth_histogram()
+    display_clone_effectiveness()
 
     if solutions:
         print(f"\n=== 共 {found_true} 个真解 + {found_pseudo} 个伪解 ===")

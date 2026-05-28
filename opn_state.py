@@ -19,6 +19,7 @@ from typing import Deque, Dict, Optional, Tuple
 from gmpy2 import mpz
 
 from opn_core import (
+    DEPTH_STATS,
     PRUNE_STATS,
     _SIG_FACTORS,
     MAX_EXP,
@@ -183,6 +184,7 @@ def assign_prime_dfs(st: DFSState, p: int, exp: int,
     if not check_touchard(ns.euler_prime, ns.assigned, ns.excluded):
         return _reject("touchard")
 
+    DEPTH_STATS[ns.depth] += 1
     return ns
 
 
@@ -222,6 +224,7 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         ns.priority = 0.0
 
     if not propagate:
+        DEPTH_STATS[ns.depth] += 1
         return ns
 
     # factor-chain propagation (additive valuation)
@@ -244,6 +247,7 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         if ns.required_v[q] > ns.current_v.get(q, 0):
             _enqueue_pending(ns, q)
 
+    DEPTH_STATS[ns.depth] += 1
     return ns
 
 

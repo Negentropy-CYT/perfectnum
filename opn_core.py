@@ -19,7 +19,7 @@ from gmpy2 import mpz
 CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 
-MAX_PRIME         = 400
+MAX_PRIME         = 200
 MAX_FACTORS       = 7
 MAX_EXP           = 2          # 2 = original a_i=1; 6+ for variable exponents
 PROPAGATE         = False      # False = pseudo-solution; True = true OPN
@@ -41,6 +41,7 @@ _SIG_FACTORS:  Dict[Tuple[int, int], set[int]] = {}
 
 # ── prune telemetry ──────────────────────────────────────────
 PRUNE_STATS: "Counter[str]" = Counter()
+DEPTH_STATS: "Counter[int]" = Counter()
 
 
 # ── prime generation ──────────────────────────────────────────

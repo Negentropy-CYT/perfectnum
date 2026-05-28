@@ -19,6 +19,7 @@ from gmpy2 import mpz
 
 from opn_core import (
     CHECKPOINT_FILE,
+    DEPTH_STATS,
     PRUNE_STATS,
     SOLUTIONS_FILE,
     MAX_FACTORS,
@@ -185,6 +186,16 @@ def display_prune_stats() -> None:
     for k, v in PRUNE_STATS.most_common():
         pct = 100.0 * v / total
         print(f"  {k:<12} {v:>12,}  ({pct:5.1f}%)")
+
+
+def display_depth_histogram() -> None:
+    """Print a histogram of successful assign depth distribution."""
+    if not DEPTH_STATS:
+        return
+    print("\nDepth histogram (successful assign):")
+    for d in sorted(DEPTH_STATS):
+        bar = "#" * min(int(DEPTH_STATS[d] / max(DEPTH_STATS.values()) * 40), 40)
+        print(f"  depth {d:>2}: {DEPTH_STATS[d]:>12,}  {bar}")
 
 
 # ── factor graph export ───────────────────────────────────────

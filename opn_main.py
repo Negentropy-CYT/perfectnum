@@ -34,6 +34,7 @@ from opn_core import (
     valid_even_exponents,
 )
 from opn_io import (
+    display_depth_histogram,
     display_prune_stats,
     display_solution,
     export_factor_graph,
@@ -127,6 +128,7 @@ def main() -> None:
         save_checkpoint(state_holder, solutions)
         save_solutions_txt(solutions)
         display_prune_stats()
+        display_depth_histogram()
         print(
             f"已保存。已完成 {state_holder.get('total_states', 0):,} 个状态"
         )
@@ -142,6 +144,7 @@ def main() -> None:
         f"耗时: {elapsed:.1f}s"
     )
     display_prune_stats()
+    display_depth_histogram()
 
     if solutions:
         print(f"\n=== 共 {found_true} 个真解 + {found_pseudo} 个伪解 ===")

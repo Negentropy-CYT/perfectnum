@@ -38,10 +38,12 @@ def display_solution(st, sol_num: int, elapsed: float) -> None:
 
     # factor list
     print("\n  Factors:")
+    req_v = getattr(st, 'required_v', {})
+    cur_v = getattr(st, 'current_v', {})
     for p, a in sorted(st.assigned.items()):
         tag = " (Euler)" if p == st.euler_prime else ""
-        req = st.required_v.get(p, "")
-        cur = st.current_v.get(p, "")
+        req = req_v.get(p, "")
+        cur = cur_v.get(p, "")
         bal = f"  [req={req}, cur={cur}]" if req != "" or cur != "" else ""
         print(f"    {p}^{a}{tag}{bal}")
 

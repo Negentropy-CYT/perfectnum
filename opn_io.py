@@ -133,7 +133,7 @@ def _print_factor_chain(st) -> None:
 
 # ── checkpoint persistence ────────────────────────────────────
 def save_checkpoint(state_holder: dict, solutions: list) -> None:
-    """Atomically persist search state + solutions to disk."""
+    """Atomically persist search state + solutions + telemetry to disk."""
     chk = {
         "primes":       state_holder.get("primes", []),
         "max_factors":  state_holder.get("max_factors", MAX_FACTORS),
@@ -144,6 +144,8 @@ def save_checkpoint(state_holder: dict, solutions: list) -> None:
         "elapsed":      state_holder.get("elapsed", 0.0),
         "use_heap":     state_holder.get("use_heap", True),
         "solutions":    solutions,
+        "prune_stats":  dict(PRUNE_STATS),
+        "depth_stats":  dict(DEPTH_STATS),
     }
     tmp = CHECKPOINT_FILE + ".tmp"
     with open(tmp, "wb") as f:
@@ -172,6 +174,13 @@ def load_checkpoint() -> Optional[dict]:
         for issue in issues:
             print(f"  - {issue}")
         print("将继续使用，但建议删除检查点文件重新开始。")
+
+    # restore telemetry counters so stats accumulate across sessions
+    if chk.get("prune_stats"):
+        PRUNE_STATS.update(chk["prune_stats"])
+    if chk.get("depth_stats"):
+        DEPTH_STATS.update({int(k): v for k, v in chk["depth_stats"].items()})
+
     return chk
 
 

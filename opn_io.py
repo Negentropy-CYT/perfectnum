@@ -19,6 +19,7 @@ from gmpy2 import mpz
 
 from opn_core import (
     CHECKPOINT_FILE,
+    CLONE_STATS,
     DEPTH_STATS,
     PRUNE_STATS,
     SOLUTIONS_FILE,
@@ -146,6 +147,7 @@ def save_checkpoint(state_holder: dict, solutions: list) -> None:
         "solutions":    solutions,
         "prune_stats":  dict(PRUNE_STATS),
         "depth_stats":  dict(DEPTH_STATS),
+        "clone_stats":  dict(CLONE_STATS),
     }
     tmp = CHECKPOINT_FILE + ".tmp"
     with open(tmp, "wb") as f:
@@ -180,6 +182,8 @@ def load_checkpoint() -> Optional[dict]:
         PRUNE_STATS.update(chk["prune_stats"])
     if chk.get("depth_stats"):
         DEPTH_STATS.update({int(k): v for k, v in chk["depth_stats"].items()})
+    if chk.get("clone_stats"):
+        CLONE_STATS.update(chk["clone_stats"])
 
     return chk
 
@@ -187,24 +191,55 @@ def load_checkpoint() -> Optional[dict]:
 # ── prune telemetry ───────────────────────────────────────────
 
 def display_prune_stats() -> None:
-    """Print a summary table of prune reasons and their frequencies."""
+    """Print a summary table of prune reasons and their frequencies.
+
+    Shows raw count + share of all prunes + rate per 1000 clones (if available).
+    """
     total = sum(PRUNE_STATS.values())
     if total == 0:
         return
+    total_clones = CLONE_STATS.get("total", 0)
     print("\nPrune statistics:")
     for k, v in PRUNE_STATS.most_common():
         pct = 100.0 * v / total
-        print(f"  {k:<12} {v:>12,}  ({pct:5.1f}%)")
+        if total_clones:
+            rate = 1000.0 * v / total_clones
+            print(f"  {k:<12} {v:>12,}  ({pct:5.1f}% of prunes, {rate:5.1f}‰ of clones)")
+        else:
+            print(f"  {k:<12} {v:>12,}  ({pct:5.1f}%)")
 
 
 def display_depth_histogram() -> None:
-    """Print a histogram of successful assign depth distribution."""
+    """Print a histogram of successful assign depth distribution (normalised)."""
     if not DEPTH_STATS:
         return
+    total = sum(DEPTH_STATS.values())
     print("\nDepth histogram (successful assign):")
     for d in sorted(DEPTH_STATS):
-        bar = "#" * min(int(DEPTH_STATS[d] / max(DEPTH_STATS.values()) * 40), 40)
-        print(f"  depth {d:>2}: {DEPTH_STATS[d]:>12,}  {bar}")
+        pct = 100.0 * DEPTH_STATS[d] / total
+        bar = "#" * max(1, int(pct * 2))
+        print(f"  depth {d:>2}: {DEPTH_STATS[d]:>12,}  ({pct:4.1f}%)  {bar}")
+
+
+def display_clone_effectiveness() -> None:
+    """Print clone-economics summary: how many clones were productive vs wasted."""
+    total = CLONE_STATS.get("total", 0)
+    if total == 0:
+        return
+    productive = CLONE_STATS.get("productive", 0)
+    saved      = CLONE_STATS.get("saved", 0)
+    wasted     = CLONE_STATS.get("wasted", 0)
+    overhead   = total - productive - wasted  # skip branches, init, etc.
+
+    print("\nClone effectiveness:")
+    print(f"  total clones     {total:>12,}")
+    print(f"  productive       {productive:>12,}  ({100.0*productive/total:5.1f}%)")
+    print(f"  saved (pre-clone){saved:>12,}  ({100.0*saved/total:5.1f}%)  "
+          f"ratio/excluded/euler — clone avoided")
+    print(f"  wasted (post-cln){wasted:>12,}  ({100.0*wasted/total:5.1f}%)  "
+          f"touchard/valuation — clone already paid")
+    print(f"  overhead (other) {overhead:>12,}  ({100.0*overhead/total:5.1f}%)  "
+          f"skip branches, init")
 
 
 # ── factor graph export ───────────────────────────────────────

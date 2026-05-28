@@ -34,6 +34,7 @@ from opn_core import (
     valid_even_exponents,
 )
 from opn_io import (
+    display_clone_effectiveness,
     display_depth_histogram,
     display_prune_stats,
     display_solution,
@@ -129,6 +130,7 @@ def main() -> None:
         save_solutions_txt(solutions)
         display_prune_stats()
         display_depth_histogram()
+        display_clone_effectiveness()
         print(
             f"已保存。已完成 {state_holder.get('total_states', 0):,} 个状态"
         )

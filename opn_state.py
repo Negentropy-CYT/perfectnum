@@ -19,6 +19,7 @@ from typing import Deque, Dict, Optional, Tuple
 from gmpy2 import mpz
 
 from opn_core import (
+    CLONE_STATS,
     DEPTH_STATS,
     PRUNE_STATS,
     _SIG_FACTORS,
@@ -66,6 +67,7 @@ class DFSState:
     pseudo:      bool           = False
 
     def clone(self) -> "DFSState":
+        CLONE_STATS["total"] += 1
         return DFSState(
             assigned=dict(self.assigned),
             excluded=set(self.excluded),
@@ -102,6 +104,7 @@ class ChainState:
     priority:    float           = 0.0
 
     def clone(self) -> "ChainState":
+        CLONE_STATS["total"] += 1
         return ChainState(
             assigned=dict(self.assigned),
             required_v=dict(self.required_v),
@@ -123,8 +126,16 @@ class ChainState:
 # ── prune telemetry helper ──────────────────────────────────
 
 def _reject(reason: str):
-    """Increment prune counter and return None (sentinel for pruned branch)."""
+    """Increment prune counter and return None (sentinel for pruned branch).
+
+    Also classifies the prune as pre-clone (saved) or post-clone (wasted)
+    for clone-effectiveness telemetry.
+    """
     PRUNE_STATS[reason] += 1
+    if reason in ("excluded", "ratio", "euler"):
+        CLONE_STATS["saved"] += 1   # clone was avoided
+    else:
+        CLONE_STATS["wasted"] += 1  # clone was already paid
     return None
 
 
@@ -185,6 +196,7 @@ def assign_prime_dfs(st: DFSState, p: int, exp: int,
         return _reject("touchard")
 
     DEPTH_STATS[ns.depth] += 1
+    CLONE_STATS["productive"] += 1
     return ns
 
 
@@ -248,6 +260,7 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
             _enqueue_pending(ns, q)
 
     DEPTH_STATS[ns.depth] += 1
+    CLONE_STATS["productive"] += 1
     return ns
 
 

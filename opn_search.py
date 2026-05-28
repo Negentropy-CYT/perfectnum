@@ -222,6 +222,9 @@ def search_opn(
         state_holder["total_states"] = total_states
         state_holder["use_heap"]     = use_heap
 
+    # ── initial progress (trigger on the very first state) ──
+    _first = True
+
     # ── main loop ──
     while heap:
         if use_heap and len(heap) > HEAP_MAX_SIZE:
@@ -238,8 +241,10 @@ def search_opn(
             state_holder["elapsed"]       = time.time() - t0
 
         total_states += 1
-        if total_states % PROGRESS_INTERVAL == 0 and progress_callback is not None:
-            progress_callback(total_states, st, time.time() - t0)
+        if progress_callback is not None:
+            if total_states == 1 or total_states % PROGRESS_INTERVAL == 0:
+                progress_callback(total_states, st, time.time() - t0)
+                _first = False
 
         # ── true-OPN check ──
         if (
@@ -336,7 +341,8 @@ def search_opn(
 
     # ── exhausted ──
     elapsed = time.time() - t0
-    print(f"\n搜索完成: {total_states:,} states, {elapsed:.1f}s")
+    print()  # end inline progress line cleanly
+    print(f"搜索完成: {total_states:,} states, {elapsed:.1f}s")
     if state_holder is not None:
         state_holder["heap"]         = []
         state_holder["heap_counter"]  = heap_counter

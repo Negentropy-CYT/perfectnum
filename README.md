@@ -17,8 +17,7 @@ python opn_main.py
 ```
 
 Default configuration searches for **pseudo-OPN candidates** (composite
-"Euler factor") with primes ≤ 400, up to 7 distinct factors, exponent 2.
-A 12-digit Descartes-type pseudo-candidate is found in ~7 minutes.
+"Euler factor") with primes ≤ 100, up to 7 distinct factors, exponent 2.
 
 ---
 
@@ -103,8 +102,10 @@ opn_search.py      Search engine
 opn_io.py          Display, checkpoint, file I/O
                      · display_solution()
                      · factor-chain trace
-                     · atomic pickle checkpoint save/load
+                     · atomic pickle checkpoint save/load + validation
                      · human-readable solutions file
+                     · display_prune_stats() — per-reason prune telemetry
+                     · export_factor_graph() — DOT + JSON σ-dependency graph
 ```
 
 **Dependency graph** (no cycles):
@@ -236,7 +237,7 @@ programmatically):
 ```python
 # opn_core.py
 
-MAX_PRIME   = 400        # largest odd prime considered
+MAX_PRIME   = 100        # largest odd prime considered
 MAX_FACTORS = 7          # max distinct prime factors in N
 MAX_EXP     = 2          # max exponent for any prime
                          #   2 = a_i=1 restriction
@@ -289,11 +290,50 @@ PROPAGATE   = False      # False → pseudo-solution search
     ...
 ```
 
+### Factor Graph
+
+When a solution is found, the σ-factor dependency graph is automatically
+exported as two files:
+
+- `factor_graph.dot` — Graphviz DOT format.  Render with:
+  ```bash
+  dot -Tpng factor_graph.dot -o factor_graph.png
+  ```
+- `factor_graph.json` — machine-readable edge list with cycle detection.
+
+Each edge `p → q` means σ(p^a) contains prime factor q, i.e. assigning
+p forces q into N.  Cycles in this graph (e.g. 3 → 13 → 3) are the
+structural signature of Descartes-type pseudo-solutions and explain why
+the resonance heuristic works.
+
+### Prune Statistics
+
+On completion or `Ctrl+C`, the engine prints a summary of why states
+were rejected during `assign_prime`:
+
+```
+Prune statistics:
+  ratio           412,300  ( 41.2%)
+  valuation       318,000  ( 31.8%)
+  touchard        115,000  ( 11.5%)
+  excluded         91,000  (  9.1%)
+  euler            64,000  (  6.4%)
+```
+
+Each counter is incremented at the exact `return None` site inside
+`assign_prime_dfs` / `assign_prime_chain`, giving direct observability
+into which heuristic dominates pruning and where optimisation effort
+should focus.
+
 ### Checkpoint / Resume
 
 Press `Ctrl+C` at any time — the search state (including the full
 heap/stack) is atomically saved to `checkpoint_merged.pkl`.  Running
 `python opn_main.py` again will resume from the interruption point.
+
+On resume the checkpoint is validated for internal consistency
+(pending/pending_set agreement, non-negative valuations, heap counter
+coherence).  Issues are reported as warnings.
 
 Delete `checkpoint_merged.pkl` to force a fresh start.
 

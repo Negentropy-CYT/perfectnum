@@ -227,8 +227,9 @@ def search_opn(
 
     # ── main loop ──
     while heap:
-        if use_heap and len(heap) > HEAP_MAX_SIZE:
-            heap = heapq.nsmallest(HEAP_MAX_SIZE, heap)
+        if use_heap and len(heap) > HEAP_MAX_SIZE and total_states % 1000 == 0:
+            keep = int(HEAP_MAX_SIZE * 0.6)
+            heap = heapq.nsmallest(keep, heap)
             heapq.heapify(heap)
 
         st = _pop(heap)

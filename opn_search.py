@@ -23,6 +23,7 @@ from opn_core import (
     PROGRESS_INTERVAL,
     check_touchard,
     precompute_sig_factors,
+    precompute_suffix_bounds,
     ratio_lower_bound,
     ratio_upper_bound,
     sigma_prime_power,
@@ -170,6 +171,9 @@ def search_opn(
     cache = ContradictionCache() if use_cache else None
     use_heap = propagate
 
+    # ── precompute suffix bounds (O(1) ratio queries) ──
+    s_ub_num, s_ub_den, s_lb_num, s_lb_den = precompute_suffix_bounds(primes)
+
     if propagate:
         precompute_sig_factors(primes, max_exp)
 
@@ -280,6 +284,8 @@ def search_opn(
         ub_num, ub_den = ratio_upper_bound(
             st.ratio_num, st.ratio_den,
             st.assigned, st.excluded, primes,
+            next_idx=st.next_idx,
+            suffix_ub_num=s_ub_num, suffix_ub_den=s_ub_den,
         )
         if ub_num < 2 * ub_den:
             if cache is not None and len(st.assigned) >= 3:

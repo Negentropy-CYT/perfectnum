@@ -21,8 +21,8 @@ SOLUTIONS_FILE   = "solutions_merged.txt"
 MAX_PRIME         = 300
 MAX_FACTORS       = 7
 MAX_EXP           = 6          # 2 = original a_i=1; 6+ for variable exponents
-PROPAGATE         = True      # False = pseudo-solution; True = true OPN
-PROGRESS_INTERVAL = 1_000
+PROPAGATE         = False      # False = pseudo-solution; True = true OPN
+PROGRESS_INTERVAL = 100_000
 
 # resonance heuristic weights
 RESONANCE_REUSE_W   = 1.5
@@ -164,26 +164,65 @@ def precompute_sig_factors(primes: List[int], max_exp: int) -> None:
             _SIG_FACTORS[(p, a)] = {q for q, _ in factorize(sig) if q != 2}
 
 
-# ── ratio bounds (with LRU cache) ──────────────────────────────
-_RATIO_UB_CACHE: Dict[Tuple[int, int, frozenset, frozenset],
-                        Tuple[mpz, mpz]] = {}
-_RATIO_LB_CACHE: Dict[Tuple[int, int, tuple],
-                        Tuple[mpz, mpz]] = {}
-_RATIO_CACHE_MAX = 8192   # per-cache limit; clear when exceeded
+# ── suffix-product precomputation (O(1) ratio bounds) ──────────
 
+def precompute_suffix_bounds(primes: List[int]):
+    """Build suffix arrays for O(1) ratio bounds.
+
+    suffix_ub[i] = ∏_{j≥i} p_j/(p_j-1)   (upper bound: max ratio contribution)
+    suffix_lb[i] = ∏_{j≥i} (p_j+1)/p_j   (lower bound: min ratio contribution)
+    """
+    n = len(primes)
+    ub_num = [mpz(1)] * (n + 1)
+    ub_den = [mpz(1)] * (n + 1)
+    lb_num = [mpz(1)] * (n + 1)
+    lb_den = [mpz(1)] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        p = primes[i]
+        ub_num[i] = ub_num[i + 1] * p
+        ub_den[i] = ub_den[i + 1] * (p - 1)
+        lb_num[i] = lb_num[i + 1] * (p + 1)
+        lb_den[i] = lb_den[i + 1] * p
+    return ub_num, ub_den, lb_num, lb_den
+
+
+# ── ratio bounds (suffix-based, O(1) per query) ───────────────
 
 def ratio_upper_bound(
     ratio_num: mpz, ratio_den: mpz,
     assigned: Dict[int, int], excluded: set[int],
     primes: List[int],
+    next_idx: int = -1,
+    suffix_ub_num: list = None,
+    suffix_ub_den: list = None,
 ) -> Tuple[mpz, mpz]:
-    """Maximum possible σ(N)/N (cached — O(1) hit, O(|primes|) miss)."""
-    key = (int(ratio_num), int(ratio_den),
-           frozenset(assigned), frozenset(excluded))
-    cached = _RATIO_UB_CACHE.get(key)
-    if cached is not None:
-        return cached
+    """Maximum possible σ(N)/N — O(1) with suffix, O(|primes|) fallback."""
+    if suffix_ub_num is not None and next_idx >= 0:
+        n = len(primes)
+        if next_idx >= n:
+            return mpz(ratio_num), mpz(ratio_den)
+        # full suffix product for all remaining primes
+        num = mpz(ratio_num) * suffix_ub_num[next_idx]
+        den = mpz(ratio_den) * suffix_ub_den[next_idx]
+        # remove contribution of primes already decided (assigned / excluded)
+        limit = primes[next_idx]
+        for p in assigned:
+            if p >= limit:
+                num //= p           # factor p was in suffix_ub_num
+        for p in excluded:
+            if p >= limit:
+                num //= p
+        # den contains ∏(p-1); assigned/excluded primes' (p-1) factors
+        # must also be removed — do it in a second pass over the same sets
+        for p in assigned:
+            if p >= limit:
+                den //= (p - 1)
+        for p in excluded:
+            if p >= limit:
+                den //= (p - 1)
+        return num, den
 
+    # fallback: O(|primes|)
     num = mpz(ratio_num)
     den = mpz(ratio_den)
     for p in primes:
@@ -191,31 +230,18 @@ def ratio_upper_bound(
             continue
         num *= p
         den *= (p - 1)
-
-    if len(_RATIO_UB_CACHE) >= _RATIO_CACHE_MAX:
-        _RATIO_UB_CACHE.clear()
-    _RATIO_UB_CACHE[key] = (num, den)
     return num, den
 
 
 def ratio_lower_bound(
-    ratio_num: mpz, ratio_den: mpz, pending,  # Deque[int]
+    ratio_num: mpz, ratio_den: mpz, pending,
 ) -> Tuple[mpz, mpz]:
-    """Minimum possible σ(N)/N (cached — O(1) hit, O(|pending|) miss)."""
-    key = (int(ratio_num), int(ratio_den), tuple(pending))
-    cached = _RATIO_LB_CACHE.get(key)
-    if cached is not None:
-        return cached
-
+    """Minimum possible σ(N)/N — pending primes contribute ``(p+1)/p``."""
     num = mpz(ratio_num)
     den = mpz(ratio_den)
     for p in pending:
         num *= (p + 1)
         den *= p
-
-    if len(_RATIO_LB_CACHE) >= _RATIO_CACHE_MAX:
-        _RATIO_LB_CACHE.clear()
-    _RATIO_LB_CACHE[key] = (num, den)
     return num, den
 
 

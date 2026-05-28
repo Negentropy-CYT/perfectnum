@@ -9,6 +9,7 @@ user-configurable constants.
 
 import math
 import random
+from collections import Counter
 from typing import Dict, List, Tuple
 
 import gmpy2
@@ -18,11 +19,11 @@ from gmpy2 import mpz
 CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 
-MAX_PRIME         = 300
+MAX_PRIME         = 400
 MAX_FACTORS       = 7
-MAX_EXP           = 6          # 2 = original a_i=1; 6+ for variable exponents
+MAX_EXP           = 2          # 2 = original a_i=1; 6+ for variable exponents
 PROPAGATE         = False      # False = pseudo-solution; True = true OPN
-PROGRESS_INTERVAL = 100_000
+PROGRESS_INTERVAL = 10_000
 
 # resonance heuristic weights
 RESONANCE_REUSE_W   = 1.5
@@ -37,6 +38,9 @@ SIGMA_CACHE:   Dict[Tuple[int, int], mpz] = {}
 POWER_CACHE:   Dict[Tuple[int, int], int] = {}
 FACTOR_CACHE:  Dict[int, List[Tuple[int, int]]] = {}
 _SIG_FACTORS:  Dict[Tuple[int, int], set[int]] = {}
+
+# ── prune telemetry ──────────────────────────────────────────
+PRUNE_STATS: "Counter[str]" = Counter()
 
 
 # ── prime generation ──────────────────────────────────────────

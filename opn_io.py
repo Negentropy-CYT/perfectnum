@@ -6,6 +6,7 @@ trace for true OPN candidates), atomic pickle-based checkpoint
 save/load, and plain-text solution summaries.
 """
 
+import json
 import math
 import os
 import pickle
@@ -18,14 +19,16 @@ from gmpy2 import mpz
 
 from opn_core import (
     CHECKPOINT_FILE,
+    PRUNE_STATS,
     SOLUTIONS_FILE,
     MAX_FACTORS,
     MAX_EXP,
+    PROPAGATE,
     factorize,
     power_pa,
     sigma_prime_power,
 )
-from opn_state import ChainState, DFSState
+from opn_state import ChainState, DFSState, validate_chain_state
 
 
 # ── display ───────────────────────────────────────────────────
@@ -148,15 +151,153 @@ def save_checkpoint(state_holder: dict, solutions: list) -> None:
 
 
 def load_checkpoint() -> Optional[dict]:
-    """Return saved state dict, or ``None`` if no checkpoint exists."""
+    """Return saved state dict, or ``None`` if no checkpoint exists.
+
+    Validates internal consistency after deserialisation and reports any
+    issues found (silent corruption guard for long-running searches).
+    """
     if not os.path.exists(CHECKPOINT_FILE):
         return None
     try:
         with open(CHECKPOINT_FILE, "rb") as f:
-            return pickle.load(f)
+            chk = pickle.load(f)
     except Exception as e:
         print(f"警告: 检查点损坏 ({e})")
         return None
+
+    issues = validate_checkpoint(chk)
+    if issues:
+        print("警告: 检查点一致性检查发现问题:")
+        for issue in issues:
+            print(f"  - {issue}")
+        print("将继续使用，但建议删除检查点文件重新开始。")
+    return chk
+
+
+# ── prune telemetry ───────────────────────────────────────────
+
+def display_prune_stats() -> None:
+    """Print a summary table of prune reasons and their frequencies."""
+    total = sum(PRUNE_STATS.values())
+    if total == 0:
+        return
+    print("\nPrune statistics:")
+    for k, v in PRUNE_STATS.most_common():
+        pct = 100.0 * v / total
+        print(f"  {k:<12} {v:>12,}  ({pct:5.1f}%)")
+
+
+# ── factor graph export ───────────────────────────────────────
+
+def export_factor_graph(st, path: str = "factor_graph") -> None:
+    """Export the σ-factor dependency graph for a candidate state.
+
+    Writes two files:
+      - ``{path}.dot`` — Graphviz DOT (human viewing via ``dot -Tpng``)
+      - ``{path}.json`` — machine-readable edge list with cycles
+    """
+    edges: List[dict] = []
+    for p, exp in st.assigned.items():
+        sig = int(sigma_prime_power(p, exp))
+        for q, _ in factorize(sig):
+            if q == 2:
+                continue
+            edges.append({"from": p, "to": q})
+
+    # ── DOT ──
+    with open(f"{path}.dot", "w") as f:
+        f.write("digraph OPN {\n")
+        f.write('  rankdir=LR;\n')
+        f.write('  node [shape=circle];\n')
+        seen_pairs = set()
+        for e in edges:
+            pair = (e["from"], e["to"])
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            f.write(f'  "{e["from"]}" -> "{e["to"]}";\n')
+        f.write("}\n")
+
+    # ── JSON ──
+    # detect cycles for analysis
+    adj: Dict[int, list] = {}
+    for e in edges:
+        adj.setdefault(e["from"], []).append(e["to"])
+    cycles = _find_cycles(adj)
+
+    with open(f"{path}.json", "w") as f:
+        json.dump({
+            "edges": edges,
+            "cycles": cycles,
+            "assigned": {str(p): exp for p, exp in st.assigned.items()},
+            "euler_prime": st.euler_prime,
+        }, f, indent=2)
+
+    print(f"Factor graph exported: {path}.dot, {path}.json")
+
+
+def _find_cycles(adj: Dict[int, list]) -> list:
+    """Return list of simple cycles in a directed graph (DFS-based)."""
+    cycles: list = []
+    visited: set = set()
+    stack: list = []
+
+    def dfs(node: int):
+        if node in stack:
+            cycle_start = stack.index(node)
+            cycles.append(stack[cycle_start:])
+            return
+        if node in visited:
+            return
+        visited.add(node)
+        stack.append(node)
+        for nb in adj.get(node, []):
+            dfs(nb)
+        stack.pop()
+
+    for start in adj:
+        if start not in visited:
+            dfs(start)
+    return cycles
+
+
+# ── checkpoint validation ─────────────────────────────────────
+
+def validate_checkpoint(chk: dict) -> List[str]:
+    """Validate a deserialised checkpoint dict.  Returns list of issues (empty = OK)."""
+    issues: List[str] = []
+
+    required_keys = ["primes", "max_factors", "max_exp", "heap", "total_states",
+                     "elapsed", "use_heap"]
+    for k in required_keys:
+        if k not in chk:
+            issues.append(f"missing key: {k}")
+
+    if issues:
+        return issues  # structural damage, stop early
+
+    # primes list vs current MAX_PRIME
+    if chk["primes"] and chk["primes"][-1] > MAX_EXP * 500:
+        issues.append("prime list looks mismatched (check MAX_PRIME)")
+
+    # heap counter consistency
+    heap = chk.get("heap", [])
+    heap_counter = chk.get("heap_counter", 0)
+    if len(heap) > 0 and heap_counter < len(heap):
+        issues.append(f"heap_counter ({heap_counter}) < heap length ({len(heap)})")
+
+    # validate ChainState invariants (only in factor-chain mode)
+    if chk.get("use_heap", False):
+        for entry in heap:
+            if isinstance(entry, (list, tuple)):
+                st = entry[2] if len(entry) >= 3 else entry[0]
+            else:
+                st = entry
+            if isinstance(st, ChainState):
+                if not validate_chain_state(st):
+                    issues.append("ChainState invariant violated in heap")
+
+    return issues
 
 
 # ── solutions file ────────────────────────────────────────────

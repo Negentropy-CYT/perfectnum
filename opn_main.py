@@ -34,7 +34,9 @@ from opn_core import (
     valid_even_exponents,
 )
 from opn_io import (
+    display_prune_stats,
     display_solution,
+    export_factor_graph,
     load_checkpoint,
     save_checkpoint,
     save_solutions_txt,
@@ -116,6 +118,7 @@ def main() -> None:
                 found_true += 1
             solutions.append((dict(st.assigned), st.euler_prime, st.pseudo))
             display_solution(st, len(solutions), time.time() - t0)
+            export_factor_graph(st)
             save_checkpoint(state_holder, solutions)
             save_solutions_txt(solutions)
 
@@ -123,6 +126,7 @@ def main() -> None:
         print("\n\n收到中断信号，正在保存 ...")
         save_checkpoint(state_holder, solutions)
         save_solutions_txt(solutions)
+        display_prune_stats()
         print(
             f"已保存。已完成 {state_holder.get('total_states', 0):,} 个状态"
         )
@@ -137,6 +141,7 @@ def main() -> None:
         f"\n搜索完成。总状态: {state_holder.get('total_states', 0):,}, "
         f"耗时: {elapsed:.1f}s"
     )
+    display_prune_stats()
 
     if solutions:
         print(f"\n=== 共 {found_true} 个真解 + {found_pseudo} 个伪解 ===")

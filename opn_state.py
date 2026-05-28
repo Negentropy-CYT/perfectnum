@@ -19,6 +19,7 @@ from typing import Deque, Dict, Optional, Tuple
 from gmpy2 import mpz
 
 from opn_core import (
+    PRUNE_STATS,
     _SIG_FACTORS,
     MAX_EXP,
     RESONANCE_REUSE_W,
@@ -118,6 +119,14 @@ class ChainState:
         )
 
 
+# ── prune telemetry helper ──────────────────────────────────
+
+def _reject(reason: str):
+    """Increment prune counter and return None (sentinel for pruned branch)."""
+    PRUNE_STATS[reason] += 1
+    return None
+
+
 # ── shared helpers ───────────────────────────────────────────
 
 def _euler_ok(p, exp, euler_prime):
@@ -156,11 +165,11 @@ def assign_prime_dfs(st: DFSState, p: int, exp: int,
                      max_exp: int = MAX_EXP) -> Optional[DFSState]:
     """Assign p^exp to a DFSState.  No factor-chain propagation."""
     if p in st.excluded or p in st.assigned:
-        return None
+        return _reject("excluded")
     if _early_ratio_prune(st.ratio_num, st.ratio_den, p, exp):
-        return None
+        return _reject("ratio")
     if not _euler_ok(p, exp, st.euler_prime):
-        return None
+        return _reject("euler")
 
     ns = st.clone()
     ns.assigned[p] = exp
@@ -172,7 +181,7 @@ def assign_prime_dfs(st: DFSState, p: int, exp: int,
         ns.euler_prime = p
 
     if not check_touchard(ns.euler_prime, ns.assigned, ns.excluded):
-        return None
+        return _reject("touchard")
 
     return ns
 
@@ -184,11 +193,11 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
                        max_exp: int = MAX_EXP) -> Optional[ChainState]:
     """Assign p^exp to a ChainState with full factor-chain propagation."""
     if p in st.excluded or p in st.assigned:
-        return None
+        return _reject("excluded")
     if _early_ratio_prune(st.ratio_num, st.ratio_den, p, exp):
-        return None
+        return _reject("ratio")
     if not _euler_ok(p, exp, st.euler_prime):
-        return None
+        return _reject("euler")
 
     ns = st.clone()
     ns.assigned[p] = exp
@@ -201,7 +210,7 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         ns.euler_prime = p
 
     if not check_touchard(ns.euler_prime, ns.assigned, ns.excluded):
-        return None
+        return _reject("touchard")
 
     # resonance (chain mode only)
     if propagate:
@@ -220,22 +229,46 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         if q == 2:
             continue
         if q in ns.excluded:
-            return None
+            return _reject("valuation")
 
         ns.required_v[q] = ns.required_v.get(q, 0) + e
 
         if q in ns.assigned:
             if ns.required_v[q] > ns.current_v[q]:
-                return None
+                return _reject("valuation")
         else:
             if ns.required_v[q] > _max_possible_valuation(q, ns.euler_prime,
                                                           max_exp):
-                return None
+                return _reject("valuation")
 
         if ns.required_v[q] > ns.current_v.get(q, 0):
             _enqueue_pending(ns, q)
 
     return ns
+
+
+# ── checkpoint validation ────────────────────────────────────
+
+def validate_chain_state(st: ChainState) -> bool:
+    """Check internal consistency of a ChainState after deserialisation.
+
+    Returns False if any invariant is violated (silent corruption guard).
+    """
+    # pending / pending_set must agree
+    if set(st.pending) != st.pending_set:
+        return False
+    # a pending prime must not already be assigned
+    for q in st.pending_set:
+        if q in st.assigned:
+            return False
+    # valuations must be non-negative
+    for q, rq in st.required_v.items():
+        if rq < 0:
+            return False
+        cq = st.current_v.get(q, 0)
+        if cq < 0:
+            return False
+    return True
 
 
 # ── resonance update ─────────────────────────────────────────

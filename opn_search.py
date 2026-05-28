@@ -1,40 +1,123 @@
 """
 opn_search — constraint-propagation factor-chain search engine.
 
-Exposes ``search_opn()``, a generator that yields ``(State, bool)``
-tuples for each valid odd-perfect-number or pseudo-OPN candidate
-discovered.
+Exposes ``search_opn()``, a generator that yields State objects for
+each valid OPN or pseudo-OPN candidate discovered.
 
-Supports two search strategies, selected by the *propagate* flag:
-  - DFS (stack)   — for independent-prime pseudo-solution search
-  - best-first    — for factor-chain true-OPN search (guided by
-                     resonance score and ratio proximity to 2)
+Supports two search strategies:
+  - DFS (stack)   — for pseudo-solution (DFSState)
+  - best-first    — for factor-chain true-OPN (ChainState)
+
+Polymorphic dispatch on state type; Touchard congruence pruning;
+optional contradiction-pattern learning cache.
 """
-
 import gmpy2
 import heapq
 import time
-from typing import List, Optional
+from typing import Callable, FrozenSet, List, Optional, Tuple, Union
 
 from gmpy2 import mpz
 
 from opn_core import (
     HEAP_MAX_SIZE,
     PROGRESS_INTERVAL,
+    check_touchard,
     precompute_sig_factors,
     ratio_lower_bound,
     ratio_upper_bound,
     sigma_prime_power,
     power_pa,
+    touchard_force_3,
     valid_euler_exponents,
     valid_even_exponents,
 )
-from opn_state import State, assign_prime, _compute_priority
+from opn_state import (
+    ChainState,
+    DFSState,
+    _compute_priority,
+    _enqueue_pending,
+    _max_possible_valuation,
+    assign_prime_chain,
+    assign_prime_dfs,
+)
+
+State = Union[DFSState, ChainState]
+"""Type alias covering both concrete state classes."""
 
 
-# ── verification ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Contradiction Learning Cache
+# ══════════════════════════════════════════════════════════════
+
+class ContradictionCache:
+    """Remembers valuation-deficit patterns that lead to contradiction.
+
+    Two-tier lookup:
+      1. Exact-match set — O(1) hash lookup for identical patterns.
+      2. Subsumption list — O(n) scan checking whether current state
+         is provably worse than a cached contradiction.
+
+    Only caches contradictions at depth >= MIN_CACHE_DEPTH (deeper
+    patterns generalise better).  Bounded by CACHE_MAX_SIZE with
+    FIFO eviction.  Disabled by default — enable via *use_cache*.
+    """
+
+    CACHE_MAX_SIZE  = 50_000
+    MIN_CACHE_DEPTH = 3
+
+    def __init__(self):
+        self._exact: set = set()
+        self._patterns: List[Tuple[FrozenSet[int], FrozenSet[int],
+                                     FrozenSet[Tuple[int, int]]]] = []
+
+    def add(self, assigned_keys, excluded_keys, deficit_items):
+        entry = (assigned_keys, excluded_keys, deficit_items)
+        self._exact.add(entry)
+        if len(self._patterns) >= self.CACHE_MAX_SIZE:
+            self._patterns.pop(0)   # FIFO eviction
+        self._patterns.append(entry)
+
+    def is_subsumed(self, assigned_keys, excluded_keys,
+                    required_v, current_v):
+        # Tier 1: exact match
+        cur_def = _make_deficit_frozenset(required_v, current_v)
+        exact = (assigned_keys, excluded_keys, cur_def)
+        if exact in self._exact:
+            return True
+
+        # Tier 2: subsumption scan
+        for a_keys, e_keys, def_items in self._patterns:
+            if not a_keys.issubset(assigned_keys):
+                continue
+            if not e_keys.issubset(excluded_keys):
+                continue
+            ok = True
+            for q, min_def in def_items:
+                if required_v.get(q, 0) - current_v.get(q, 0) < min_def:
+                    ok = False
+                    break
+            if ok:
+                return True
+        return False
+
+    def __len__(self):
+        return len(self._patterns)
+
+
+def _make_deficit_frozenset(required_v, current_v):
+    items = []
+    for q, req in required_v.items():
+        deficit = req - current_v.get(q, 0)
+        if deficit > 0:
+            items.append((q, deficit))
+    return frozenset(items)
+
+
+# ══════════════════════════════════════════════════════════════
+# Verification & pseudo check
+# ══════════════════════════════════════════════════════════════
+
 def _verify_solution(st: State) -> bool:
-    """Check σ(N) == 2N by recomputing from scratch."""
     lhs = mpz(1)
     rhs = mpz(1)
     for p, a in st.assigned.items():
@@ -43,19 +126,14 @@ def _verify_solution(st: State) -> bool:
     return lhs == 2 * rhs
 
 
-# ── pseudo-solution check ─────────────────────────────────────
 def _check_pseudo(st: State) -> bool:
-    """Test whether *st* admits a composite 'r' satisfying
-       (r+1)·∏σ(p^a) = 2r·∏p^a.   Sets ``st.pseudo = True`` on match."""
     if len(st.assigned) < 1 or st.ratio_num >= 2 * st.ratio_den:
         return False
-    # threshold: ratio must exceed 1.9 for r to be >= 19
     if 10 * st.ratio_num < 19 * st.ratio_den:
         return False
     denom = 2 * st.ratio_den - st.ratio_num
     if denom <= 0:
         return False
-    # use C-level divisibility check (avoids constructing remainder object)
     if not gmpy2.is_divisible(st.ratio_num, denom):
         return False
     r = st.ratio_num // denom
@@ -68,7 +146,10 @@ def _check_pseudo(st: State) -> bool:
     return True
 
 
-# ── main search ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Main search
+# ══════════════════════════════════════════════════════════════
+
 def search_opn(
     primes: List[int],
     max_factors: int,
@@ -78,49 +159,40 @@ def search_opn(
     *,
     propagate: bool = True,
     progress_callback=None,
+    use_cache: bool = False,
 ):
-    """Generator that yields ``State`` objects for each candidate found.
+    """Generator yielding State objects for each candidate found.
 
-    Parameters
-    ----------
-    primes:        sorted list of odd primes constituting the search alphabet.
-    max_factors:   maximum number of distinct prime factors in N.
-    max_exp:       maximum exponent to consider for any prime.
-    state_holder:      mutable dict updated each iteration for checkpoint saves.
-    resume_state:      dict from a previous checkpoint (or ``None``).
-    propagate:         ``True``  → factor-chain true-OPN search (best-first).
-                       ``False`` → independent-prime pseudo-solution search (DFS).
-    progress_callback: called as ``f(total_states, state, elapsed)`` each
-                       ``PROGRESS_INTERVAL`` iterations, or ``None``.
+    *propagate* selects DFSState (False) or ChainState (True).
+    *use_cache* enables the contradiction learning cache (chain mode).
     """
     n = len(primes)
+    cache = ContradictionCache() if use_cache else None
+    use_heap = propagate
 
-    # ── precompute σ-factor sets (only needed for factor-chain mode) ──
     if propagate:
         precompute_sig_factors(primes, max_exp)
-
-    # ── init container & stats ──
-    use_heap = propagate
 
     if resume_state is not None:
         heap = resume_state["heap"]
         total_states = resume_state["total_states"]
-        heap_counter  = resume_state.get("heap_counter", total_states)
+        heap_counter = resume_state.get("heap_counter", total_states)
         elapsed_offset = resume_state["elapsed"]
         use_heap = resume_state.get("use_heap", use_heap)
     else:
-        init_st = State()
-        init_st.priority = _compute_priority(mpz(1), mpz(1), 0.0, 0)
         if use_heap:
+            init_st = ChainState()
+            init_st.priority = _compute_priority(mpz(1), mpz(1), 0.0, 0)
             heap = [(init_st.priority, 0, init_st)]
             heap_counter = 1
         else:
+            init_st = DFSState()
             heap = [init_st]
             heap_counter = 0
-        total_states   = 0
+        total_states = 0
         elapsed_offset = 0.0
 
-    # ── helpers (heap/stack agnostic) ──
+    # ── push / pop helpers ──
     def _push(container, st):
         nonlocal heap_counter
         if use_heap:
@@ -150,16 +222,14 @@ def search_opn(
         state_holder["total_states"] = total_states
         state_holder["use_heap"]     = use_heap
 
-    # ── main loop ────────────────────────────────────────────
+    # ── main loop ──
     while heap:
-        # heap-size guard (best-first mode only)
         if use_heap and len(heap) > HEAP_MAX_SIZE:
             heap = heapq.nsmallest(HEAP_MAX_SIZE, heap)
             heapq.heapify(heap)
 
         st = _pop(heap)
 
-        # checkpoint snapshot
         if state_holder is not None:
             front = [(st.priority, heap_counter, st)] if use_heap else [st]
             state_holder["heap"]         = _snapshot(front + heap)
@@ -171,30 +241,32 @@ def search_opn(
         if total_states % PROGRESS_INTERVAL == 0 and progress_callback is not None:
             progress_callback(total_states, st, time.time() - t0)
 
-        # ── true-OPN check ──────────────────────────────────
+        # ── true-OPN check ──
         if (
             st.ratio_num == 2 * st.ratio_den
             and st.euler_prime is not None
             and len(st.assigned) >= 2
+            and check_touchard(st.euler_prime, st.assigned, st.excluded)
             and _verify_solution(st)
         ):
             st.pseudo = False
             yield st
             continue
 
-        # ── pseudo-solution check ───────────────────────────
+        # ── pseudo-solution check ──
         if _check_pseudo(st):
             yield st
             continue
 
-        # ── pruning ─────────────────────────────────────────
+        # ── pruning ──
         if st.ratio_num >= 2 * st.ratio_den:
             continue
         if len(st.assigned) >= max_factors:
             continue
 
         lb_num, lb_den = ratio_lower_bound(
-            st.ratio_num, st.ratio_den, st.pending,
+            st.ratio_num, st.ratio_den,
+            st.pending if use_heap else [],
         )
         if lb_num > 2 * lb_den:
             continue
@@ -204,15 +276,34 @@ def search_opn(
             st.assigned, st.excluded, primes,
         )
         if ub_num < 2 * ub_den:
+            if cache is not None and len(st.assigned) >= 3:
+                cache.add(frozenset(st.assigned.keys()),
+                          frozenset(st.excluded), frozenset())
             continue
 
-        # ── process pending (forced) primes ─────────────────
-        if _drain_and_process_pending(
-            st, heap, primes, max_exp, propagate, _push,
-        ):
-            continue
+        # ── Touchard: force 3 ──
+        if use_heap and touchard_force_3(st.euler_prime, st.assigned,
+                                         st.excluded):
+            _enqueue_pending(st, 3)
 
-        # ── expansion (branch on next unprocessed prime) ────
+        # ── contradiction cache check ──
+        if use_heap and cache is not None and len(st.assigned) >= 3:
+            if cache.is_subsumed(
+                frozenset(st.assigned.keys()),
+                frozenset(st.excluded),
+                st.required_v,
+                st.current_v,
+            ):
+                continue
+
+        # ── pending (chain mode) ──
+        if use_heap:
+            if _drain_and_process_pending(
+                st, heap, primes, max_exp, _push, cache,
+            ):
+                continue
+
+        # ── expansion ──
         idx = st.next_idx
         while idx < n:
             p = primes[idx]
@@ -224,30 +315,26 @@ def search_opn(
             skip_st = st.clone()
             skip_st.excluded.add(p)
             skip_st.next_idx = idx + 1
-            skip_st.priority = _compute_priority(
-                skip_st.ratio_num, skip_st.ratio_den,
-                skip_st.resonance, len(skip_st.assigned),
-            )
             _push(heap, skip_st)
 
-            # Euler-include branches
+            # Euler-include
             if st.euler_prime is None and p % 4 == 1:
                 for e in reversed(valid_euler_exponents(1, max_exp)):
-                    ns = assign_prime(st, p, e, propagate=propagate, max_exp=max_exp)
+                    ns = _assign(st, p, e, use_heap, propagate, max_exp)
                     if ns is not None:
                         ns.next_idx = idx + 1
                         _push(heap, ns)
 
-            # non-Euler include branches
+            # non-Euler include
             for e in reversed(valid_even_exponents(2, max_exp)):
-                ns = assign_prime(st, p, e, propagate=propagate, max_exp=max_exp)
+                ns = _assign(st, p, e, use_heap, propagate, max_exp)
                 if ns is not None:
                     ns.next_idx = idx + 1
                     _push(heap, ns)
 
             break
 
-    # ── search exhausted ────────────────────────────────────
+    # ── exhausted ──
     elapsed = time.time() - t0
     print(f"\n搜索完成: {total_states:,} states, {elapsed:.1f}s")
     if state_holder is not None:
@@ -257,15 +344,27 @@ def search_opn(
         state_holder["elapsed"]       = elapsed
 
 
-# ── pending-prime processing ───────────────────────────────────
+# ── polymorphic assign dispatch ──────────────────────────────
+
+def _assign(st: State, p: int, exp: int, use_heap: bool,
+            propagate: bool, max_exp: int) -> Optional[State]:
+    """Dispatch to DFSState or ChainState assign function."""
+    if use_heap:
+        return assign_prime_chain(st, p, exp, propagate=propagate,
+                                   max_exp=max_exp)
+    else:
+        return assign_prime_dfs(st, p, exp, max_exp=max_exp)
+
+
+# ── pending processing (chain mode) ──────────────────────────
+
 def _drain_and_process_pending(
-    st: State, heap, primes, max_exp: int, propagate: bool, _push,
+    st: ChainState, heap, primes, max_exp: int, _push,
+    cache,
 ) -> bool:
-    """Pop one pending forced prime and push its exponent branches."""
     if not st.pending:
         return False
 
-    # drain already-assigned or out-of-range entries
     while st.pending and (
         st.pending[0] in st.assigned
         or st.pending[0] > primes[-1]
@@ -280,16 +379,14 @@ def _drain_and_process_pending(
     st.pending_set.discard(q)
     lb = max(st.required_v.get(q, 1) - st.current_v.get(q, 0), 1)
 
-    # Euler-candidate branches
     if st.euler_prime is None and q % 4 == 1:
         for e in reversed(valid_euler_exponents(lb, max_exp)):
-            ns = assign_prime(st, q, e, propagate=propagate, max_exp=max_exp)
+            ns = assign_prime_chain(st, q, e, propagate=True, max_exp=max_exp)
             if ns is not None:
                 _push(heap, ns)
 
-    # non-Euler branches
     for e in reversed(valid_even_exponents(lb, max_exp)):
-        ns = assign_prime(st, q, e, propagate=propagate, max_exp=max_exp)
+        ns = assign_prime_chain(st, q, e, propagate=True, max_exp=max_exp)
         if ns is not None:
             _push(heap, ns)
 

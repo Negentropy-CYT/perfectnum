@@ -195,3 +195,52 @@ def ratio_lower_bound(
         num *= (p + 1)
         den *= p
     return num, den
+
+
+# ── Touchard congruence pruning (O(1), no modulo) ──────────────
+
+def check_touchard(euler_prime, assigned, excluded):
+    """Check Touchard's theorem: any OPN satisfies N≡1(mod12) or N≡9(mod36).
+
+    Returns True if the partial state is consistent with Touchard.
+    Returns False if a contradiction is detected (prune this branch).
+
+    Case A: 3 ∈ N → exponent must be even (3 ≡ 3 mod 4, can't be Euler)
+                     → 3² | N → always satisfiable with remaining freedom.
+    Case B: 3 ∉ N → N ≡ 1 (mod 12) → if Euler ≡ 2 (mod 3), then
+                     the odd-exponent contribution ≡ 2 (mod 3), requiring
+                     3 | N to reach N ≡ 0 or 1 (mod 3).
+                     If 3 ∉ N and Euler ≡ 2 mod 3 → contradiction.
+    """
+    has_3 = 3 in assigned
+    excluded_3 = 3 in excluded
+
+    if has_3:
+        exp3 = assigned[3]
+        if exp3 % 2 == 1:
+            return False      # 3 ≡ 3 mod 4, cannot be the Euler prime
+        if exp3 < 2:
+            return False
+        return True
+
+    if euler_prime is None:
+        return True            # Euler not yet chosen — defer check
+
+    if euler_prime % 3 == 2:
+        if excluded_3:
+            return False       # 3 explicitly excluded → impossible
+
+    return True
+
+
+def touchard_force_3(euler_prime, assigned, excluded):
+    """Return True if prime 3 MUST be included in N based on Touchard.
+
+    This happens when Euler ≡ 2 (mod 3) — the Euler prime's contribution
+    to N mod 3 is 2, requiring 3 | N to reach N ≡ 0 or ≡ 1 (mod 3).
+    """
+    if 3 in assigned or 3 in excluded:
+        return False
+    if euler_prime is None:
+        return False
+    return euler_prime % 3 == 2

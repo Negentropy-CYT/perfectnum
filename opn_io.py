@@ -25,11 +25,11 @@ from opn_core import (
     power_pa,
     sigma_prime_power,
 )
-from opn_state import State
+from opn_state import ChainState, DFSState
 
 
 # ── display ───────────────────────────────────────────────────
-def display_solution(st: State, sol_num: int, elapsed: float) -> None:
+def display_solution(st, sol_num: int, elapsed: float) -> None:
     """Print a single candidate (true OPN or pseudo) to stdout."""
     if st.pseudo:
         _display_pseudo(st, sol_num, elapsed)
@@ -50,7 +50,7 @@ def display_solution(st: State, sol_num: int, elapsed: float) -> None:
         _print_factor_chain(st)
 
 
-def _display_pseudo(st: State, sol_num: int, elapsed: float) -> None:
+def _display_pseudo(st, sol_num: int, elapsed: float) -> None:
     """Print a pseudo-OPN candidate with its composite r-factor."""
     denom = 2 * st.ratio_den - st.ratio_num
     r = st.ratio_num // denom
@@ -68,11 +68,12 @@ def _display_pseudo(st: State, sol_num: int, elapsed: float) -> None:
     print(f"  |factors|      = {len(st.assigned)} + r")
     print(f"  r (composite)  = {r}  =  {r_str}")
     print(f"  r ≡ 1 mod 4    = {r % 4 == 1}")
-    print(f"  resonance      = {st.resonance:+.2f}")
+    res = getattr(st, 'resonance', 0.0)
+    print(f"  resonance      = {res:+.2f}")
     print(f"  elapsed        = {elapsed:.1f}s")
 
 
-def _display_true_opn(st: State, sol_num: int, elapsed: float) -> None:
+def _display_true_opn(st, sol_num: int, elapsed: float) -> None:
     """Print a true OPN candidate with Euler-prime verification."""
     n_val = mpz(1)
     for p, a in st.assigned.items():
@@ -86,11 +87,12 @@ def _display_true_opn(st: State, sol_num: int, elapsed: float) -> None:
     print(f"  Euler      = {st.euler_prime}")
     print(f"  σ(N)/N     = {float(st.ratio_num) / float(st.ratio_den):.12f}")
     print(f"  verified   = {_verify(st)}")
-    print(f"  resonance  = {st.resonance:+.2f}")
+    res = getattr(st, 'resonance', 0.0)
+    print(f"  resonance  = {res:+.2f}")
     print(f"  elapsed    = {elapsed:.1f}s")
 
 
-def _verify(st: State) -> bool:
+def _verify(st) -> bool:
     """Recompute σ(N) from scratch to confirm σ(N) == 2N."""
     lhs = mpz(1)
     rhs = mpz(1)
@@ -100,7 +102,7 @@ def _verify(st: State) -> bool:
     return lhs == 2 * rhs
 
 
-def _print_factor_chain(st: State) -> None:
+def _print_factor_chain(st) -> None:
     """Trace σ-propagation from the Euler prime outward (BFS)."""
     print(f"\n  Factor chain (from Euler prime {st.euler_prime}):")
     seen: set[int] = set()

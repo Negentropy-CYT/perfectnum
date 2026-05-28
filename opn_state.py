@@ -1,11 +1,16 @@
 """
-opn_state — search state and constraint propagation.
+opn_state — polymorphic search states and constraint propagation.
 
-Defines the ``State`` dataclass and the core ``assign_prime`` function
-that enforces Euler constraints, computes σ(p^a), propagates
-q-adic valuations, and updates the resonance heuristic score.
+Defines two state classes:
+  - DFSState   — minimal (5 fields) for pseudo-solution DFS
+  - ChainState — full (14 fields) for factor-chain best-first search
+
+Key improvements over v1 unified State:
+  - DFSState.clone() copies 2 collections vs 7 → ~60% less overhead
+  - Separate assign_prime_dfs / assign_prime_chain functions
+  - Touchard congruence pruning integrated into both paths
+  - Additive q-adic valuation contradiction detection (chain mode)
 """
-
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -21,58 +26,81 @@ from opn_core import (
     RESONANCE_GIANT_W,
     PRIORITY_RESONANCE_W,
     PRIORITY_DEPTH_W,
+    check_touchard,
     factorize,
     power_pa,
     sigma_prime_power,
+    touchard_force_3,
 )
 
 
-# ── priority helper ───────────────────────────────────────────
-def _compute_priority(
-    ratio_num: mpz, ratio_den: mpz, resonance: float, n_assigned: int,
-) -> float:
-    """Heap ordering key — lower value is explored first."""
+# ── priority helper ──────────────────────────────────────────
+def _compute_priority(ratio_num, ratio_den, resonance, n_assigned):
     ratio = float(ratio_num) / float(ratio_den)
     return (abs(2.0 - ratio)
             - PRIORITY_RESONANCE_W * resonance
             - PRIORITY_DEPTH_W * n_assigned)
 
 
-# ── State ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# DFSState — minimal state for pseudo-solution DFS
+# ══════════════════════════════════════════════════════════════
+
 @dataclass(slots=True)
-class State:
-    """One node in the constraint-propagation search tree."""
+class DFSState:
+    """Minimal state for DFS pseudo-solution search (propagate=False).
 
-    # ── prime factorisation of the candidate ──
+    Omits: required_v, current_v, pending, pending_set, resonance, priority.
+    Saves 5 collection deep-copies per clone vs the old unified State.
+    """
+
     assigned:    Dict[int, int] = field(default_factory=dict)
-    required_v:  Dict[int, int] = field(default_factory=dict)   # Σ v_q from σ side
-    current_v:   Dict[int, int] = field(default_factory=dict)   # v_q already in N
+    excluded:    set[int]       = field(default_factory=set)
+    euler_prime: int | None     = None
+    ratio_num:   mpz            = field(default_factory=lambda: mpz(1))
+    ratio_den:   mpz            = field(default_factory=lambda: mpz(1))
+    next_idx:    int            = 0
+    depth:       int            = 0
+    pseudo:      bool           = False
 
-    # ── search-space partitioning ──
-    excluded:    set[int]              = field(default_factory=set)
-    pending:     Deque[int]            = field(default_factory=deque)
-    pending_set: set[int]              = field(default_factory=set)
+    def clone(self) -> "DFSState":
+        return DFSState(
+            assigned=dict(self.assigned),
+            excluded=set(self.excluded),
+            euler_prime=self.euler_prime,
+            ratio_num=mpz(self.ratio_num),
+            ratio_den=mpz(self.ratio_den),
+            next_idx=self.next_idx,
+            depth=self.depth + 1,
+            pseudo=self.pseudo,
+        )
 
-    # ── Euler (special) prime ──
-    euler_prime: Optional[int]         = None
 
-    # ── accumulated σ(N)/N ──
-    ratio_num:   mpz                   = mpz(1)
-    ratio_den:   mpz                   = mpz(1)
+# ══════════════════════════════════════════════════════════════
+# ChainState — full state for factor-chain best-first search
+# ══════════════════════════════════════════════════════════════
 
-    # ── search progress ──
-    next_idx:    int                   = 0
-    depth:       int                   = 0
-    pseudo:      bool                  = False
+@dataclass(slots=True)
+class ChainState:
+    """Full state for factor-chain true-OPN search (propagate=True)."""
 
-    # ── heuristic guidance ──
-    resonance:   float                 = 0.0
-    priority:    float                 = 0.0
+    assigned:    Dict[int, int]  = field(default_factory=dict)
+    required_v:  Dict[int, int]  = field(default_factory=dict)
+    current_v:   Dict[int, int]  = field(default_factory=dict)
+    excluded:    set[int]        = field(default_factory=set)
+    pending:     Deque[int]      = field(default_factory=deque)
+    pending_set: set[int]        = field(default_factory=set)
+    euler_prime: int | None      = None
+    ratio_num:   mpz             = field(default_factory=lambda: mpz(1))
+    ratio_den:   mpz             = field(default_factory=lambda: mpz(1))
+    next_idx:    int             = 0
+    depth:       int             = 0
+    pseudo:      bool            = False
+    resonance:   float           = 0.0
+    priority:    float           = 0.0
 
-    # ──────────────────────────────────────────────────────────
-    def clone(self) -> "State":
-        """Deep-copy the state (used before branching)."""
-        return State(
+    def clone(self) -> "ChainState":
+        return ChainState(
             assigned=dict(self.assigned),
             required_v=dict(self.required_v),
             current_v=dict(self.current_v),
@@ -90,57 +118,92 @@ class State:
         )
 
 
-# ── pending-queue helper ──────────────────────────────────────
-def _enqueue_pending(st: State, q: int) -> None:
-    """Add *q* to the pending queue if not already there or assigned."""
+# ── shared helpers ───────────────────────────────────────────
+
+def _euler_ok(p, exp, euler_prime):
+    if exp % 2 == 1:
+        if p % 4 != 1 or exp % 4 != 1:
+            return False
+        if euler_prime is not None:
+            return False
+    return True
+
+
+def _early_ratio_prune(ratio_num, ratio_den, p, exp):
+    sig = sigma_prime_power(p, exp)
+    pa = mpz(power_pa(p, exp))
+    return ratio_num * sig >= 2 * ratio_den * pa
+
+
+def _enqueue_pending(st, q):
     if q not in st.pending_set and q not in st.assigned:
         st.pending.append(q)
         st.pending_set.add(q)
 
 
-# ── constraint propagation ────────────────────────────────────
-def assign_prime(
-    st: State, p: int, exp: int, *, propagate: bool = True,
-    max_exp: int = MAX_EXP,
-) -> Optional[State]:
-    """Return a new ``State`` with *p* ^ *exp* assigned, or ``None``.
+def _max_possible_valuation(q, euler_prime, max_exp):
+    if q == euler_prime:
+        x = max_exp
+        while x % 4 != 1 and x > 0:
+            x -= 1
+        return max(x, 1)
+    return max_exp if max_exp % 2 == 0 else max_exp - 1
 
-    Performs (in order):
-    1. early ratio pruning (skip clone if ratio already >= 2)
-    2. Euler-prime constraint checks
-    3. clone + ratio update
-    4. resonance-score update via precomputed σ-factor sets
-    5. factor-chain propagation (only when *propagate* is True)
-    """
-    # ── trivial rejection ──
+
+# ── assign_prime_dfs (lightweight, no propagation) ───────────
+
+def assign_prime_dfs(st: DFSState, p: int, exp: int,
+                     max_exp: int = MAX_EXP) -> Optional[DFSState]:
+    """Assign p^exp to a DFSState.  No factor-chain propagation."""
     if p in st.excluded or p in st.assigned:
         return None
-
-    # ── early ratio pruning (before clone) ──
-    sig    = sigma_prime_power(p, exp)
-    pa     = mpz(power_pa(p, exp))
-    new_num = st.ratio_num * sig
-    new_den = st.ratio_den * pa
-    if new_num >= 2 * new_den:
+    if _early_ratio_prune(st.ratio_num, st.ratio_den, p, exp):
+        return None
+    if not _euler_ok(p, exp, st.euler_prime):
         return None
 
-    # ── Euler constraints (before clone for early exit) ──
-    if exp % 2 == 1:
-        if p % 4 != 1 or exp % 4 != 1:
-            return None
-        if st.euler_prime is not None:
-            return None
-
-    # ── clone & apply ──
     ns = st.clone()
-    ns.assigned[p]  = exp
-    ns.current_v[p]  = ns.current_v.get(p, 0) + exp
-    ns.ratio_num     = new_num
-    ns.ratio_den     = new_den
+    ns.assigned[p] = exp
+    sig = sigma_prime_power(p, exp)
+    pa = mpz(power_pa(p, exp))
+    ns.ratio_num = st.ratio_num * sig
+    ns.ratio_den = st.ratio_den * pa
     if exp % 2 == 1:
         ns.euler_prime = p
 
-    # ── resonance score (factor-chain mode only) ──
+    if not check_touchard(ns.euler_prime, ns.assigned, ns.excluded):
+        return None
+
+    return ns
+
+
+# ── assign_prime_chain (full factor-chain propagation) ───────
+
+def assign_prime_chain(st: ChainState, p: int, exp: int, *,
+                       propagate: bool = True,
+                       max_exp: int = MAX_EXP) -> Optional[ChainState]:
+    """Assign p^exp to a ChainState with full factor-chain propagation."""
+    if p in st.excluded or p in st.assigned:
+        return None
+    if _early_ratio_prune(st.ratio_num, st.ratio_den, p, exp):
+        return None
+    if not _euler_ok(p, exp, st.euler_prime):
+        return None
+
+    ns = st.clone()
+    ns.assigned[p] = exp
+    ns.current_v[p] = ns.current_v.get(p, 0) + exp
+    sig = sigma_prime_power(p, exp)
+    pa = mpz(power_pa(p, exp))
+    ns.ratio_num = st.ratio_num * sig
+    ns.ratio_den = st.ratio_den * pa
+    if exp % 2 == 1:
+        ns.euler_prime = p
+
+    if not check_touchard(ns.euler_prime, ns.assigned, ns.excluded):
+        return None
+
+    # resonance (chain mode only)
     if propagate:
         _update_resonance(ns, st, p, exp)
         ns.priority = _compute_priority(
@@ -152,22 +215,19 @@ def assign_prime(
     if not propagate:
         return ns
 
-    # ── factor-chain propagation (additive valuation) ──
+    # factor-chain propagation (additive valuation)
     for q, e in factorize(int(sig)):
         if q == 2:
             continue
         if q in ns.excluded:
-            return None                     # contradiction
+            return None
 
         ns.required_v[q] = ns.required_v.get(q, 0) + e
 
-        # ── valuation contradiction detection ──
         if q in ns.assigned:
-            # q's exponent in N is already fixed; σ-side cannot demand more
             if ns.required_v[q] > ns.current_v[q]:
                 return None
         else:
-            # q not yet assigned: check if σ demand exceeds what N can supply
             if ns.required_v[q] > _max_possible_valuation(q, ns.euler_prime,
                                                           max_exp):
                 return None
@@ -178,37 +238,18 @@ def assign_prime(
     return ns
 
 
-def _max_possible_valuation(q: int, euler_prime: int | None,
-                            max_exp: int) -> int:
-    """Maximum exponent that prime *q* could receive in N."""
-    if q == euler_prime:
-        # Euler prime: largest exponent ≡ 1 (mod 4) ≤ max_exp
-        x = max_exp
-        while x % 4 != 1 and x > 0:
-            x -= 1
-        return max(x, 1)
-    else:
-        # non-Euler: largest even exponent ≤ max_exp
-        return max_exp if max_exp % 2 == 0 else max_exp - 1
+# ── resonance update ─────────────────────────────────────────
 
-
-# ── resonance update ──────────────────────────────────────────
-def _update_resonance(
-    ns: State, parent: State, p: int, exp: int,
-) -> None:
-    """Adjust *ns.resonance* based on σ-factor overlap with parent state."""
+def _update_resonance(ns, parent, p, exp):
     if not _SIG_FACTORS:
         return
     factors_set = _SIG_FACTORS.get((p, exp))
     if factors_set is None:
         return
-
     assigned_keys = parent.assigned.keys()
     reuse = len(factors_set & assigned_keys)
-    newf  = len(factors_set - assigned_keys)
-
+    newf = len(factors_set - assigned_keys)
     ns.resonance += reuse * RESONANCE_REUSE_W - newf * RESONANCE_NEWF_W
-
     new_primes = factors_set - assigned_keys
     if new_primes:
         largest = max(new_primes)

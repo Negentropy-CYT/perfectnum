@@ -67,6 +67,11 @@ appear in N.  This creates **forced chains** — including one prime
 forces others.  The search engine propagates these constraints
 additively, tracking q-adic valuations.
 
+Engines incorporate **Touchard's theorem** ($N \equiv 1 \pmod{12}$ or
+$N \equiv 9 \pmod{36}$) as an O(1) congruence check, and an optional
+**contradiction learning cache** that remembers pruned valuation-deficit
+patterns to short-circuit isomorphic dead subtrees.
+
 ---
 
 ## Project Structure
@@ -82,16 +87,16 @@ opn_core.py        Arithmetic engine
                      · ratio upper/lower bounds
                      · all user-configurable constants
 opn_state.py       Search state & constraint propagation
-                     · State dataclass (slots)
-                     · assign_prime() — Euler constraints,
-                       resonance score, additive valuation,
-                       factor-chain propagation
+                     · DFSState (5 fields) — lightweight pseudo-solution DFS
+                     · ChainState (14 fields) — full factor-chain search
+                     · assign_prime_dfs / assign_prime_chain — separate
+                       constraint propagation per mode
                      · pending-queue dedup helpers
 opn_search.py      Search engine
-                     · search_opn() — generator yielding candidates
-                     · DFS (stack) for pseudo-solution mode
-                     · best-first (heap) for factor-chain mode
-                     · pending-prime processing
+                     · search_opn() — generator with polymorphic dispatch
+                     · DFS (stack) for pseudo-solution mode (DFSState)
+                     · best-first (heap) for factor-chain mode (ChainState)
+                     · Touchard congruence pruning + contradiction-learning cache
                      · true-OPN & pseudo-solution checks
 opn_io.py          Display, checkpoint, file I/O
                      · display_solution()
@@ -158,13 +163,15 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 1. **Brent Pollard-Rho factorisation** — each $\sigma(p^{a})$ must be fully
    factorised to propagate factor chains.  The legacy engine never factorises
    $\sigma$ values — it only multiplies them into the running product.
-2. **State cloning** — the `State` dataclass carries 10 fields (7 collections);
-   `clone()` deep-copies all of them.  The legacy engine reuses 5-element tuples.
+2. **State cloning** — `ChainState` carries 14 fields (7 collections); `clone()`
+   deep-copies all of them.  In DFS mode the lightweight `DFSState` (5 fields,
+   2 collections) avoids this overhead.  The legacy engine reuses 5-element tuples.
 3. **Resonance computation** — computing σ-factor overlap via set intersections on
-   every `assign_prime` call adds measurable overhead.
+   every `assign_prime_chain` call adds measurable overhead.  In DFS mode this
+   is skipped entirely.
 4. **Best-first heap** — `heapq.heappush`/`heappop` are $O(\log h)$ vs
    $O(1)$ stack operations.  With `HEAP_MAX_SIZE = 200 000`, each push costs
-   ∼18 comparisons.
+   ∼18 comparisons.  DFS mode uses a plain stack.
 
 ### Why the Current Engine Matters Despite the Slowdown
 
@@ -178,6 +185,11 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 - **The additive q-adic valuation** provides a correctness guarantee that the
   legacy `max()` heuristic lacks: tracking $\sum v_q(\sigma(\cdot))$ against
   $v_q(N)$ enables precise contradiction detection.
+- **Touchard congruence pruning** catches impossible branches in O(1) without
+  any modulo arithmetic, by tracking prime 3's assigned/excluded status.
+- **The contradiction learning cache** (optional, chain mode) remembers
+  pruned valuation-deficit patterns, short-circuiting isomorphic dead subtrees
+  in long-running searches.
 
 ### When to Use Which
 

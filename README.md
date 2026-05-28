@@ -17,7 +17,7 @@ python opn_main.py
 ```
 
 Default configuration searches for **pseudo-OPN candidates** (composite
-"Euler factor") with primes ≤ 500, up to 8 distinct factors, exponent 2.
+"Euler factor") with primes ≤ 400, up to 7 distinct factors, exponent 2.
 A 12-digit Descartes-type pseudo-candidate is found in ~7 minutes.
 
 ---
@@ -87,8 +87,10 @@ opn_core.py        Arithmetic engine
                      · ratio upper/lower bounds
                      · all user-configurable constants
 opn_state.py       Search state & constraint propagation
-                     · DFSState (5 fields) — lightweight pseudo-solution DFS
-                     · ChainState (14 fields) — full factor-chain search
+                     · DFSState (8 fields, 2 collections cloned) — lightweight
+                       pseudo-solution DFS
+                     · ChainState (14 fields, 7 collections cloned) — full
+                       factor-chain search
                      · assign_prime_dfs / assign_prime_chain — separate
                        constraint propagation per mode
                      · pending-queue dedup helpers
@@ -164,7 +166,7 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
    factorised to propagate factor chains.  The legacy engine never factorises
    $\sigma$ values — it only multiplies them into the running product.
 2. **State cloning** — `ChainState` carries 14 fields (7 collections); `clone()`
-   deep-copies all of them.  In DFS mode the lightweight `DFSState` (5 fields,
+   deep-copies all of them.  In DFS mode the lightweight `DFSState` (8 fields,
    2 collections) avoids this overhead.  The legacy engine reuses 5-element tuples.
 3. **Resonance computation** — computing σ-factor overlap via set intersections on
    every `assign_prime_chain` call adds measurable overhead.  In DFS mode this
@@ -234,9 +236,9 @@ programmatically):
 ```python
 # opn_core.py
 
-MAX_PRIME   = 500        # largest odd prime considered
-MAX_FACTORS = 8          # max distinct prime factors in N
-MAX_EXP     = 4          # max exponent for any prime
+MAX_PRIME   = 400        # largest odd prime considered
+MAX_FACTORS = 7          # max distinct prime factors in N
+MAX_EXP     = 2          # max exponent for any prime
                          #   2 = a_i=1 restriction
                          #   6+ = variable exponents
 PROPAGATE   = False      # False → pseudo-solution search
@@ -252,7 +254,7 @@ PROPAGATE   = False      # False → pseudo-solution search
 
 ### Interpreting Output
 
-**Progress line** (updates in-place every ~100K states):
+**Progress line** (update interval set by `PROGRESS_INTERVAL` in `opn_core.py`):
 ```
 [Progress] States:  884,300,000 | Time:  582.1s | Rate: 1519000/s | |f|=8 ratio=1.8486 reson=-3.42
 ```

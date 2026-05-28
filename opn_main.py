@@ -34,14 +34,13 @@ from opn_core import (
     valid_even_exponents,
 )
 from opn_io import (
-    display_clone_effectiveness,
-    display_depth_histogram,
-    display_prune_stats,
     display_solution,
+    display_telemetry_brief,
     export_factor_graph,
     load_checkpoint,
     save_checkpoint,
     save_solutions_txt,
+    write_telemetry_report,
 )
 from opn_search import search_opn
 
@@ -128,9 +127,8 @@ def main() -> None:
         print("\n\n收到中断信号，正在保存 ...")
         save_checkpoint(state_holder, solutions)
         save_solutions_txt(solutions)
-        display_prune_stats()
-        display_depth_histogram()
-        display_clone_effectiveness()
+        write_telemetry_report(time.time() - t0, found_true + found_pseudo)
+        display_telemetry_brief()
         print(
             f"已保存。已完成 {state_holder.get('total_states', 0):,} 个状态"
         )
@@ -145,9 +143,8 @@ def main() -> None:
         f"\n搜索完成。总状态: {state_holder.get('total_states', 0):,}, "
         f"耗时: {elapsed:.1f}s"
     )
-    display_prune_stats()
-    display_depth_histogram()
-    display_clone_effectiveness()
+    write_telemetry_report(elapsed, found_true + found_pseudo)
+    display_telemetry_brief()
 
     if solutions:
         print(f"\n=== 共 {found_true} 个真解 + {found_pseudo} 个伪解 ===")

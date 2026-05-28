@@ -18,10 +18,25 @@ from typing import Deque, Dict, List, Optional, Tuple
 from gmpy2 import mpz
 
 from opn_core import (
+    CASCADE_DEPTH_HIST,
     CHECKPOINT_FILE,
+    CLONE_PAYLOAD,
     CLONE_STATS,
+    CONTRADICTION_ATTR,
+    DEPTH_FACTOR_MAP,
     DEPTH_STATS,
+    EXCLUDE_EXP_4,
+    EXP4_FILTER_HITS,
+    HEADROOM_BY_FACTOR,
+    MAX_PRIME,
+    OBLIGATION_SIGS,
+    PENDING_SIZE_HIST,
+    PROPAGATE,
+    PROPAGATION_EDGES,
     PRUNE_STATS,
+    RATIO_HEADROOM,
+    TELEMETRY_FILE,
+    _SIG_FACTORS,
     SOLUTIONS_FILE,
     MAX_FACTORS,
     MAX_EXP,
@@ -148,6 +163,16 @@ def save_checkpoint(state_holder: dict, solutions: list) -> None:
         "prune_stats":  dict(PRUNE_STATS),
         "depth_stats":  dict(DEPTH_STATS),
         "clone_stats":  dict(CLONE_STATS),
+        "pending_size": dict(PENDING_SIZE_HIST),
+        "cascade_depth":dict(CASCADE_DEPTH_HIST),
+        "prop_edges":   [(k, v) for k, v in PROPAGATION_EDGES.items()],
+        "clone_payload":dict(CLONE_PAYLOAD),
+        "ratio_headroom":dict(RATIO_HEADROOM),
+        "depth_factor":  [(k, v) for k, v in DEPTH_FACTOR_MAP.items()],
+        "headroom_by_f": [(k, v) for k, v in HEADROOM_BY_FACTOR.items()],
+        "obligation_sigs":[(k, v) for k, v in OBLIGATION_SIGS.items()],
+        "exp4_filter":   dict(EXP4_FILTER_HITS),
+        "contradiction_attr": dict(CONTRADICTION_ATTR),
     }
     tmp = CHECKPOINT_FILE + ".tmp"
     with open(tmp, "wb") as f:
@@ -184,62 +209,216 @@ def load_checkpoint() -> Optional[dict]:
         DEPTH_STATS.update({int(k): v for k, v in chk["depth_stats"].items()})
     if chk.get("clone_stats"):
         CLONE_STATS.update(chk["clone_stats"])
+    if chk.get("contradiction_attr"):
+        CONTRADICTION_ATTR.update(
+            {(int(k[0]), k[1]): v for k, v in chk["contradiction_attr"].items()}
+        )
+    if chk.get("pending_size"):
+        PENDING_SIZE_HIST.update({int(k): v for k, v in chk["pending_size"].items()})
+    if chk.get("cascade_depth"):
+        CASCADE_DEPTH_HIST.update({int(k): v for k, v in chk["cascade_depth"].items()})
+    if chk.get("prop_edges"):
+        PROPAGATION_EDGES.update({(int(k[0]), int(k[1])): v for k, v in chk["prop_edges"]})
+    if chk.get("clone_payload"):
+        CLONE_PAYLOAD.update({int(k): v for k, v in chk["clone_payload"].items()})
+    if chk.get("ratio_headroom"):
+        RATIO_HEADROOM.update(chk["ratio_headroom"])
+    if chk.get("depth_factor"):
+        DEPTH_FACTOR_MAP.update({(int(k[0]), int(k[1])): v for k, v in chk["depth_factor"]})
+    if chk.get("headroom_by_f"):
+        HEADROOM_BY_FACTOR.update({(int(k[0]), k[1]): v for k, v in chk["headroom_by_f"]})
+    if chk.get("obligation_sigs"):
+        OBLIGATION_SIGS.update(
+            {(frozenset(k[0]), int(k[1]), int(k[2])): v for k, v in chk["obligation_sigs"]})
+    if chk.get("exp4_filter"):
+        EXP4_FILTER_HITS.update({int(k): v for k, v in chk["exp4_filter"].items()})
 
     return chk
 
 
-# ── prune telemetry ───────────────────────────────────────────
+# ── telemetry report (file output) ────────────────────────────
 
-def display_prune_stats() -> None:
-    """Print a summary table of prune reasons and their frequencies.
+def write_telemetry_report(elapsed: float, solutions_found: int) -> None:
+    """Write comprehensive telemetry to TELEMETRY_FILE."""
+    lines: List[str] = []
+    w = lines.append
 
-    Shows raw count + share of all prunes + rate per 1000 clones (if available).
-    """
-    total = sum(PRUNE_STATS.values())
-    if total == 0:
-        return
-    total_clones = CLONE_STATS.get("total", 0)
-    print("\nPrune statistics:")
-    for k, v in PRUNE_STATS.most_common():
-        pct = 100.0 * v / total
-        if total_clones:
-            rate = 1000.0 * v / total_clones
-            print(f"  {k:<12} {v:>12,}  ({pct:5.1f}% of prunes, {rate:5.1f}‰ of clones)")
+    mode = "chain (true OPN)" if PROPAGATE else "DFS (pseudo-OPN)"
+    w(f"# OPN Search Telemetry  |  {elapsed:.1f}s  |  {solutions_found} solutions  |  {mode}\n")
+
+    # ── prune stats ──
+    pr_total = sum(PRUNE_STATS.values())
+    cl_total = CLONE_STATS.get("total", 0)
+    if pr_total:
+        w("\n## Prune statistics")
+        if cl_total:
+            w(f"{'reason':>14}  {'count':>10}  {'%prune':>7}  {'‰clone':>7}")
         else:
-            print(f"  {k:<12} {v:>12,}  ({pct:5.1f}%)")
+            w(f"{'reason':>14}  {'count':>10}  {'%prune':>7}")
+        for k, v in PRUNE_STATS.most_common():
+            pct = 100.0 * v / pr_total
+            if cl_total:
+                rate = 1000.0 * v / cl_total
+                w(f"{k:>14}  {v:>10,}  {pct:>6.1f}%  {rate:>6.1f}‰")
+            else:
+                w(f"{k:>14}  {v:>10,}  {pct:>6.1f}%")
 
-
-def display_depth_histogram() -> None:
-    """Print a histogram of successful assign depth distribution (normalised)."""
-    if not DEPTH_STATS:
-        return
-    total = sum(DEPTH_STATS.values())
-    print("\nDepth histogram (successful assign):")
-    for d in sorted(DEPTH_STATS):
-        pct = 100.0 * DEPTH_STATS[d] / total
-        bar = "#" * max(1, int(pct * 2))
-        print(f"  depth {d:>2}: {DEPTH_STATS[d]:>12,}  ({pct:4.1f}%)  {bar}")
-
-
-def display_clone_effectiveness() -> None:
-    """Print clone-economics summary: how many clones were productive vs wasted."""
+    # ── clone effectiveness ──
     total = CLONE_STATS.get("total", 0)
-    if total == 0:
-        return
-    productive = CLONE_STATS.get("productive", 0)
-    saved      = CLONE_STATS.get("saved", 0)
-    wasted     = CLONE_STATS.get("wasted", 0)
-    overhead   = total - productive - wasted  # skip branches, init, etc.
+    if total:
+        productive = CLONE_STATS.get("productive", 0)
+        saved      = CLONE_STATS.get("saved", 0)
+        wasted     = CLONE_STATS.get("wasted", 0)
+        overhead   = total - productive - wasted
+        w("\n## Clone effectiveness")
+        w(f"  total clones     {total:>12,}")
+        w(f"  productive       {productive:>12,}  ({100.0*productive/total:5.1f}%)")
+        w(f"  saved (pre-clone){saved:>12,}  ({100.0*saved/total:5.1f}%)")
+        w(f"  wasted (post-cln){wasted:>12,}  ({100.0*wasted/total:5.1f}%)")
+        w(f"  overhead (other) {overhead:>12,}  ({100.0*overhead/total:5.1f}%)")
 
-    print("\nClone effectiveness:")
-    print(f"  total clones     {total:>12,}")
-    print(f"  productive       {productive:>12,}  ({100.0*productive/total:5.1f}%)")
-    print(f"  saved (pre-clone){saved:>12,}  ({100.0*saved/total:5.1f}%)  "
-          f"ratio/excluded/euler — clone avoided")
-    print(f"  wasted (post-cln){wasted:>12,}  ({100.0*wasted/total:5.1f}%)  "
-          f"touchard/valuation — clone already paid")
-    print(f"  overhead (other) {overhead:>12,}  ({100.0*overhead/total:5.1f}%)  "
-          f"skip branches, init")
+    # ── depth histogram ──
+    if DEPTH_STATS:
+        dt = sum(DEPTH_STATS.values())
+        w("\n## Depth histogram")
+        for d in sorted(DEPTH_STATS):
+            pct = 100.0 * DEPTH_STATS[d] / dt
+            w(f"  depth {d:>2}: {DEPTH_STATS[d]:>12,}  ({pct:4.1f}%)")
+
+    # ── clone payload ──
+    if CLONE_PAYLOAD:
+        ct = sum(CLONE_PAYLOAD.values())
+        w("\n## Clone payload (|assigned|)")
+        for s in sorted(CLONE_PAYLOAD):
+            w(f"  |f|={s:>2}:   {CLONE_PAYLOAD[s]:>12,}  ({100.0*CLONE_PAYLOAD[s]/ct:5.1f}%)")
+
+    # ── ratio headroom ──
+    if RATIO_HEADROOM:
+        rt = sum(RATIO_HEADROOM.values())
+        order = ["<1e-6","1e-6-1e-5","1e-5-1e-4","1e-4-1e-3","1e-3-1e-2",">1e-2"]
+        w("\n## Ratio headroom")
+        for b in order:
+            v = RATIO_HEADROOM.get(b, 0)
+            if v:
+                w(f"  {b:>12}  {v:>12,}  ({100.0*v/rt:5.1f}%)")
+
+    # ── headroom by |f| ──
+    if HEADROOM_BY_FACTOR:
+        w("\n## Headroom by |f|")
+        header = f"  {'|f|':>4}"
+        for b in order:
+            header += f"  {b:>10}"
+        w(header)
+        f_levels = sorted(set(f for f, _ in HEADROOM_BY_FACTOR))
+        for nf in f_levels:
+            row = f"  {nf:>4}"
+            for b in order:
+                v = HEADROOM_BY_FACTOR.get((nf, b), 0)
+                row += f"  {v:>10,}"
+            w(row)
+
+    # ── obligation recurrence ──
+    if OBLIGATION_SIGS:
+        ot = sum(OBLIGATION_SIGS.values())
+        uniq = len(OBLIGATION_SIGS)
+        top10 = sum(v for _, v in OBLIGATION_SIGS.most_common(10))
+        w("\n## Obligation recurrence")
+        w(f"  unique/total: {uniq:,} / {ot:,}  ({100.0*uniq/ot:.2f}%)")
+        w(f"  top-10 coverage: {top10:,}  ({100.0*top10/ot:.1f}%)")
+        w("  Top-10 signatures:")
+        for (pending, nf, coarse), count in OBLIGATION_SIGS.most_common(10):
+            w(f"    pending={set(pending)} |f|={nf} h~=1e-{coarse}  x{count:,}")
+
+    # ── contradiction attribution ──
+    if CONTRADICTION_ATTR:
+        w("\n## Contradiction attribution (top-15)")
+        for (q, reason), count in CONTRADICTION_ATTR.most_common(15):
+            w(f"  ({q:>4}, {reason:<14}) {count:>10,}")
+
+    # ── propagation edges ──
+    if PROPAGATION_EDGES:
+        w("\n## Propagation edges (top-10)")
+        for (p, q), count in PROPAGATION_EDGES.most_common(10):
+            w(f"  {p:>4} → {q:<8}  {count:>10,}")
+
+    # ── depth × |f| ──
+    if DEPTH_FACTOR_MAP:
+        w("\n## Depth × |f| (top-15)")
+        for (d, nf), count in DEPTH_FACTOR_MAP.most_common(15):
+            w(f"  depth={d:>3}  |f|={nf}  {count:>12,}")
+
+    # ── exp4 filter verification ──
+    if EXP4_FILTER_HITS:
+        w("\n## EXP4 filter verification")
+        w(f"  primes filtered: {len(EXCLUDE_EXP_4)}")
+        w(f"  total a=4 branches skipped: {sum(EXP4_FILTER_HITS.values()):,}")
+        w("  per-prime hits (top-10):")
+        for p, count in EXP4_FILTER_HITS.most_common(10):
+            facs = _SIG_FACTORS.get((p, 4), set())
+            w(f"    {p:>4}^4  x{count:>10,}  σ factors → {facs}")
+
+    # ── attractor resolvability ──
+    if OBLIGATION_SIGS:
+        _write_attractor_resolvability(w)
+
+    w("")
+    with open(TELEMETRY_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def _write_attractor_resolvability(w) -> None:
+    """For each top attractor prime, identify its σ(r^a) source and check
+    whether it can be closed within the current search window (q ≤ MAX_PRIME).
+    """
+    attractor_primes: Dict[int, int] = {}
+    for (pending, nf, coarse), count in OBLIGATION_SIGS.most_common(10):
+        for q in pending:
+            attractor_primes[q] = attractor_primes.get(q, 0) + count
+
+    if not attractor_primes:
+        return
+
+    # reverse index: for each q, which (r, a) pairs have q | σ(r^a)
+    sources: Dict[int, list] = {}
+    for q in attractor_primes:
+        sources[q] = []
+        for (r, a), factors in _SIG_FACTORS.items():
+            if q in factors:
+                sources[q].append((r, a))
+
+    w("\n## Attractor source & closability")
+    w(f"  {'obligation':>14}  {'freq':>10}  {'in pool':>8}  {'srcs':>5}  {'generated by':>30}")
+    for q, count in sorted(attractor_primes.items(), key=lambda x: -x[1]):
+        in_pool = "YES" if q <= MAX_PRIME else "NO"
+        src = sources.get(q, [])
+        n_src = len(src)
+        if not src:
+            examples = "(unknown)"
+        else:
+            examples = ", ".join(f"{r}^{a}" for r, a in src[:3])
+            if n_src > 3:
+                examples += f", ..."
+        w(f"  {q:>14}  {count:>10,}  {in_pool:>8}  {n_src:>5}  ← {examples}")
+
+
+def display_telemetry_brief() -> None:
+    """Print a one-line telemetry summary to stdout (details → file)."""
+    pr_total = sum(PRUNE_STATS.values())
+    cl_total = CLONE_STATS.get("total", 0)
+    productive = CLONE_STATS.get("productive", 0)
+    ot = sum(OBLIGATION_SIGS.values()) if OBLIGATION_SIGS else 0
+    uniq = len(OBLIGATION_SIGS) if OBLIGATION_SIGS else 0
+
+    parts = [f"states={cl_total:,}", f"productive={productive}"]
+    if pr_total:
+        top = PRUNE_STATS.most_common(1)
+        if top:
+            parts.append(f"prune=({top[0][0]} {100.0*top[0][1]/pr_total:.0f}%)")
+    if ot:
+        recur = 100.0 * uniq / ot if ot else 0
+        parts.append(f"recur={recur:.1f}%")
+    sys.stderr.write(f"\n[telemetry] {' | '.join(parts)}\n")
+    sys.stderr.write(f"  full report → {TELEMETRY_FILE}\n")
 
 
 # ── factor graph export ───────────────────────────────────────

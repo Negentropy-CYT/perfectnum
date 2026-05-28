@@ -19,10 +19,20 @@ from typing import Deque, Dict, Optional, Tuple
 from gmpy2 import mpz
 
 from opn_core import (
+    CASCADE_DEPTH_HIST,
+    CLONE_PAYLOAD,
     CLONE_STATS,
+    CONTRADICTION_ATTR,
+    DEPTH_FACTOR_MAP,
     DEPTH_STATS,
+    HEADROOM_BY_FACTOR,
+    OBLIGATION_SIGS,
+    PENDING_SIZE_HIST,
+    PROPAGATION_EDGES,
     PRUNE_STATS,
+    RATIO_HEADROOM,
     _SIG_FACTORS,
+    _SIG_VALUATIONS,
     MAX_EXP,
     RESONANCE_REUSE_W,
     RESONANCE_NEWF_W,
@@ -43,6 +53,54 @@ def _compute_priority(ratio_num, ratio_den, resonance, n_assigned):
     return (abs(2.0 - ratio)
             - PRIORITY_RESONANCE_W * resonance
             - PRIORITY_DEPTH_W * n_assigned)
+
+
+# ══════════════════════════════════════════════════════════════
+# Feasibility Cache
+# ══════════════════════════════════════════════════════════════
+
+class FeasibilityCache:
+    """Caches impossible valuation-deficit patterns across search paths.
+
+    Key insight: many different search branches converge to the *same*
+    valuation obligation topology (same required_v, same deficits).  If
+    one path proves a deficit pattern unsatisfiable, all other paths
+    leading to the same pattern can be pruned — regardless of which
+    specific primes got them there.
+
+    Contrast with ContradictionCache (in opn_search): that cache requires
+    assigned_keys ⊇ cached_assigned, which makes it more precise but less
+    general.  FeasibilityCache is purely deficit-based — broader, faster,
+    complementary.
+
+    Signature
+    ---------
+    frozenset of (q, deficit) pairs where deficit = required_v[q] - current_v[q].
+    """
+    CACHE_MAX_SIZE = 100_000
+
+    def __init__(self):
+        self._failed: set = set()
+
+    def _signature(self, required_v, current_v):
+        items = []
+        for q, req in required_v.items():
+            deficit = req - current_v.get(q, 0)
+            if deficit > 0:
+                items.append((q, deficit))
+        return frozenset(items)
+
+    def add(self, required_v, current_v):
+        sig = self._signature(required_v, current_v)
+        if len(self._failed) >= self.CACHE_MAX_SIZE:
+            self._failed.clear()  # aggressive: just reset (rare in practice)
+        self._failed.add(sig)
+
+    def contains(self, required_v, current_v):
+        return self._signature(required_v, current_v) in self._failed
+
+    def __len__(self):
+        return len(self._failed)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -68,6 +126,7 @@ class DFSState:
 
     def clone(self) -> "DFSState":
         CLONE_STATS["total"] += 1
+        CLONE_PAYLOAD[len(self.assigned)] += 1
         return DFSState(
             assigned=dict(self.assigned),
             excluded=set(self.excluded),
@@ -105,6 +164,7 @@ class ChainState:
 
     def clone(self) -> "ChainState":
         CLONE_STATS["total"] += 1
+        CLONE_PAYLOAD[len(self.assigned)] += 1
         return ChainState(
             assigned=dict(self.assigned),
             required_v=dict(self.required_v),
@@ -132,7 +192,7 @@ def _reject(reason: str):
     for clone-effectiveness telemetry.
     """
     PRUNE_STATS[reason] += 1
-    if reason in ("excluded", "ratio", "euler"):
+    if reason in ("excluded", "ratio", "euler", "valuation_pre"):
         CLONE_STATS["saved"] += 1   # clone was avoided
     else:
         CLONE_STATS["wasted"] += 1  # clone was already paid
@@ -205,7 +265,14 @@ def assign_prime_dfs(st: DFSState, p: int, exp: int,
 def assign_prime_chain(st: ChainState, p: int, exp: int, *,
                        propagate: bool = True,
                        max_exp: int = MAX_EXP) -> Optional[ChainState]:
-    """Assign p^exp to a ChainState with full factor-chain propagation."""
+    """Assign p^exp to a ChainState with full factor-chain propagation.
+
+    IMPROVEMENT: pre-clone valuation contradiction check using
+    _SIG_VALUATIONS.  Previously, the clone was paid first, then σ(p^a)
+    was factorised, and only then was a valuation contradiction detected
+    (49% wasted clone rate).  Now the precomputed valuation map enables
+    checking *before* clone — moving wasted → saved.
+    """
     if p in st.excluded or p in st.assigned:
         return _reject("excluded")
     if _early_ratio_prune(st.ratio_num, st.ratio_den, p, exp):
@@ -213,6 +280,27 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
     if not _euler_ok(p, exp, st.euler_prime):
         return _reject("euler")
 
+    # ── pre-clone valuation check (uses precomputed _SIG_VALUATIONS) ──
+    if propagate:
+        pre_vals = _SIG_VALUATIONS.get((p, exp))
+        if pre_vals is not None:
+            for q, e in pre_vals.items():
+                # q is an odd prime factor of σ(p^a) with exponent e
+                if q in st.excluded:
+                    CONTRADICTION_ATTR[(q, "excluded_pre")] += 1
+                    return _reject("valuation_pre")
+                new_req = st.required_v.get(q, 0) + e
+                if q in st.assigned:
+                    if new_req > st.current_v[q]:
+                        CONTRADICTION_ATTR[(q, "overrun_pre")] += 1
+                        return _reject("valuation_pre")
+                else:
+                    if new_req > _max_possible_valuation(q, st.euler_prime,
+                                                         max_exp):
+                        CONTRADICTION_ATTR[(q, "budget_pre")] += 1
+                        return _reject("valuation_pre")
+
+    # ── clone & apply ──
     ns = st.clone()
     ns.assigned[p] = exp
     ns.current_v[p] = ns.current_v.get(p, 0) + exp
@@ -237,30 +325,43 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
 
     if not propagate:
         DEPTH_STATS[ns.depth] += 1
+        CLONE_STATS["productive"] += 1
+        PENDING_SIZE_HIST[len(ns.pending)] += 1
+        CASCADE_DEPTH_HIST[0] += 1
+        _record_productive_telemetry(ns)
         return ns
 
     # factor-chain propagation (additive valuation)
+    cascade_steps = 0
     for q, e in factorize(int(sig)):
         if q == 2:
             continue
+        PROPAGATION_EDGES[(p, q)] += 1
         if q in ns.excluded:
-            return _reject("valuation")
+            CONTRADICTION_ATTR[(q, "excluded_post")] += 1
+            return _reject("valuation_post")
 
         ns.required_v[q] = ns.required_v.get(q, 0) + e
 
         if q in ns.assigned:
             if ns.required_v[q] > ns.current_v[q]:
-                return _reject("valuation")
+                CONTRADICTION_ATTR[(q, "overrun_post")] += 1
+                return _reject("valuation_post")
         else:
             if ns.required_v[q] > _max_possible_valuation(q, ns.euler_prime,
                                                           max_exp):
-                return _reject("valuation")
+                CONTRADICTION_ATTR[(q, "budget_post")] += 1
+                return _reject("valuation_post")
 
         if ns.required_v[q] > ns.current_v.get(q, 0):
             _enqueue_pending(ns, q)
+            cascade_steps += 1
 
     DEPTH_STATS[ns.depth] += 1
     CLONE_STATS["productive"] += 1
+    PENDING_SIZE_HIST[len(ns.pending)] += 1
+    CASCADE_DEPTH_HIST[cascade_steps] += 1
+    _record_productive_telemetry(ns)
     return ns
 
 
@@ -286,6 +387,29 @@ def validate_chain_state(st: ChainState) -> bool:
         if cq < 0:
             return False
     return True
+
+
+# ── productive telemetry recording ───────────────────────────
+
+def _record_productive_telemetry(ns) -> None:
+    """Record ratio headroom and depth×|f| for a productive state."""
+    ratio = float(ns.ratio_num) / float(ns.ratio_den)
+    headroom = 2.0 - ratio
+    if headroom <= 1e-6:       bucket = "<1e-6"
+    elif headroom <= 1e-5:     bucket = "1e-6-1e-5"
+    elif headroom <= 1e-4:     bucket = "1e-5-1e-4"
+    elif headroom <= 1e-3:     bucket = "1e-4-1e-3"
+    elif headroom <= 1e-2:     bucket = "1e-3-1e-2"
+    else:                      bucket = ">1e-2"
+    RATIO_HEADROOM[bucket] += 1
+    DEPTH_FACTOR_MAP[(ns.depth, len(ns.assigned))] += 1
+    HEADROOM_BY_FACTOR[(len(ns.assigned), bucket)] += 1
+    # coarse headroom for signature dedup
+    if headroom > 0:
+        coarse = int(math.floor(-math.log10(headroom)))
+    else:
+        coarse = 99
+    OBLIGATION_SIGS[(frozenset(ns.pending), len(ns.assigned), coarse)] += 1
 
 
 # ── resonance update ─────────────────────────────────────────

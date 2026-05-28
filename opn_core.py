@@ -18,18 +18,19 @@ from gmpy2 import mpz
 # ── configuration ─────────────────────────────────────────────
 CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
+TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 300
-MAX_FACTORS       = 7
-MAX_EXP           = 2          # 2 = original a_i=1; 6+ for variable exponents
-PROPAGATE         = False      # False = pseudo-solution; True = true OPN
+MAX_PRIME         = 100
+MAX_FACTORS       = 10
+MAX_EXP           = 6          # 2 = original a_i=1; 6+ for variable exponents
+PROPAGATE         = True      # False = pseudo-solution; True = true OPN
 PROGRESS_INTERVAL = 10_000
 
 # resonance heuristic weights
 RESONANCE_REUSE_W   = 1.5
 RESONANCE_NEWF_W    = 0.7
 RESONANCE_GIANT_W   = 0.15
-PRIORITY_RESONANCE_W = 0.3
+PRIORITY_RESONANCE_W = 0.0  # disabled: resonance is structurally negative in chain mode
 PRIORITY_DEPTH_W     = 0.01
 HEAP_MAX_SIZE        = 200_000
 
@@ -38,11 +39,28 @@ SIGMA_CACHE:   Dict[Tuple[int, int], mpz] = {}
 POWER_CACHE:   Dict[Tuple[int, int], int] = {}
 FACTOR_CACHE:  Dict[int, List[Tuple[int, int]]] = {}
 _SIG_FACTORS:  Dict[Tuple[int, int], set[int]] = {}
+_SIG_VALUATIONS: Dict[Tuple[int, int], Dict[int, int]] = {}  # (p,a) → {q: v_q(σ(p^a))}
 
 # ── prune telemetry ──────────────────────────────────────────
-PRUNE_STATS: "Counter[str]" = Counter()
-DEPTH_STATS: "Counter[int]" = Counter()
-CLONE_STATS: "Counter[str]" = Counter()   # total, productive, saved, wasted
+PRUNE_STATS:        "Counter[str]"           = Counter()
+DEPTH_STATS:        "Counter[int]"           = Counter()
+CLONE_STATS:        "Counter[str]"           = Counter()
+CONTRADICTION_ATTR: "Counter[Tuple[int,str]]" = Counter()  # (prime, reason)
+
+# ── structural telemetry ─────────────────────────────────────
+PENDING_SIZE_HIST:  "Counter[int]"           = Counter()  # pending queue size
+CASCADE_DEPTH_HIST: "Counter[int]"           = Counter()  # propagation chain length
+PROPAGATION_EDGES:  "Counter[Tuple[int,int]]"= Counter()  # (source, introduced)
+CLONE_PAYLOAD:      "Counter[int]"           = Counter()  # len(assigned) at clone
+RATIO_HEADROOM:     "Counter[str]"           = Counter()  # 2-ratio bucketed
+DEPTH_FACTOR_MAP:   "Counter[Tuple[int,int]]"= Counter()  # (depth, |f|) 2D histogram
+HEADROOM_BY_FACTOR: "Counter[Tuple[int,str]]"= Counter()  # (|f|, headroom_bucket)
+OBLIGATION_SIGS: "Counter[Tuple]"     = Counter()  # (frozen-pending, |f|, coarse-headroom)
+
+# ── search-policy data (derived from telemetry) ───────────────
+TOXIC_SKIP: set[int] = set()
+EXCLUDE_EXP_4: set[int] = set()        # primes whose σ(p^4) factors all > MAX_PRIME
+EXP4_FILTER_HITS: "Counter[int]" = Counter()  # per-prime filter verification
 
 
 # ── prime generation ──────────────────────────────────────────
@@ -159,15 +177,24 @@ def valid_euler_exponents(lb: int, max_exp: int) -> List[int]:
 
 # ── σ-factor sets (precomputation for resonance heuristic) ────
 def precompute_sig_factors(primes: List[int], max_exp: int) -> None:
-    """Populate ``_SIG_FACTORS[(p, a)] = {odd prime factors of σ(p^a)}``."""
+    """Populate ``_SIG_FACTORS`` and ``_SIG_VALUATIONS`` for all (p, a).
+
+    _SIG_VALUATIONS stores the full {q: v_q(σ(p^a))} mapping, enabling
+    pre-clone valuation contradiction checks that avoid wasted clones.
+    """
     _SIG_FACTORS.clear()
+    _SIG_VALUATIONS.clear()
     for p in primes:
         for a in range(2, max_exp + 1, 2):
             sig = int(sigma_prime_power(p, a))
-            _SIG_FACTORS[(p, a)] = {q for q, _ in factorize(sig) if q != 2}
+            facs = factorize(sig)
+            _SIG_FACTORS[(p, a)] = {q for q, _ in facs if q != 2}
+            _SIG_VALUATIONS[(p, a)] = {q: e for q, e in facs if q != 2}
         for a in valid_euler_exponents(1, max_exp):
             sig = int(sigma_prime_power(p, a))
-            _SIG_FACTORS[(p, a)] = {q for q, _ in factorize(sig) if q != 2}
+            facs = factorize(sig)
+            _SIG_FACTORS[(p, a)] = {q for q, _ in facs if q != 2}
+            _SIG_VALUATIONS[(p, a)] = {q: e for q, e in facs if q != 2}
 
 
 # ── suffix-product precomputation (O(1) ratio bounds) ──────────
@@ -298,3 +325,44 @@ def touchard_force_3(euler_prime, assigned, excluded):
     if euler_prime is None:
         return False
     return euler_prime % 3 == 2
+
+
+# ── toxic-skip seeding ───────────────────────────────────────
+
+def compute_exclude_exp4(primes: List[int], max_exp: int,
+                         max_prime: int) -> None:
+    """Populate EXCLUDE_EXP_4: primes whose σ(p^4) factors ALL exceed
+    MAX_PRIME.  These a=4 include branches deterministically produce
+    cofactors that enter pending but can never be resolved within the
+    current prime window.
+
+    This is WINDOW-COMPLETE (not globally complete): a factor > MAX_PRIME
+    today may be resolvable if MAX_PRIME is increased later (e.g. 197^4
+    produces {661, 991, 2311} — all > 293 now, but 661 fits at MAX_PRIME≥661).
+    The filter is parameter-sensitive; rerunning with a larger prime pool
+    automatically reclassifies borderline primes.
+
+    Conservative: only filters when ALL odd factors > max_prime.
+    If at least one factor fits in the pool, the branch is kept.
+    a=2 is NEVER filtered.
+    """
+    EXCLUDE_EXP_4.clear()
+    if max_exp < 4:
+        return
+    for p in primes:
+        facs = _SIG_FACTORS.get((p, 4))
+        if facs is None:
+            continue          # not precomputed — conservative, don't filter
+        if facs and all(q > max_prime for q in facs):
+            EXCLUDE_EXP_4.add(p)
+
+
+def compute_toxic_skip_list() -> None:
+    """Seed TOXIC_SKIP from contradiction attribution data."""
+    from collections import Counter as _Counter
+    excluded_counts: 'Counter[int]' = _Counter()
+    for (q, reason), count in CONTRADICTION_ATTR.items():
+        if reason == "excluded_pre":
+            excluded_counts[q] += count
+    TOXIC_SKIP.clear()
+    TOXIC_SKIP.update(q for q, _ in excluded_counts.most_common(5))

@@ -19,8 +19,15 @@ from typing import Callable, FrozenSet, List, Optional, Tuple, Union
 from gmpy2 import mpz
 
 from opn_core import (
+    CLONE_STATS,
+    EXCLUDE_EXP_4,
+    EXP4_FILTER_HITS,
     HEAP_MAX_SIZE,
+    MAX_PRIME,
     PROGRESS_INTERVAL,
+    PRUNE_STATS,
+    TOXIC_SKIP,
+    compute_exclude_exp4,
     check_touchard,
     precompute_sig_factors,
     precompute_suffix_bounds,
@@ -35,6 +42,7 @@ from opn_core import (
 from opn_state import (
     ChainState,
     DFSState,
+    FeasibilityCache,
     _compute_priority,
     _enqueue_pending,
     _max_possible_valuation,
@@ -169,6 +177,7 @@ def search_opn(
     """
     n = len(primes)
     cache = ContradictionCache() if use_cache else None
+    feas_cache = FeasibilityCache() if use_cache else None
     use_heap = propagate
 
     # ── precompute suffix bounds (O(1) ratio queries) ──
@@ -176,6 +185,7 @@ def search_opn(
 
     if propagate:
         precompute_sig_factors(primes, max_exp)
+        compute_exclude_exp4(primes, max_exp, MAX_PRIME)
 
     if resume_state is not None:
         heap = resume_state["heap"]
@@ -274,6 +284,11 @@ def search_opn(
         if len(st.assigned) >= max_factors:
             continue
 
+        # feasibility cache check: same deficit pattern failed before?
+        if feas_cache is not None and use_heap:
+            if feas_cache.contains(st.required_v, st.current_v):
+                continue
+
         lb_num, lb_den = ratio_lower_bound(
             st.ratio_num, st.ratio_den,
             st.pending if use_heap else [],
@@ -291,6 +306,8 @@ def search_opn(
             if cache is not None and len(st.assigned) >= 3:
                 cache.add(frozenset(st.assigned.keys()),
                           frozenset(st.excluded), frozenset())
+            if feas_cache is not None:
+                feas_cache.add(st.required_v, st.current_v)
             continue
 
         # ── Touchard: force 3 ──
@@ -339,6 +356,11 @@ def search_opn(
 
             # non-Euler include
             for e in reversed(valid_even_exponents(2, max_exp)):
+                if e == 4 and use_heap and p in EXCLUDE_EXP_4:
+                    PRUNE_STATS["exp4_filtered"] += 1
+                    CLONE_STATS["saved"] += 1
+                    EXP4_FILTER_HITS[p] += 1
+                    continue
                 ns = _assign(st, p, e, use_heap, propagate, max_exp)
                 if ns is not None:
                     ns.next_idx = idx + 1
@@ -384,6 +406,8 @@ def _drain_and_process_pending(
     ):
         q = st.pending.popleft()
         st.pending_set.discard(q)
+        if q > primes[-1]:
+            PRUNE_STATS["maxprime"] += 1
 
     if not st.pending:
         return False

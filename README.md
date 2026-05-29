@@ -513,8 +513,14 @@ SOFTWARE.
 - Nielsen, P. P. (2007).  *Odd perfect numbers have at least nine
   distinct prime factors*.  Math. Comp. 76, 2109–2126.
   doi:[10.1090/S0025-5718-07-01990-4](https://doi.org/10.1090/S0025-5718-07-01990-4)
+- Nielsen, P. P. (2015).  *Odd perfect numbers, Diophantine equations,
+  and upper bounds*.  Math. Comp. 84, 2549–2567.
+  doi:[10.1090/S0025-5718-2015-02941-X](https://doi.org/10.1090/S0025-5718-2015-02941-X)
 - Ochem, P. & Rao, M. (2012).  *Odd perfect numbers are greater than
   10^1500*.  Math. Comp. 81, 1869–1877.
   doi:[10.1090/S0025-5718-2012-02563-4](https://doi.org/10.1090/S0025-5718-2012-02563-4)
+- Thackeray, H. R. (2024).  *Each friend of 10 has at least 10
+  nonidentical prime factors*.  Indag. Math. (N.S.) 35, 595–607.
+  arXiv:[2310.15900](https://arxiv.org/abs/2310.15900)
 - Touchard, J. (1953).  *On prime numbers and perfect numbers*.
   Scripta Math. 19, 35–39.

@@ -59,9 +59,11 @@ def main() -> None:
         print(f"  已找到解:   {len(chk.get('solutions', []))}")
         print("=" * 60)
         prev_solutions = chk.get("solutions", [])
-        primes      = chk["primes"]
-        max_factors = chk["max_factors"]
-        max_exp     = chk["max_exp"]
+        primes      = chk.get("primes", [])
+        max_factors = chk.get("max_factors", MAX_FACTORS)
+        max_exp     = chk.get("max_exp", MAX_EXP)
+        if not primes:
+            primes = generate_odd_primes(MAX_PRIME)
         resume_state = {
             "heap":         chk.get("heap", []),
             "heap_counter": chk.get("heap_counter", 0),

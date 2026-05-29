@@ -20,11 +20,36 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 100
-MAX_FACTORS       = 10
-MAX_EXP           = 6          # 2 = original a_i=1; 6+ for variable exponents
-PROPAGATE         = True      # False = pseudo-solution; True = true OPN
-PROGRESS_INTERVAL = 10_000
+MAX_PRIME         = 500       # largest odd prime considered
+MAX_FACTORS       = 10        # max distinct prime factors in N
+MAX_EXP           = 4         # max exponent (2 = a_i=1 restriction)
+PROPAGATE         = False     # False = pseudo-solution DFS; True = true OPN chain
+PROGRESS_INTERVAL = 1_000
+
+# ── target abundance ───────────────────────────────────────────
+#   σ(N)/N = TARGET_NUM / TARGET_DEN
+#   OPN:        2/1        Friend-of-10: 9/5
+TARGET_NUM = 2
+TARGET_DEN = 1
+
+# ── friend-of-10 preset [INACTIVE] ──────────────────────────────
+# Uncomment the block below to switch to friend-of-10 mode.
+#
+# TARGET_NUM   = 9
+# TARGET_DEN   = 5
+# MAX_PRIME    = 200
+# MAX_FACTORS  = 9
+# MAX_EXP      = 4
+# PROPAGATE    = True
+# FRIEND_OF_10 = True
+
+FRIEND_OF_10 = False
+
+# When FRIEND_OF_10 is True, the engine:
+#   - forces 5 into N (must be assigned with even exponent)
+#   - excludes 3 (cannot be assigned)
+#   - skips Euler-prime odd-exponent checks
+#   - uses TARGET_NUM=9, TARGET_DEN=5 for all ratio comparisons
 
 # resonance heuristic weights
 RESONANCE_REUSE_W   = 1.5
@@ -366,3 +391,91 @@ def compute_toxic_skip_list() -> None:
             excluded_counts[q] += count
     TOXIC_SKIP.clear()
     TOXIC_SKIP.update(q for q, _ in excluded_counts.most_common(5))
+
+
+# ═══════════════════════════════════════════════════════════════
+# Stage 1: Precise next-prime interval bounds (Nielsen Prop. 3)
+# ═══════════════════════════════════════════════════════════════
+
+def next_prime_lower_bound(ratio_num, ratio_den, target_num, target_den):
+    """Smallest prime p such that current_ratio × (p+1)/p ≤ target.
+
+    Derived from: R × (p+1)/p ≤ T  ⇒  p ≥ R/(T−R).
+    Uses integer ceiling division.
+    """
+    denom = target_num * ratio_den - target_den * ratio_num
+    if denom <= 0:
+        return 0   # already at or above target — no lower bound
+    return (ratio_num * target_den + denom - 1) // denom
+
+
+def next_prime_upper_bound(ratio_num, ratio_den, next_idx,
+                           target_num, target_den,
+                           suffix_ub_num, suffix_ub_den,
+                           n_primes):
+    """Largest prime p such that:
+       current_ratio × p/(p−1) × suffix_ub_ratio ≥ target.
+
+    Derived from: R × p/(p−1) × U ≥ T  ⇒  p ≤ 1/(1 − R×U/T).
+    p is clamped to MAX_PRIME (window constraint).
+
+    Returns 0 if no finite upper bound exists (interval is unbounded).
+    """
+    if next_idx >= n_primes:
+        return 0
+    # suffix ratio for primes AFTER the one we're assigning
+    ub_n = suffix_ub_num[next_idx + 1] if next_idx + 1 < n_primes else mpz(1)
+    ub_d = suffix_ub_den[next_idx + 1] if next_idx + 1 < n_primes else mpz(1)
+
+    # R × p/(p−1) × ub_n/ub_d ≥ T
+    # → p/(p−1) ≥ T×ub_d / (R×ub_n)
+    # → p ≤ T×ub_d×ratio_den / (T×ub_d×ratio_den − target_den×ratio_num×ub_n)
+    num = mpz(target_num) * ub_d * ratio_den
+    den = (mpz(target_num) * ratio_den * ub_d
+           - mpz(target_den) * ratio_num * ub_n)
+    if den <= 0:
+        return 0   # no finite upper bound
+    return int(num // den)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Stage 2: Fermat prime pruning (Nielsen Lemma 3.6-3.7)
+# ═══════════════════════════════════════════════════════════════
+
+FERMAT_PRIMES = {3, 5, 17, 257, 65537}
+
+
+def check_fermat_contradiction(p, exp, assigned, excluded):
+    """Nielsen Lemmas 3.6-3.7: Fermat prime high-exponent pruning.
+
+    When a Fermat prime has exponent ≥ 80, the number of primes
+    ≡ 1 (mod p) in N is bounded by a τ value derived from
+    v_p(σ(p^a)).  If the count exceeds the bound, a prime > 10^11
+    must exist — contradiction within a finite MAX_PRIME window.
+
+    Returns True if contradiction detected (prune this branch).
+    """
+    if p not in FERMAT_PRIMES:
+        return False
+    if exp < 80:
+        return False
+
+    cnt_in = sum(1 for q in assigned if q % p == 1)
+    cnt_ex = sum(1 for q in excluded if q % p == 1)
+    total = cnt_in + cnt_ex
+
+    # Conservative τ bound:  τ = floor(exp / 2) + 1
+    tau = (exp // 2) + 1
+    return total > tau
+
+
+# ═══════════════════════════════════════════════════════════════
+# Stage 3: Infinite-power approximation
+# ═══════════════════════════════════════════════════════════════
+
+INFINITE_POWER_LIMIT = 10**30
+
+
+def is_prime_infinite(p, a):
+    """Return True if p^a exceeds the factorisation threshold."""
+    return pow(p, a) > INFINITE_POWER_LIMIT

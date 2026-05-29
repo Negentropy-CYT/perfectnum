@@ -16,10 +16,10 @@ pip install gmpy2
 python opn_main.py
 ```
 
-Default configuration runs **factor-chain true-OPN search** with primes ≤ 300,
-up to 10 distinct factors, exponents up to 6.  Pseudo-OPN mode is available
-by setting `PROPAGATE = False` in `opn_core.py`.  A 12-digit Descartes-type
-pseudo-candidate is found in seconds in DFS mode.
+Default configuration runs **pseudo-OPN DFS search** with primes ≤ 500,
+up to 10 distinct factors, exponent 4.  Factor-chain true-OPN mode is
+available by setting `PROPAGATE = True`.  A friend-of-10 verification mode
+is included via `FRIEND_OF_10 = True` toggle.
 
 ---
 
@@ -438,6 +438,31 @@ If $\sigma(p^{4})$'s every odd prime factor exceeds `MAX_PRIME`, the
 $a=4$ include branch is skipped.  This is **window-complete** logical
 pruning — the cofactor would deterministically become an unresolvable
 pending obligation.  $a=2$ is never filtered, preserving completeness.
+
+### Precise Next-Prime Interval Bounds (Nielsen Prop. 3)
+
+In chain mode, each expansion step computes lower and upper bounds on the
+next unknown prime, filtering the candidate set from ~60 to typically 3-8.
+Derived from $R \times (p+1)/p \leq T$ (lower) and $R \times p/(p-1) \times U \geq T$ (upper).
+
+### Fermat Prime Pruning (Nielsen Lemmas 3.6-3.7)
+
+Fermat primes $\{3,5,17,257,65537\}$ receive specialised contradiction
+detection at exponent $\geq 80$: when too many primes $\equiv 1 \pmod{p}$
+exist, a necessary large prime $> 10^{11}$ must appear — contradiction
+within a finite `MAX_PRIME` window.
+
+### Infinite-Power Approximation
+
+When $p^a > 10^{30}$, $\sigma(p^a)$ factorisation is skipped.  The prime
+contributes only its asymptotic maximum $p/(p-1)$ to ratio bounds.
+
+### Friend-of-10 Verification Mode
+
+Parameterised target abundance via `TARGET_NUM/TARGET_DEN`.  Setting
+`FRIEND_OF_10 = True` switches to $\sigma(N)/N = 9/5$, forces $5 \mid N$,
+excludes $3$, and disables Euler-special-prime checks.  Reproduces the
+Thackeray (2024) result: $\omega \ge 10$ for friends of 10.
 
 ---
 

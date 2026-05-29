@@ -25,12 +25,16 @@ from opn_core import (
     CONTRADICTION_ATTR,
     DEPTH_FACTOR_MAP,
     DEPTH_STATS,
+    FRIEND_OF_10,
     HEADROOM_BY_FACTOR,
+    INFINITE_POWER_LIMIT,
     OBLIGATION_SIGS,
     PENDING_SIZE_HIST,
     PROPAGATION_EDGES,
     PRUNE_STATS,
     RATIO_HEADROOM,
+    TARGET_DEN,
+    TARGET_NUM,
     _SIG_FACTORS,
     _SIG_VALUATIONS,
     MAX_EXP,
@@ -39,8 +43,10 @@ from opn_core import (
     RESONANCE_GIANT_W,
     PRIORITY_RESONANCE_W,
     PRIORITY_DEPTH_W,
+    check_fermat_contradiction,
     check_touchard,
     factorize,
+    is_prime_infinite,
     power_pa,
     sigma_prime_power,
     touchard_force_3,
@@ -49,8 +55,9 @@ from opn_core import (
 
 # ── priority helper ──────────────────────────────────────────
 def _compute_priority(ratio_num, ratio_den, resonance, n_assigned):
+    target = TARGET_NUM / TARGET_DEN
     ratio = float(ratio_num) / float(ratio_den)
-    return (abs(2.0 - ratio)
+    return (abs(target - ratio)
             - PRIORITY_RESONANCE_W * resonance
             - PRIORITY_DEPTH_W * n_assigned)
 
@@ -202,6 +209,9 @@ def _reject(reason: str):
 # ── shared helpers ───────────────────────────────────────────
 
 def _euler_ok(p, exp, euler_prime):
+    if FRIEND_OF_10:
+        # friend mode: all exponents must be even, no Euler prime
+        return exp % 2 == 0
     if exp % 2 == 1:
         if p % 4 != 1 or exp % 4 != 1:
             return False
@@ -213,7 +223,7 @@ def _euler_ok(p, exp, euler_prime):
 def _early_ratio_prune(ratio_num, ratio_den, p, exp):
     sig = sigma_prime_power(p, exp)
     pa = mpz(power_pa(p, exp))
-    return ratio_num * sig >= 2 * ratio_den * pa
+    return ratio_num * sig * TARGET_DEN > TARGET_NUM * ratio_den * pa
 
 
 def _enqueue_pending(st, q):
@@ -279,6 +289,12 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         return _reject("ratio")
     if not _euler_ok(p, exp, st.euler_prime):
         return _reject("euler")
+    if check_fermat_contradiction(p, exp, st.assigned, st.excluded):
+        return _reject("fermat")
+
+    # ── interval skip (pre-clone, counts as saved) ──
+    # Tracked via _reject but actually handled in the expansion loop.
+    # The _reject path here is for future per-assign interval checks.
 
     # ── pre-clone valuation check (uses precomputed _SIG_VALUATIONS) ──
     if propagate:
@@ -324,6 +340,15 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         ns.priority = 0.0
 
     if not propagate:
+        DEPTH_STATS[ns.depth] += 1
+        CLONE_STATS["productive"] += 1
+        PENDING_SIZE_HIST[len(ns.pending)] += 1
+        CASCADE_DEPTH_HIST[0] += 1
+        _record_productive_telemetry(ns)
+        return ns
+
+    # ── infinite-power: skip factorisation for massive p^a ──
+    if is_prime_infinite(p, exp):
         DEPTH_STATS[ns.depth] += 1
         CLONE_STATS["productive"] += 1
         PENDING_SIZE_HIST[len(ns.pending)] += 1
@@ -394,7 +419,7 @@ def validate_chain_state(st: ChainState) -> bool:
 def _record_productive_telemetry(ns) -> None:
     """Record ratio headroom and depth×|f| for a productive state."""
     ratio = float(ns.ratio_num) / float(ns.ratio_den)
-    headroom = 2.0 - ratio
+    headroom = TARGET_NUM / TARGET_DEN - ratio
     if headroom <= 1e-6:       bucket = "<1e-6"
     elif headroom <= 1e-5:     bucket = "1e-6-1e-5"
     elif headroom <= 1e-4:     bucket = "1e-5-1e-4"

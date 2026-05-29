@@ -22,13 +22,18 @@ from opn_core import (
     CLONE_STATS,
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
+    FRIEND_OF_10,
     HEAP_MAX_SIZE,
     MAX_PRIME,
     PROGRESS_INTERVAL,
     PRUNE_STATS,
+    TARGET_DEN,
+    TARGET_NUM,
     TOXIC_SKIP,
     compute_exclude_exp4,
     check_touchard,
+    next_prime_lower_bound,
+    next_prime_upper_bound,
     precompute_sig_factors,
     precompute_suffix_bounds,
     ratio_lower_bound,
@@ -136,7 +141,9 @@ def _verify_solution(st: State) -> bool:
 
 
 def _check_pseudo(st: State) -> bool:
-    if len(st.assigned) < 1 or st.ratio_num >= 2 * st.ratio_den:
+    if FRIEND_OF_10:
+        return False  # pseudo-solutions are only meaningful for target = 2
+    if len(st.assigned) < 1 or st.ratio_num * TARGET_DEN >= TARGET_NUM * st.ratio_den:
         return False
     if 10 * st.ratio_num < 19 * st.ratio_den:
         return False
@@ -206,6 +213,14 @@ def search_opn(
         total_states = 0
         elapsed_offset = 0.0
 
+    # ── friend-of-10: force 5 into N, forbid 3 ──
+    if FRIEND_OF_10 and not resume_state:
+        if use_heap:
+            heap[0][2].excluded.add(3)   # 3 ∤ N  (Thackeray 2024)
+            _enqueue_pending(heap[0][2], 5)  # force 5 | N
+        else:
+            heap[0].excluded.add(3)
+
     # ── push / pop helpers ──
     def _push(container, st):
         nonlocal heap_counter
@@ -263,10 +278,10 @@ def search_opn(
 
         # ── true-OPN check ──
         if (
-            st.ratio_num == 2 * st.ratio_den
-            and st.euler_prime is not None
+            st.ratio_num * TARGET_DEN == TARGET_NUM * st.ratio_den
+            and (st.euler_prime is not None or FRIEND_OF_10)
             and len(st.assigned) >= 2
-            and check_touchard(st.euler_prime, st.assigned, st.excluded)
+            and (FRIEND_OF_10 or check_touchard(st.euler_prime, st.assigned, st.excluded))
             and _verify_solution(st)
         ):
             st.pseudo = False
@@ -279,7 +294,7 @@ def search_opn(
             continue
 
         # ── pruning ──
-        if st.ratio_num >= 2 * st.ratio_den:
+        if st.ratio_num * TARGET_DEN >= TARGET_NUM * st.ratio_den:
             continue
         if len(st.assigned) >= max_factors:
             continue
@@ -293,7 +308,7 @@ def search_opn(
             st.ratio_num, st.ratio_den,
             st.pending if use_heap else [],
         )
-        if lb_num > 2 * lb_den:
+        if lb_num * TARGET_DEN > TARGET_NUM * lb_den:
             continue
 
         ub_num, ub_den = ratio_upper_bound(
@@ -302,7 +317,7 @@ def search_opn(
             next_idx=st.next_idx,
             suffix_ub_num=s_ub_num, suffix_ub_den=s_ub_den,
         )
-        if ub_num < 2 * ub_den:
+        if ub_num * TARGET_DEN < TARGET_NUM * ub_den:
             if cache is not None and len(st.assigned) >= 3:
                 cache.add(frozenset(st.assigned.keys()),
                           frozenset(st.excluded), frozenset())
@@ -333,12 +348,30 @@ def search_opn(
                 continue
 
         # ── expansion ──
+        # interval bounds (chain mode): skip primes provably too small / large
+        # Upper bound is only reliable when few primes remain or ratio is close
+        # to target.  Otherwise the bound collapses to ~1, blocking all expansion.
+        lo = hi = 0
+        k_remain = max_factors - len(st.assigned)
+        if use_heap:
+            lo = next_prime_lower_bound(st.ratio_num, st.ratio_den,
+                                        TARGET_NUM, TARGET_DEN)
+            if k_remain <= 4:
+                hi = next_prime_upper_bound(st.ratio_num, st.ratio_den,
+                                            st.next_idx, TARGET_NUM, TARGET_DEN,
+                                            s_ub_num, s_ub_den, n)
         idx = st.next_idx
         while idx < n:
             p = primes[idx]
             if p in st.assigned or p in st.excluded:
                 idx += 1
                 continue
+            if lo > 0 and p < lo:
+                PRUNE_STATS["interval_lo"] += 1
+                idx += 1; continue   # too small to reach target
+            if hi > 0 and p > hi:
+                PRUNE_STATS["interval_hi"] += 1
+                break                 # exceeded interval upper bound
 
             # skip branch
             skip_st = st.clone()
@@ -408,6 +441,7 @@ def _drain_and_process_pending(
         st.pending_set.discard(q)
         if q > primes[-1]:
             PRUNE_STATS["maxprime"] += 1
+            return True   # forced prime beyond window → prune state
 
     if not st.pending:
         return False

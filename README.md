@@ -16,10 +16,10 @@ pip install gmpy2
 python opn_main.py
 ```
 
-Default configuration runs **pseudo-OPN DFS search** with primes ≤ 500,
-up to 10 distinct factors, exponent 4.  Factor-chain true-OPN mode is
+Default configuration runs **pseudo-OPN DFS search** with primes ≤ 200,
+up to 10 distinct factors, exponent 2.  Factor-chain true-OPN mode is
 available by setting `PROPAGATE = True`.  A friend-of-10 verification mode
-is included via `FRIEND_OF_10 = True` toggle.
+is included via `SEARCH_MODE = FRIEND_10_MODE`.
 
 ---
 
@@ -244,10 +244,11 @@ programmatically):
 ```python
 # opn_core.py
 
-MAX_PRIME   = 100        # largest odd prime considered
+MAX_PRIME   = 200        # largest odd prime considered
 MAX_FACTORS = 10         # max distinct prime factors in N
-MAX_EXP     = 6          # max exponent for any prime
-PROPAGATE   = True       # False → pseudo-solution search
+MAX_EXP     = 2          # max exponent for any prime
+                         #   2 = original a_i=1 restriction
+PROPAGATE   = False      # False → pseudo-solution search
                          # True  → true-OPN factor-chain search
 ```
 
@@ -459,9 +460,11 @@ contributes only its asymptotic maximum $p/(p-1)$ to ratio bounds.
 
 ### Friend-of-10 Verification Mode
 
-Parameterised target abundance via `TARGET_NUM/TARGET_DEN`.  Setting
-`FRIEND_OF_10 = True` switches to $\sigma(N)/N = 9/5$, forces $5 \mid N$,
-excludes $3$, and disables Euler-special-prime checks.  Reproduces the
+Parameterised target abundance via `TARGET_NUM/TARGET_DEN`.  The
+`SearchMode` descriptor (presets `OPN_MODE` / `FRIEND_10_MODE`) bundles
+target ratio, Euler requirements, and forced/excluded primes.
+`SEARCH_MODE = FRIEND_10_MODE` switches to $\sigma(N)/N = 9/5$, forces
+$5 \mid N$, excludes $3$, and disables Euler checks.  Reproduces the
 Thackeray (2024) result: $\omega \ge 10$ for friends of 10.
 
 ---

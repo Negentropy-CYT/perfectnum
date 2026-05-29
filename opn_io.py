@@ -125,7 +125,7 @@ def _verify(st) -> bool:
     for p, a in st.assigned.items():
         lhs *= sigma_prime_power(p, a)
         rhs *= mpz(power_pa(p, a))
-    return lhs == 2 * rhs
+    return lhs * SEARCH_MODE.target_den == SEARCH_MODE.target_num * rhs
 
 
 def _print_factor_chain(st) -> None:

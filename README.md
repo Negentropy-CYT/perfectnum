@@ -460,9 +460,9 @@ contributes only its asymptotic maximum $p/(p-1)$ to ratio bounds.
 
 ### Friend-of-10 Verification Mode
 
-Parameterised target abundance via `TARGET_NUM/TARGET_DEN`.  The
-`SearchMode` descriptor (presets `OPN_MODE` / `FRIEND_10_MODE`) bundles
-target ratio, Euler requirements, and forced/excluded primes.
+The `SearchMode` descriptor (presets `OPN_MODE` / `FRIEND_10_MODE`)
+bundles target abundance, Euler requirements, and forced/excluded primes
+into a single immutable configuration object.
 `SEARCH_MODE = FRIEND_10_MODE` switches to $\sigma(N)/N = 9/5$, forces
 $5 \mid N$, excludes $3$, and disables Euler checks.  Reproduces the
 Thackeray (2024) result: $\omega \ge 10$ for friends of 10.

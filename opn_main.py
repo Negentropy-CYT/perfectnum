@@ -121,7 +121,7 @@ def main() -> None:
                 found_true += 1
             solutions.append((dict(st.assigned), st.euler_prime, st.pseudo))
             display_solution(st, len(solutions), time.time() - t0)
-            export_factor_graph(st)
+            export_factor_graph(st, path=f"factor_graph_{len(solutions)}")
             save_checkpoint(state_holder, solutions)
             save_solutions_txt(solutions)
 

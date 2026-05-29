@@ -28,5 +28,8 @@ dependencies = [
     "gmpy2>=2.0.0",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
 [project.urls]
 Repository = "https://github.com/Negentropy-CYT/perfectnum"

@@ -38,9 +38,9 @@ from opn_core import (
     FACTOR_CACHE,
     _SIG_FACTORS,
     _SIG_VALUATIONS,
-    TARGET_NUM,
-    TARGET_DEN,
-    FRIEND_OF_10,
+    FRIEND_10_MODE,
+    OPN_MODE,
+    SEARCH_MODE,
     brent_rho,
     check_fermat_contradiction,
     check_touchard,
@@ -451,12 +451,12 @@ class TestCheckpoint:
 
 class TestFriendMode:
     def test_euler_skipped_when_friend(self, monkeypatch):
-        """When FRIEND_OF_10=True, odd exponents should be rejected."""
-        monkeypatch.setattr("opn_state.FRIEND_OF_10", True)
+        """When require_euler=False, odd exponents should be rejected."""
+        monkeypatch.setattr("opn_state.SEARCH_MODE", FRIEND_10_MODE)
         assert not _euler_ok(5, 1, None)  # odd exp rejected
         assert _euler_ok(5, 2, None)      # even exp ok
 
     def test_euler_normal_when_not_friend(self):
-        """When FRIEND_OF_10=False, normal Euler rules apply."""
+        """OPN_MODE (default) — normal Euler rules apply."""
         assert _euler_ok(5, 1, None)       # 5%4=1, ok
         assert not _euler_ok(3, 1, None)   # 3%4≠1, rejected

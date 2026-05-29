@@ -13,6 +13,7 @@ optional contradiction-pattern learning cache.
 """
 import gmpy2
 import heapq
+import sys
 import time
 from typing import Callable, FrozenSet, List, Optional, Tuple, Union
 
@@ -186,10 +187,17 @@ def search_opn(
     use_heap = propagate
 
     # ── precompute suffix bounds (O(1) ratio queries) ──
+    sys.stderr.write(f"precomputing suffix bounds for {len(primes)} primes... ")
     s_ub_num, s_ub_den, s_lb_num, s_lb_den = precompute_suffix_bounds(primes)
+    sys.stderr.write("done\n")
 
     if propagate:
+        n_even = sum(1 for p in primes for _ in valid_even_exponents(2, max_exp))
+        n_euler = sum(1 for p in primes if p % 4 == 1 for _ in valid_euler_exponents(1, max_exp))
+        sys.stderr.write(f"precomputing sigma-factors ({n_even + n_euler} entries)... ")
+        sys.stderr.flush()
         precompute_sig_factors(primes, max_exp)
+        sys.stderr.write("done\n")
         compute_exclude_exp4(primes, max_exp, MAX_PRIME)
 
     if resume_state is not None:

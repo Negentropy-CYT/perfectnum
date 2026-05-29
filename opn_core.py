@@ -20,9 +20,9 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 500       # largest odd prime considered
+MAX_PRIME         = 200       # largest odd prime considered
 MAX_FACTORS       = 10        # max distinct prime factors in N
-MAX_EXP           = 4         # max exponent (2 = a_i=1 restriction)
+MAX_EXP           = 2         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = False     # False = pseudo-solution DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 
@@ -31,6 +31,37 @@ PROGRESS_INTERVAL = 1_000
 #   OPN:        2/1        Friend-of-10: 9/5
 TARGET_NUM = 2
 TARGET_DEN = 1
+
+# ── search mode (replaces FRIEND_OF_10 boolean) ────────────────
+# Encapsulates target, Euler requirement, forced/excluded primes.
+# Set via pre-defined constants or the friend preset block below.
+
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class SearchMode:
+    """Immutable search-mode descriptor: target abundancy, Euler rule,
+    forced primes (must be in N) and excluded primes (can never be in N)."""
+    target_num: int = 2
+    target_den: int = 1
+    require_euler: bool = True       # True → OPN Euler form; False → all even
+    forced_primes: dict = None       # {prime: min_exponent} dict
+    excluded_primes: set = None      # frozenset of primes forbidden in N
+
+    def __post_init__(self):
+        object.__setattr__(self, 'forced_primes',
+                           dict(self.forced_primes or {}))
+        object.__setattr__(self, 'excluded_primes',
+                           frozenset(self.excluded_primes or set()))
+
+
+# Pre-defined modes
+OPN_MODE = SearchMode(target_num=2, target_den=1, require_euler=True)
+FRIEND_10_MODE = SearchMode(target_num=9, target_den=5, require_euler=False,
+                            forced_primes={5: 2}, excluded_primes={3})
+
+# Active mode — set by the friend preset, or override in code.
+SEARCH_MODE = OPN_MODE
 
 # ── friend-of-10 preset [INACTIVE] ──────────────────────────────
 # Uncomment the block below to switch to friend-of-10 mode.
@@ -41,15 +72,7 @@ TARGET_DEN = 1
 # MAX_FACTORS  = 9
 # MAX_EXP      = 4
 # PROPAGATE    = True
-# FRIEND_OF_10 = True
-
-FRIEND_OF_10 = False
-
-# When FRIEND_OF_10 is True, the engine:
-#   - forces 5 into N (must be assigned with even exponent)
-#   - excludes 3 (cannot be assigned)
-#   - skips Euler-prime odd-exponent checks
-#   - uses TARGET_NUM=9, TARGET_DEN=5 for all ratio comparisons
+# SEARCH_MODE  = FRIEND_10_MODE
 
 # resonance heuristic weights
 RESONANCE_REUSE_W   = 1.5

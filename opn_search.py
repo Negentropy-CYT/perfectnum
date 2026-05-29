@@ -22,7 +22,7 @@ from opn_core import (
     CLONE_STATS,
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
-    FRIEND_OF_10,
+    SEARCH_MODE,
     HEAP_MAX_SIZE,
     MAX_PRIME,
     PROGRESS_INTERVAL,
@@ -141,8 +141,8 @@ def _verify_solution(st: State) -> bool:
 
 
 def _check_pseudo(st: State) -> bool:
-    if FRIEND_OF_10:
-        return False  # pseudo-solutions are only meaningful for target = 2
+    if TARGET_NUM != 2 or TARGET_DEN != 1:
+        return False  # pseudo-solutions formula assumes target = 2/1
     if len(st.assigned) < 1 or st.ratio_num * TARGET_DEN >= TARGET_NUM * st.ratio_den:
         return False
     if 10 * st.ratio_num < 19 * st.ratio_den:
@@ -213,13 +213,16 @@ def search_opn(
         total_states = 0
         elapsed_offset = 0.0
 
-    # ── friend-of-10: force 5 into N, forbid 3 ──
-    if FRIEND_OF_10 and not resume_state:
-        if use_heap:
-            heap[0][2].excluded.add(3)   # 3 ∤ N  (Thackeray 2024)
-            _enqueue_pending(heap[0][2], 5)  # force 5 | N
-        else:
-            heap[0].excluded.add(3)
+    # ── search-mode initialisation: forced/excluded primes ──
+    if SEARCH_MODE != OPN_MODE and not resume_state:
+        st0 = heap[0][2] if use_heap else heap[0]
+        for q in SEARCH_MODE.excluded_primes:
+            st0.excluded.add(q)
+        for q, _ in SEARCH_MODE.forced_primes.items():
+            if use_heap:
+                _enqueue_pending(st0, q)
+            else:  # DFS: skip branch already covers "exclude", no pending queue
+                pass
 
     # ── push / pop helpers ──
     def _push(container, st):
@@ -279,9 +282,9 @@ def search_opn(
         # ── true-OPN check ──
         if (
             st.ratio_num * TARGET_DEN == TARGET_NUM * st.ratio_den
-            and (st.euler_prime is not None or FRIEND_OF_10)
+            and (not SEARCH_MODE.require_euler or st.euler_prime is not None)
             and len(st.assigned) >= 2
-            and (FRIEND_OF_10 or check_touchard(st.euler_prime, st.assigned, st.excluded))
+            and (not SEARCH_MODE.require_euler or check_touchard(st.euler_prime, st.assigned, st.excluded))
             and _verify_solution(st)
         ):
             st.pseudo = False

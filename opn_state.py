@@ -25,7 +25,7 @@ from opn_core import (
     CONTRADICTION_ATTR,
     DEPTH_FACTOR_MAP,
     DEPTH_STATS,
-    FRIEND_OF_10,
+    SEARCH_MODE,
     HEADROOM_BY_FACTOR,
     INFINITE_POWER_LIMIT,
     OBLIGATION_SIGS,
@@ -209,8 +209,8 @@ def _reject(reason: str):
 # ── shared helpers ───────────────────────────────────────────
 
 def _euler_ok(p, exp, euler_prime):
-    if FRIEND_OF_10:
-        # friend mode: all exponents must be even, no Euler prime
+    if not SEARCH_MODE.require_euler:
+        # non-Euler mode: all exponents must be even
         return exp % 2 == 0
     if exp % 2 == 1:
         if p % 4 != 1 or exp % 4 != 1:

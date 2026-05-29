@@ -30,11 +30,13 @@ from opn_core import (
     HEADROOM_BY_FACTOR,
     MAX_PRIME,
     OBLIGATION_SIGS,
+    OPN_MODE,
     PENDING_SIZE_HIST,
     PROPAGATE,
     PROPAGATION_EDGES,
     PRUNE_STATS,
     RATIO_HEADROOM,
+    SEARCH_MODE,
     TELEMETRY_FILE,
     _SIG_FACTORS,
     SOLUTIONS_FILE,
@@ -243,7 +245,12 @@ def write_telemetry_report(elapsed: float, solutions_found: int) -> None:
     lines: List[str] = []
     w = lines.append
 
-    mode = "chain (true OPN)" if PROPAGATE else "DFS (pseudo-OPN)"
+    if SEARCH_MODE != OPN_MODE:
+        mode = "friend-of-10"
+    elif PROPAGATE:
+        mode = "chain (true OPN)"
+    else:
+        mode = "DFS (pseudo-OPN)"
     w(f"# OPN Search Telemetry  |  {elapsed:.1f}s  |  {solutions_found} solutions  |  {mode}\n")
 
     # ── prune stats ──

@@ -1,8 +1,9 @@
-# opn-search — Odd Perfect Number Constraint Engine
+# perfectnum — Odd Perfect Number Search Engine
 
-A constraint-propagation factor-chain search engine for exploring
-structured subspaces of odd perfect numbers and Descartes-type
-pseudo-candidates.
+High-performance constraint-propagation search engine for odd perfect
+numbers and Descartes-type pseudo-candidates.  Factor-chain propagation,
+window-complete pruning, Nielsen-interval bounds, obligation-attractor
+telemetry.
 
 $$N = q^{4k+1} \prod p_i^{2a_i} \qquad\text{(Euler form)}$$
 $$\sigma(N) = 2N \qquad\text{(perfect number condition)}$$

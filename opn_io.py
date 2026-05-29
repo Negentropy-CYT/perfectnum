@@ -43,6 +43,8 @@ from opn_core import (
     MAX_FACTORS,
     MAX_EXP,
     PROPAGATE,
+    valid_euler_exponents,
+    valid_even_exponents,
     factorize,
     power_pa,
     sigma_prime_power,
@@ -245,11 +247,15 @@ def write_telemetry_report(elapsed: float, solutions_found: int) -> None:
     lines: List[str] = []
     w = lines.append
 
+    euler_exp = valid_euler_exponents(1, MAX_EXP)
+    even_exp = valid_even_exponents(2, MAX_EXP)
     mode = f"target={SEARCH_MODE.target_num}/{SEARCH_MODE.target_den}"
     mode += " (chain)" if PROPAGATE else " (DFS)"
     if not SEARCH_MODE.require_euler:
         mode += " no-euler"
-    w(f"# OPN Search Telemetry  |  {elapsed:.1f}s  |  {solutions_found} solutions  |  {mode}\n")
+    w(f"# P={MAX_PRIME}  f≤{MAX_FACTORS}  exp={MAX_EXP}  "
+      f"euler={euler_exp}  even={even_exp}")
+    w(f"# {elapsed:.1f}s  |  {solutions_found} solutions  |  {mode}\n")
 
     # ── prune stats ──
     pr_total = sum(PRUNE_STATS.values())

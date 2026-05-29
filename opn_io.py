@@ -245,12 +245,10 @@ def write_telemetry_report(elapsed: float, solutions_found: int) -> None:
     lines: List[str] = []
     w = lines.append
 
-    if SEARCH_MODE != OPN_MODE:
-        mode = "friend-of-10"
-    elif PROPAGATE:
-        mode = "chain (true OPN)"
-    else:
-        mode = "DFS (pseudo-OPN)"
+    mode = f"target={SEARCH_MODE.target_num}/{SEARCH_MODE.target_den}"
+    mode += " (chain)" if PROPAGATE else " (DFS)"
+    if not SEARCH_MODE.require_euler:
+        mode += " no-euler"
     w(f"# OPN Search Telemetry  |  {elapsed:.1f}s  |  {solutions_found} solutions  |  {mode}\n")
 
     # ── prune stats ──

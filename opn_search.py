@@ -27,8 +27,6 @@ from opn_core import (
     MAX_PRIME,
     PROGRESS_INTERVAL,
     PRUNE_STATS,
-    TARGET_DEN,
-    TARGET_NUM,
     TOXIC_SKIP,
     compute_exclude_exp4,
     check_touchard,
@@ -141,9 +139,9 @@ def _verify_solution(st: State) -> bool:
 
 
 def _check_pseudo(st: State) -> bool:
-    if TARGET_NUM != 2 or TARGET_DEN != 1:
+    if SEARCH_MODE.target_num != 2 or SEARCH_MODE.target_den != 1:
         return False  # pseudo-solutions formula assumes target = 2/1
-    if len(st.assigned) < 1 or st.ratio_num * TARGET_DEN >= TARGET_NUM * st.ratio_den:
+    if len(st.assigned) < 1 or st.ratio_num * SEARCH_MODE.target_den >= SEARCH_MODE.target_num * st.ratio_den:
         return False
     if 10 * st.ratio_num < 19 * st.ratio_den:
         return False
@@ -214,15 +212,15 @@ def search_opn(
         elapsed_offset = 0.0
 
     # ── search-mode initialisation: forced/excluded primes ──
-    if SEARCH_MODE != OPN_MODE and not resume_state:
+    if not resume_state:
         st0 = heap[0][2] if use_heap else heap[0]
-        for q in SEARCH_MODE.excluded_primes:
-            st0.excluded.add(q)
+        st0.excluded.update(SEARCH_MODE.excluded_primes)
         for q, _ in SEARCH_MODE.forced_primes.items():
             if use_heap:
                 _enqueue_pending(st0, q)
-            else:  # DFS: skip branch already covers "exclude", no pending queue
-                pass
+            else:
+                raise NotImplementedError(
+                    "DFS mode does not support forced_primes.  Set PROPAGATE=True.")
 
     # ── push / pop helpers ──
     def _push(container, st):
@@ -281,7 +279,7 @@ def search_opn(
 
         # ── true-OPN check ──
         if (
-            st.ratio_num * TARGET_DEN == TARGET_NUM * st.ratio_den
+            st.ratio_num * SEARCH_MODE.target_den == SEARCH_MODE.target_num * st.ratio_den
             and (not SEARCH_MODE.require_euler or st.euler_prime is not None)
             and len(st.assigned) >= 2
             and (not SEARCH_MODE.require_euler or check_touchard(st.euler_prime, st.assigned, st.excluded))
@@ -297,7 +295,7 @@ def search_opn(
             continue
 
         # ── pruning ──
-        if st.ratio_num * TARGET_DEN >= TARGET_NUM * st.ratio_den:
+        if st.ratio_num * SEARCH_MODE.target_den >= SEARCH_MODE.target_num * st.ratio_den:
             continue
         if len(st.assigned) >= max_factors:
             continue
@@ -311,7 +309,7 @@ def search_opn(
             st.ratio_num, st.ratio_den,
             st.pending if use_heap else [],
         )
-        if lb_num * TARGET_DEN > TARGET_NUM * lb_den:
+        if lb_num * SEARCH_MODE.target_den > SEARCH_MODE.target_num * lb_den:
             continue
 
         ub_num, ub_den = ratio_upper_bound(
@@ -320,7 +318,7 @@ def search_opn(
             next_idx=st.next_idx,
             suffix_ub_num=s_ub_num, suffix_ub_den=s_ub_den,
         )
-        if ub_num * TARGET_DEN < TARGET_NUM * ub_den:
+        if ub_num * SEARCH_MODE.target_den < SEARCH_MODE.target_num * ub_den:
             if cache is not None and len(st.assigned) >= 3:
                 cache.add(frozenset(st.assigned.keys()),
                           frozenset(st.excluded), frozenset())
@@ -358,10 +356,10 @@ def search_opn(
         k_remain = max_factors - len(st.assigned)
         if use_heap:
             lo = next_prime_lower_bound(st.ratio_num, st.ratio_den,
-                                        TARGET_NUM, TARGET_DEN)
+                                        SEARCH_MODE.target_num, SEARCH_MODE.target_den)
             if k_remain <= 4:
                 hi = next_prime_upper_bound(st.ratio_num, st.ratio_den,
-                                            st.next_idx, TARGET_NUM, TARGET_DEN,
+                                            st.next_idx, SEARCH_MODE.target_num, SEARCH_MODE.target_den,
                                             s_ub_num, s_ub_den, n)
         idx = st.next_idx
         while idx < n:

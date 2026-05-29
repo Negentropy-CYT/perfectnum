@@ -33,8 +33,6 @@ from opn_core import (
     PROPAGATION_EDGES,
     PRUNE_STATS,
     RATIO_HEADROOM,
-    TARGET_DEN,
-    TARGET_NUM,
     _SIG_FACTORS,
     _SIG_VALUATIONS,
     MAX_EXP,
@@ -55,7 +53,7 @@ from opn_core import (
 
 # ── priority helper ──────────────────────────────────────────
 def _compute_priority(ratio_num, ratio_den, resonance, n_assigned):
-    target = TARGET_NUM / TARGET_DEN
+    target = SEARCH_MODE.target_num / SEARCH_MODE.target_den
     ratio = float(ratio_num) / float(ratio_den)
     return (abs(target - ratio)
             - PRIORITY_RESONANCE_W * resonance
@@ -223,7 +221,7 @@ def _euler_ok(p, exp, euler_prime):
 def _early_ratio_prune(ratio_num, ratio_den, p, exp):
     sig = sigma_prime_power(p, exp)
     pa = mpz(power_pa(p, exp))
-    return ratio_num * sig * TARGET_DEN > TARGET_NUM * ratio_den * pa
+    return ratio_num * sig * SEARCH_MODE.target_den > SEARCH_MODE.target_num * ratio_den * pa
 
 
 def _enqueue_pending(st, q):
@@ -419,7 +417,7 @@ def validate_chain_state(st: ChainState) -> bool:
 def _record_productive_telemetry(ns) -> None:
     """Record ratio headroom and depth×|f| for a productive state."""
     ratio = float(ns.ratio_num) / float(ns.ratio_den)
-    headroom = TARGET_NUM / TARGET_DEN - ratio
+    headroom = SEARCH_MODE.target_num / SEARCH_MODE.target_den - ratio
     if headroom <= 1e-6:       bucket = "<1e-6"
     elif headroom <= 1e-5:     bucket = "1e-6-1e-5"
     elif headroom <= 1e-4:     bucket = "1e-5-1e-4"

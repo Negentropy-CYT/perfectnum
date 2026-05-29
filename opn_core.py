@@ -26,15 +26,9 @@ MAX_EXP           = 2         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = False     # False = pseudo-solution DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 
-# ── target abundance ───────────────────────────────────────────
-#   σ(N)/N = TARGET_NUM / TARGET_DEN
-#   OPN:        2/1        Friend-of-10: 9/5
-TARGET_NUM = 2
-TARGET_DEN = 1
-
-# ── search mode (replaces FRIEND_OF_10 boolean) ────────────────
-# Encapsulates target, Euler requirement, forced/excluded primes.
-# Set via pre-defined constants or the friend preset block below.
+# ── search mode (target + Euler + forced/excluded primes) ─────
+# Single configuration point for OPN vs. friend-of-10 searches.
+# All ratio comparisons read target from SEARCH_MODE.
 
 from dataclasses import dataclass
 
@@ -66,8 +60,6 @@ SEARCH_MODE = OPN_MODE
 # ── friend-of-10 preset [INACTIVE] ──────────────────────────────
 # Uncomment the block below to switch to friend-of-10 mode.
 #
-# TARGET_NUM   = 9
-# TARGET_DEN   = 5
 # MAX_PRIME    = 200
 # MAX_FACTORS  = 9
 # MAX_EXP      = 4

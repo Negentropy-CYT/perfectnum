@@ -252,8 +252,8 @@ def search_opn(
         state_holder["total_states"] = total_states
         state_holder["use_heap"]     = use_heap
 
-    # ── initial progress (trigger on the very first state) ──
-    _first = True
+    # ── progress (time-based: ~1 Hz, plus first state) ──
+    _last_progress = 0.0
 
     # ── main loop ──
     while heap:
@@ -273,9 +273,10 @@ def search_opn(
 
         total_states += 1
         if progress_callback is not None:
-            if total_states == 1 or total_states % PROGRESS_INTERVAL == 0:
-                progress_callback(total_states, st, time.time() - t0)
-                _first = False
+            elapsed = time.time() - t0
+            if total_states == 1 or elapsed - _last_progress >= 1.0:
+                progress_callback(total_states, st, elapsed)
+                _last_progress = elapsed
 
         # ── true-OPN check ──
         if (

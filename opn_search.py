@@ -9,13 +9,12 @@ Supports two search strategies:
   - best-first    — for factor-chain true-OPN (ChainState)
 
 Polymorphic dispatch on state type; Touchard congruence pruning;
-optional contradiction-pattern learning cache.
+optional exact-state deduplication.
 """
 import gmpy2
 import heapq
-import sys
 import time
-from typing import Callable, FrozenSet, List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 from gmpy2 import mpz
 
@@ -24,17 +23,12 @@ from opn_core import (
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
     SEARCH_MODE,
-    HEAP_MAX_SIZE,
-    MAX_PRIME,
-    PROGRESS_INTERVAL,
     PRUNE_STATS,
     TOXIC_SKIP,
-    compute_exclude_exp4,
     check_touchard,
+    exp4_forced_outside_window,
     next_prime_lower_bound,
     next_prime_upper_bound,
-    precompute_sig_factors,
-    precompute_suffix_bounds,
     ratio_lower_bound,
     ratio_upper_bound,
     sigma_prime_power,
@@ -46,84 +40,43 @@ from opn_core import (
 from opn_state import (
     ChainState,
     DFSState,
-    FeasibilityCache,
     _compute_priority,
     _enqueue_pending,
     _max_possible_valuation,
+    _target_valuation_offset,
     assign_prime_chain,
     assign_prime_dfs,
+    fermat_debt_capacity,
 )
 
 State = Union[DFSState, ChainState]
 """Type alias covering both concrete state classes."""
 
 
-# ══════════════════════════════════════════════════════════════
-# Contradiction Learning Cache
-# ══════════════════════════════════════════════════════════════
-
-class ContradictionCache:
-    """Remembers valuation-deficit patterns that lead to contradiction.
-
-    Two-tier lookup:
-      1. Exact-match set — O(1) hash lookup for identical patterns.
-      2. Subsumption list — O(n) scan checking whether current state
-         is provably worse than a cached contradiction.
-
-    Only caches contradictions at depth >= MIN_CACHE_DEPTH (deeper
-    patterns generalise better).  Bounded by CACHE_MAX_SIZE with
-    FIFO eviction.  Disabled by default — enable via *use_cache*.
-    """
-
-    CACHE_MAX_SIZE  = 50_000
-    MIN_CACHE_DEPTH = 3
-
-    def __init__(self):
-        self._exact: set = set()
-        self._patterns: List[Tuple[FrozenSet[int], FrozenSet[int],
-                                     FrozenSet[Tuple[int, int]]]] = []
-
-    def add(self, assigned_keys, excluded_keys, deficit_items):
-        entry = (assigned_keys, excluded_keys, deficit_items)
-        self._exact.add(entry)
-        if len(self._patterns) >= self.CACHE_MAX_SIZE:
-            self._patterns.pop(0)   # FIFO eviction
-        self._patterns.append(entry)
-
-    def is_subsumed(self, assigned_keys, excluded_keys,
-                    required_v, current_v):
-        # Tier 1: exact match
-        cur_def = _make_deficit_frozenset(required_v, current_v)
-        exact = (assigned_keys, excluded_keys, cur_def)
-        if exact in self._exact:
-            return True
-
-        # Tier 2: subsumption scan
-        for a_keys, e_keys, def_items in self._patterns:
-            if not a_keys.issubset(assigned_keys):
-                continue
-            if not e_keys.issubset(excluded_keys):
-                continue
-            ok = True
-            for q, min_def in def_items:
-                if required_v.get(q, 0) - current_v.get(q, 0) < min_def:
-                    ok = False
-                    break
-            if ok:
-                return True
-        return False
-
-    def __len__(self):
-        return len(self._patterns)
+def _state_signature(st: State) -> tuple:
+    """Canonical key for sound exact-state deduplication."""
+    common = (
+        tuple(sorted(st.assigned.items())),
+        frozenset(st.excluded),
+        st.euler_prime,
+        int(st.ratio_num),
+        int(st.ratio_den),
+        st.next_idx,
+    )
+    if isinstance(st, ChainState):
+        return common + (
+            tuple(sorted(st.required_v.items())),
+            tuple(sorted(st.current_v.items())),
+            tuple(st.pending),
+        )
+    return common
 
 
-def _make_deficit_frozenset(required_v, current_v):
-    items = []
-    for q, req in required_v.items():
-        deficit = req - current_v.get(q, 0)
-        if deficit > 0:
-            items.append((q, deficit))
-    return frozenset(items)
+def _heap_snapshot(entries) -> list:
+    """Copy entries into a valid heap without mutating the live frontier."""
+    snapshot = list(entries)
+    heapq.heapify(snapshot)
+    return snapshot
 
 
 # ══════════════════════════════════════════════════════════════
@@ -179,27 +132,17 @@ def search_opn(
     """Generator yielding State objects for each candidate found.
 
     *propagate* selects DFSState (False) or ChainState (True).
-    *use_cache* enables the contradiction learning cache (chain mode).
+    *use_cache* enables sound exact-state deduplication.
     """
     n = len(primes)
-    cache = ContradictionCache() if use_cache else None
-    feas_cache = FeasibilityCache() if use_cache else None
+    seen_states = set() if use_cache else None
     use_heap = propagate
 
-    # ── precompute suffix bounds (O(1) ratio queries) ──
-    print(f"precomputing suffix bounds for {len(primes)} primes...", flush=True)
-    s_ub_num, s_ub_den, s_lb_num, s_lb_den = precompute_suffix_bounds(primes)
-    print("done")
+    print("using exact factor-slot tail bounds", flush=True)
 
     if propagate:
-        n_even = sum(1 for p in primes for _ in valid_even_exponents(2, max_exp))
-        n_euler = sum(1 for p in primes if p % 4 == 1
-                      for _ in valid_euler_exponents(1, max_exp))
-        print(f"precomputing sigma-factors ({n_even + n_euler} entries)...",
-              end=" ", flush=True)
-        precompute_sig_factors(primes, max_exp)
-        print("done")
-        compute_exclude_exp4(primes, max_exp, MAX_PRIME)
+        EXCLUDE_EXP_4.clear()
+        print("sigma-factor maps will be populated lazily")
 
     if resume_state is not None:
         heap = resume_state["heap"]
@@ -247,7 +190,7 @@ def search_opn(
 
     def _snapshot(container):
         if use_heap:
-            return [(s.priority, i, s) for i, (_, _, s) in enumerate(container)]
+            return _heap_snapshot(container)
         return list(container)
 
     t0 = time.time() - elapsed_offset
@@ -266,17 +209,19 @@ def search_opn(
 
     # ── main loop ──
     while heap:
-        if use_heap and len(heap) > HEAP_MAX_SIZE and total_states % 1000 == 0:
-            keep = int(HEAP_MAX_SIZE * 0.6)
-            heap = heapq.nsmallest(keep, heap)
-            heapq.heapify(heap)
-
         st = _pop(heap)
+
+        if seen_states is not None:
+            signature = _state_signature(st)
+            if signature in seen_states:
+                PRUNE_STATS["exact_duplicate"] += 1
+                continue
+            seen_states.add(signature)
 
         if state_holder is not None:
             front = [(st.priority, heap_counter, st)] if use_heap else [st]
             state_holder["heap"]         = _snapshot(front + heap)
-            state_holder["heap_counter"]  = heap_counter
+            state_holder["heap_counter"]  = heap_counter + int(use_heap)
             state_holder["total_states"]  = total_states
             state_holder["elapsed"]       = time.time() - t0
 
@@ -310,14 +255,32 @@ def search_opn(
         if len(st.assigned) >= max_factors:
             continue
 
-        # feasibility cache check: same deficit pattern failed before?
-        if feas_cache is not None and use_heap:
-            if feas_cache.contains(st.required_v, st.current_v):
+        k_remain = max_factors - len(st.assigned)
+
+        # Touchard can force 3 even when it lies before next_idx. Enqueue it
+        # before both ratio bounds so the mandatory component is never omitted.
+        if use_heap and touchard_force_3(st.euler_prime, st.assigned,
+                                         st.excluded):
+            _enqueue_pending(st, 3)
+
+        live_pending = (
+            {q for q in st.pending if q not in st.assigned}
+            if use_heap else set()
+        )
+        if use_heap:
+            if any(q > primes[-1] for q in live_pending):
+                PRUNE_STATS["maxprime"] += 1
+                continue
+            if live_pending & st.excluded:
+                PRUNE_STATS["pending_excluded"] += 1
+                continue
+            if len(live_pending) > k_remain:
+                PRUNE_STATS["factor_slots"] += 1
                 continue
 
         lb_num, lb_den = ratio_lower_bound(
             st.ratio_num, st.ratio_den,
-            st.pending if use_heap else [],
+            live_pending,
         )
         if lb_num * SEARCH_MODE.target_den > SEARCH_MODE.target_num * lb_den:
             continue
@@ -326,51 +289,35 @@ def search_opn(
             st.ratio_num, st.ratio_den,
             st.assigned, st.excluded, primes,
             next_idx=st.next_idx,
-            suffix_ub_num=s_ub_num, suffix_ub_den=s_ub_den,
+            remaining_slots=k_remain,
+            pending=live_pending,
         )
         if ub_num * SEARCH_MODE.target_den < SEARCH_MODE.target_num * ub_den:
-            if cache is not None and len(st.assigned) >= 3:
-                cache.add(frozenset(st.assigned.keys()),
-                          frozenset(st.excluded), frozenset())
-            if feas_cache is not None:
-                feas_cache.add(st.required_v, st.current_v)
+            PRUNE_STATS["ratio_upper"] += 1
             continue
 
-        # ── Touchard: force 3 ──
-        if use_heap and touchard_force_3(st.euler_prime, st.assigned,
-                                         st.excluded):
-            _enqueue_pending(st, 3)
-
-        # ── contradiction cache check ──
-        if use_heap and cache is not None and len(st.assigned) >= 3:
-            if cache.is_subsumed(
-                frozenset(st.assigned.keys()),
-                frozenset(st.excluded),
-                st.required_v,
-                st.current_v,
-            ):
+        if use_heap:
+            debt_ok, _debt_detail = fermat_debt_capacity(
+                st, primes, max_factors, max_exp,
+            )
+            if not debt_ok:
+                PRUNE_STATS["fermat_debt"] += 1
                 continue
 
         # ── pending (chain mode) ──
         if use_heap:
             if _drain_and_process_pending(
-                st, heap, primes, max_exp, _push, cache,
+                st, heap, primes, max_exp, _push,
             ):
                 continue
 
         # ── expansion ──
-        # interval bounds (chain mode): skip primes provably too small / large
-        # Upper bound is only reliable when few primes remain or ratio is close
-        # to target.  Otherwise the bound collapses to ~1, blocking all expansion.
-        lo = hi = 0
-        k_remain = max_factors - len(st.assigned)
+        # Interval bounds skip candidates that necessarily overshoot or cannot
+        # reach the target even with the best remaining factor slots.
+        lo = 0
         if use_heap:
             lo = next_prime_lower_bound(st.ratio_num, st.ratio_den,
                                         SEARCH_MODE.target_num, SEARCH_MODE.target_den)
-            if k_remain <= 4:
-                hi = next_prime_upper_bound(st.ratio_num, st.ratio_den,
-                                            st.next_idx, SEARCH_MODE.target_num, SEARCH_MODE.target_den,
-                                            s_ub_num, s_ub_den, n)
         idx = st.next_idx
         while idx < n:
             p = primes[idx]
@@ -380,9 +327,21 @@ def search_opn(
             if lo > 0 and p < lo:
                 PRUNE_STATS["interval_lo"] += 1
                 idx += 1; continue   # too small to reach target
-            if hi > 0 and p > hi:
-                PRUNE_STATS["interval_hi"] += 1
-                break                 # exceeded interval upper bound
+            if use_heap:
+                hi = next_prime_upper_bound(
+                    st.ratio_num,
+                    st.ratio_den,
+                    idx,
+                    k_remain,
+                    SEARCH_MODE.target_num,
+                    SEARCH_MODE.target_den,
+                    primes,
+                    st.assigned,
+                    st.excluded,
+                )
+                if hi > 0 and p > hi:
+                    PRUNE_STATS["interval_hi"] += 1
+                    break
 
             # skip branch
             skip_st = st.clone()
@@ -400,7 +359,11 @@ def search_opn(
 
             # non-Euler include
             for e in reversed(valid_even_exponents(2, max_exp)):
-                if e == 4 and use_heap and p in EXCLUDE_EXP_4:
+                if (
+                    e == 4
+                    and use_heap
+                    and exp4_forced_outside_window(p, primes[-1])
+                ):
                     PRUNE_STATS["exp4_filtered"] += 1
                     CLONE_STATS["saved"] += 1
                     EXP4_FILTER_HITS[p] += 1
@@ -439,7 +402,6 @@ def _assign(st: State, p: int, exp: int, use_heap: bool,
 
 def _drain_and_process_pending(
     st: ChainState, heap, primes, max_exp: int, _push,
-    cache,
 ) -> bool:
     if not st.pending:
         return False
@@ -459,7 +421,12 @@ def _drain_and_process_pending(
 
     q = st.pending.popleft()
     st.pending_set.discard(q)
-    lb = max(st.required_v.get(q, 1) - st.current_v.get(q, 0), 1)
+    lb = max(
+        st.required_v.get(q, 0)
+        - _target_valuation_offset(q)
+        - st.current_v.get(q, 0),
+        1,
+    )
 
     if st.euler_prime is None and q % 4 == 1:
         for e in reversed(valid_euler_exponents(lb, max_exp)):

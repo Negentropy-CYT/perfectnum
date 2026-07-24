@@ -14,6 +14,7 @@ Key improvements over v1 unified State:
 import math
 from collections import deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Deque, Dict, Optional, Tuple
 
 from gmpy2 import mpz
@@ -25,87 +26,39 @@ from opn_core import (
     CONTRADICTION_ATTR,
     DEPTH_FACTOR_MAP,
     DEPTH_STATS,
+    FERMAT_PRIMES,
     SEARCH_MODE,
     HEADROOM_BY_FACTOR,
-    INFINITE_POWER_LIMIT,
     OBLIGATION_SIGS,
     PENDING_SIZE_HIST,
     PROPAGATION_EDGES,
     PRUNE_STATS,
     RATIO_HEADROOM,
     _SIG_FACTORS,
-    _SIG_VALUATIONS,
     MAX_EXP,
     RESONANCE_REUSE_W,
     RESONANCE_NEWF_W,
     RESONANCE_GIANT_W,
     PRIORITY_RESONANCE_W,
     PRIORITY_DEPTH_W,
-    check_fermat_contradiction,
     check_touchard,
-    factorize,
-    is_prime_infinite,
     power_pa,
+    sigma_valuation_map,
+    sigma_valuation_from_order,
     sigma_prime_power,
     touchard_force_3,
+    valid_euler_exponents,
+    valid_even_exponents,
 )
 
 
 # ── priority helper ──────────────────────────────────────────
 def _compute_priority(ratio_num, ratio_den, resonance, n_assigned):
     target = SEARCH_MODE.target_num / SEARCH_MODE.target_den
-    ratio = float(ratio_num) / float(ratio_den)
+    ratio = float(ratio_num / ratio_den)
     return (abs(target - ratio)
             - PRIORITY_RESONANCE_W * resonance
             - PRIORITY_DEPTH_W * n_assigned)
-
-
-# ══════════════════════════════════════════════════════════════
-# Feasibility Cache
-# ══════════════════════════════════════════════════════════════
-
-class FeasibilityCache:
-    """Caches impossible valuation-deficit patterns across search paths.
-
-    Key insight: many different search branches converge to the *same*
-    valuation obligation topology (same required_v, same deficits).  If
-    one path proves a deficit pattern unsatisfiable, all other paths
-    leading to the same pattern can be pruned — regardless of which
-    specific primes got them there.
-
-    Contrast with ContradictionCache (in opn_search): that cache requires
-    assigned_keys ⊇ cached_assigned, which makes it more precise but less
-    general.  FeasibilityCache is purely deficit-based — broader, faster,
-    complementary.
-
-    Signature
-    ---------
-    frozenset of (q, deficit) pairs where deficit = required_v[q] - current_v[q].
-    """
-    CACHE_MAX_SIZE = 100_000
-
-    def __init__(self):
-        self._failed: set = set()
-
-    def _signature(self, required_v, current_v):
-        items = []
-        for q, req in required_v.items():
-            deficit = req - current_v.get(q, 0)
-            if deficit > 0:
-                items.append((q, deficit))
-        return frozenset(items)
-
-    def add(self, required_v, current_v):
-        sig = self._signature(required_v, current_v)
-        if len(self._failed) >= self.CACHE_MAX_SIZE:
-            self._failed.clear()  # aggressive: just reset (rare in practice)
-        self._failed.add(sig)
-
-    def contains(self, required_v, current_v):
-        return self._signature(required_v, current_v) in self._failed
-
-    def __len__(self):
-        return len(self._failed)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -230,13 +183,127 @@ def _enqueue_pending(st, q):
         st.pending_set.add(q)
 
 
+def _target_valuation_offset(q: int) -> int:
+    """Return v_q(target_num) - v_q(target_den)."""
+    numerator = SEARCH_MODE.target_num
+    denominator = SEARCH_MODE.target_den
+    offset = 0
+    while numerator % q == 0:
+        numerator //= q
+        offset += 1
+    while denominator % q == 0:
+        denominator //= q
+        offset -= 1
+    return offset
+
+
 def _max_possible_valuation(q, euler_prime, max_exp):
+    even_max = max(valid_even_exponents(2, max_exp), default=0)
+    euler_max = max(valid_euler_exponents(1, max_exp), default=0)
+
+    if not SEARCH_MODE.require_euler:
+        return even_max
     if q == euler_prime:
-        x = max_exp
-        while x % 4 != 1 and x > 0:
-            x -= 1
-        return max(x, 1)
-    return max_exp if max_exp % 2 == 0 else max_exp - 1
+        return euler_max
+    if euler_prime is None and q % 4 == 1:
+        return max(even_max, euler_max)
+    return even_max
+
+
+def valuation_debts(st: ChainState) -> Dict[int, int]:
+    """Return odd-prime valuations that future sigma factors must supply.
+
+    ``required_v[q]`` is the incoming valuation already supplied by processed
+    components, while ``current_v[q]`` is the exponent chosen for q in N.
+    Their positive difference is the reverse-valuation debt.
+    """
+    debts: Dict[int, int] = {}
+    for q, exponent in st.current_v.items():
+        debt = (
+            exponent
+            + _target_valuation_offset(q)
+            - st.required_v.get(q, 0)
+        )
+        if debt > 0:
+            debts[q] = debt
+    return debts
+
+
+@lru_cache(maxsize=None)
+def _source_valuation_capacity(
+    p: int, q: int, max_exp: int, allow_euler: bool,
+) -> int:
+    """Maximum q-adic valuation one future component p^a could supply."""
+    exponents = valid_even_exponents(2, max_exp)
+    if allow_euler and p % 4 == 1:
+        exponents = exponents + valid_euler_exponents(1, max_exp)
+    return max(
+        (sigma_valuation_from_order(p, a, q) for a in exponents),
+        default=0,
+    )
+
+
+@lru_cache(maxsize=None)
+def _capacity_ranking(
+    primes: tuple[int, ...],
+    q: int,
+    max_exp: int,
+    allow_euler: bool,
+) -> tuple[tuple[int, int], ...]:
+    """Rank source primes once by their maximum contribution to q."""
+    ranked = (
+        (_source_valuation_capacity(p, q, max_exp, allow_euler), p)
+        for p in primes
+    )
+    return tuple(sorted(ranked, reverse=True))
+
+
+def fermat_debt_capacity(
+    st: ChainState,
+    primes,
+    max_factors: int,
+    max_exp: int,
+) -> Tuple[bool, Optional[Tuple[int, int, int]]]:
+    """Prove whether remaining slots can still pay every Fermat-prime debt.
+
+    For each future prime p, the exact order/LTE formula gives an upper bound
+    on how much q-adic valuation p can supply over all allowed exponents.  The
+    sum of the largest ``remaining_slots`` capacities is therefore an upper
+    bound on every completion.  We intentionally allow more than one future
+    component to use the Euler exponent while forming this bound; that only
+    makes the bound larger and keeps the prune conservative.
+
+    Returns ``(False, (q, debt, capacity))`` only after a rigorous capacity
+    shortfall has been proved.
+    """
+    if (
+        not SEARCH_MODE.require_euler
+        or SEARCH_MODE.target_num != 2
+        or SEARCH_MODE.target_den != 1
+    ):
+        return True, None
+
+    slots = max_factors - len(st.assigned)
+    allow_euler = st.euler_prime is None
+    prime_tuple = tuple(primes)
+    unavailable = st.assigned.keys() | st.excluded
+    for q, debt in valuation_debts(st).items():
+        if q not in FERMAT_PRIMES:
+            continue
+        capacity = 0
+        selected = 0
+        for contribution, p in _capacity_ranking(
+            prime_tuple, q, max_exp, allow_euler,
+        ):
+            if contribution == 0 or selected >= max(slots, 0):
+                break
+            if p in unavailable:
+                continue
+            capacity += contribution
+            selected += 1
+        if capacity < debt:
+            return False, (q, debt, capacity)
+    return True, None
 
 
 # ── assign_prime_dfs (lightweight, no propagation) ───────────
@@ -275,11 +342,9 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
                        max_exp: int = MAX_EXP) -> Optional[ChainState]:
     """Assign p^exp to a ChainState with full factor-chain propagation.
 
-    IMPROVEMENT: pre-clone valuation contradiction check using
-    _SIG_VALUATIONS.  Previously, the clone was paid first, then σ(p^a)
-    was factorised, and only then was a valuation contradiction detected
-    (49% wasted clone rate).  Now the precomputed valuation map enables
-    checking *before* clone — moving wasted → saved.
+    The exact sigma-valuation map is populated on demand before cloning, so
+    valuation contradictions avoid both unnecessary clones and global eager
+    factorisation of unreachable (p, a) pairs.
     """
     if p in st.excluded or p in st.assigned:
         return _reject("excluded")
@@ -287,32 +352,33 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         return _reject("ratio")
     if not _euler_ok(p, exp, st.euler_prime):
         return _reject("euler")
-    if check_fermat_contradiction(p, exp, st.assigned, st.excluded):
-        return _reject("fermat")
 
     # ── interval skip (pre-clone, counts as saved) ──
     # Tracked via _reject but actually handled in the expansion loop.
     # The _reject path here is for future per-assign interval checks.
 
-    # ── pre-clone valuation check (uses precomputed _SIG_VALUATIONS) ──
+    # ── pre-clone valuation check (populates the exact map lazily) ──
     if propagate:
-        pre_vals = _SIG_VALUATIONS.get((p, exp))
-        if pre_vals is not None:
-            for q, e in pre_vals.items():
-                # q is an odd prime factor of σ(p^a) with exponent e
-                if q in st.excluded:
-                    CONTRADICTION_ATTR[(q, "excluded_pre")] += 1
+        pre_vals = sigma_valuation_map(p, exp)
+        for q, e in pre_vals.items():
+            # q is an odd prime factor of σ(p^a) with exponent e
+            offset = _target_valuation_offset(q)
+            new_req = st.required_v.get(q, 0) + e
+            if q in st.excluded and new_req > offset:
+                CONTRADICTION_ATTR[(q, "excluded_pre")] += 1
+                return _reject("valuation_pre")
+            if q in st.assigned:
+                if new_req > st.current_v[q] + offset:
+                    CONTRADICTION_ATTR[(q, "overrun_pre")] += 1
                     return _reject("valuation_pre")
-                new_req = st.required_v.get(q, 0) + e
-                if q in st.assigned:
-                    if new_req > st.current_v[q]:
-                        CONTRADICTION_ATTR[(q, "overrun_pre")] += 1
-                        return _reject("valuation_pre")
-                else:
-                    if new_req > _max_possible_valuation(q, st.euler_prime,
-                                                         max_exp):
-                        CONTRADICTION_ATTR[(q, "budget_pre")] += 1
-                        return _reject("valuation_pre")
+            else:
+                if (
+                    new_req
+                    > _max_possible_valuation(q, st.euler_prime, max_exp)
+                    + offset
+                ):
+                    CONTRADICTION_ATTR[(q, "budget_pre")] += 1
+                    return _reject("valuation_pre")
 
     # ── clone & apply ──
     ns = st.clone()
@@ -345,38 +411,38 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         _record_productive_telemetry(ns)
         return ns
 
-    # ── infinite-power: skip factorisation for massive p^a ──
-    if is_prime_infinite(p, exp):
-        DEPTH_STATS[ns.depth] += 1
-        CLONE_STATS["productive"] += 1
-        PENDING_SIZE_HIST[len(ns.pending)] += 1
-        CASCADE_DEPTH_HIST[0] += 1
-        _record_productive_telemetry(ns)
-        return ns
-
     # factor-chain propagation (additive valuation)
     cascade_steps = 0
-    for q, e in factorize(int(sig)):
+    post_vals = sigma_valuation_map(p, exp)
+    for q, e in post_vals.items():
         if q == 2:
             continue
         PROPAGATION_EDGES[(p, q)] += 1
-        if q in ns.excluded:
+        offset = _target_valuation_offset(q)
+        new_req = ns.required_v.get(q, 0) + e
+        if q in ns.excluded and new_req > offset:
             CONTRADICTION_ATTR[(q, "excluded_post")] += 1
             return _reject("valuation_post")
 
-        ns.required_v[q] = ns.required_v.get(q, 0) + e
+        ns.required_v[q] = new_req
 
         if q in ns.assigned:
-            if ns.required_v[q] > ns.current_v[q]:
+            if ns.required_v[q] > ns.current_v[q] + offset:
                 CONTRADICTION_ATTR[(q, "overrun_post")] += 1
                 return _reject("valuation_post")
         else:
-            if ns.required_v[q] > _max_possible_valuation(q, ns.euler_prime,
-                                                          max_exp):
+            if (
+                ns.required_v[q]
+                > _max_possible_valuation(q, ns.euler_prime, max_exp)
+                + offset
+            ):
                 CONTRADICTION_ATTR[(q, "budget_post")] += 1
                 return _reject("valuation_post")
 
-        if ns.required_v[q] > ns.current_v.get(q, 0):
+        if (
+            ns.required_v[q] - offset
+            > ns.current_v.get(q, 0)
+        ):
             _enqueue_pending(ns, q)
             cascade_steps += 1
 
@@ -416,7 +482,7 @@ def validate_chain_state(st: ChainState) -> bool:
 
 def _record_productive_telemetry(ns) -> None:
     """Record ratio headroom and depth×|f| for a productive state."""
-    ratio = float(ns.ratio_num) / float(ns.ratio_den)
+    ratio = float(ns.ratio_num / ns.ratio_den)
     headroom = SEARCH_MODE.target_num / SEARCH_MODE.target_den - ratio
     if headroom <= 1e-6:       bucket = "<1e-6"
     elif headroom <= 1e-5:     bucket = "1e-6-1e-5"

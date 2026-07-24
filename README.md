@@ -2,7 +2,7 @@
 
 High-performance constraint-propagation search engine for odd perfect
 numbers and Descartes-type pseudo-candidates.  Factor-chain propagation,
-window-complete pruning, Nielsen-interval bounds, obligation-attractor
+finite-window proof pruning, Nielsen-interval bounds, obligation-attractor
 telemetry.
 
 $$N = q^{4k+1} \prod p_i^{2a_i} \qquad\text{(Euler form)}$$
@@ -17,10 +17,15 @@ pip install gmpy2
 python opn_main.py
 ```
 
-Default configuration runs **pseudo-OPN DFS search** with primes ≤ 200,
-up to 10 distinct factors, exponent 2.  Factor-chain true-OPN mode is
-available by setting `PROPAGATE = True`.  A friend-of-10 verification mode
-is included via `SEARCH_MODE = FRIEND_10_MODE`.
+The active finite search box is configured at the top of `opn_core.py`.
+Set `PROPAGATE = True` for factor-chain OPN mode or `False` for the
+Descartes-type pseudo-candidate DFS.  A friend-of-10 verification mode is
+included via `SEARCH_MODE = FRIEND_10_MODE`.
+
+See [MATHEMATICAL_CORRECTNESS.md](MATHEMATICAL_CORRECTNESS.md) before
+interpreting an exhausted search.  Exhaustion proves only that no candidate
+exists inside the configured finite box; it is not a proof that odd perfect
+numbers do not exist.
 
 ---
 
@@ -71,8 +76,8 @@ additively, tracking q-adic valuations.
 
 The engine incorporates **Touchard's theorem** ($N \equiv 1 \pmod{12}$ or
 $N \equiv 9 \pmod{36}$) as an O(1) congruence check, pre-clone valuation
-contradiction detection using precomputed $\sigma(p^a)$ factor maps, and
-window-complete logical pruning of exponent-4 branches whose $\sigma(p^4)$
+contradiction detection using lazily cached $\sigma(p^a)$ factor maps, and
+finite-window logical pruning of exponent-4 branches whose $\sigma(p^4)$
 factors all exceed the search window.  A comprehensive telemetry system
 (`telemetry.txt`) records prune reasons, clone economics, depth histograms,
 and obligation-signature recurrence patterns across parameter configurations.
@@ -103,7 +108,7 @@ opn_search.py      Search engine
                      · search_opn() — generator with polymorphic dispatch
                      · DFS (stack) for pseudo-solution mode (DFSState)
                      · best-first (heap) for factor-chain mode (ChainState)
-                     · Touchard congruence pruning + contradiction-learning cache
+                     · Touchard congruence pruning + exact-state deduplication
                      · true-OPN & pseudo-solution checks
 opn_io.py          Display, checkpoint, file I/O
                      · display_solution()
@@ -154,7 +159,7 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 | | Legacy (`legacy/`) | Current (`opn_*.py`) |
 |---|---|---|
 | **Candidate form** | $N = r \prod p_i^{2}$ | $N = q^{4k+1} \prod p_i^{2a_i}$ |
-| **Exponents** | fixed: all $a_i = 1$ | variable: $a_i \in \{2, 4, 6, 8, 10\}$ |
+| **Exponents** | fixed: all $a_i = 1$ | variable, bounded by `MAX_EXP` |
 | **Euler prime** | folded into composite $r$ | explicitly tracked ($q \equiv 1 \pmod{4}$, exponent $\equiv 1 \pmod{4}$) |
 | **Factor coupling** | none — primes are independent | factor chains propagate via $\sigma(p^{a})$ factorisation |
 | **Search strategy** | DFS (stack, fixed order) | DFS for pseudo-solution; best-first heap for true OPN |
@@ -171,9 +176,9 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 
 ### Why the Current Engine Is Slower Per State
 
-1. **Brent Pollard-Rho factorisation** — each $\sigma(p^{a})$ must be fully
-   factorised to propagate factor chains.  The legacy engine never factorises
-   $\sigma$ values — it only multiplies them into the running product.
+1. **Brent Pollard-Rho factorisation** — each reached $\sigma(p^{a})$ must be
+   fully factorised to propagate factor chains.  Maps are cached lazily after
+   cheaper bounds pass; the legacy engine never factorises $\sigma$ values.
 2. **State cloning** — `ChainState` carries 14 fields (7 collections); `clone()`
    deep-copies all of them.  In DFS mode the lightweight `DFSState` (8 fields,
    2 collections) avoids this overhead.  The legacy engine reuses 5-element tuples.
@@ -181,8 +186,9 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
    every `assign_prime_chain` call adds measurable overhead.  In DFS mode this
    is skipped entirely.
 4. **Best-first heap** — `heapq.heappush`/`heappop` are $O(\log h)$ vs
-   $O(1)$ stack operations.  With `HEAP_MAX_SIZE = 200 000`, each push costs
-   ∼18 comparisons.  DFS mode uses a plain stack.
+   $O(1)$ stack operations.  DFS mode uses a plain stack.  The proof search
+   does not trim live heap states; a future memory budget must stop explicitly
+   as unresolved rather than silently changing the search space.
 
 ### Why the Current Engine Matters Despite the Slowdown
 
@@ -198,16 +204,16 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
   $v_q(N)$ enables precise contradiction detection.
 - **Touchard congruence pruning** catches impossible branches in O(1) without
   any modulo arithmetic, by tracking prime 3's assigned/excluded status.
-- **The contradiction learning cache** (optional, chain mode) remembers
-  pruned valuation-deficit patterns, short-circuiting isomorphic dead subtrees
-  in long-running searches.
+- **Exact-state deduplication** (optional) removes only states with identical
+  assignments, exclusions, valuations, pending order, ratio, and search index.
+  It does not generalise one contradiction to a broader family of states.
 
 ### When to Use Which
 
 | Goal | Recommended |
 |------|-------------|
 | Find known Descartes-type spoofs quickly | Legacy (`legacy/main.py`) |
-| Explore the full Euler-form search space | Current, `PROPAGATE=True` |
+| Explore a configured finite Euler-form box | Current, `PROPAGATE=True` |
 | Verify results against prior work | Legacy (reference implementation) |
 | Extend to new exponent ranges or factor-chain depth | Current |
 
@@ -428,36 +434,50 @@ Descartes-type structures) are explored first via a priority heap.
 
 ### Pre-Clone Valuation Check
 
-Before cloning a state in chain mode, precomputed $\{q: v_q(\sigma(p^{a}))\}$
-maps enable valuation contradiction detection *without* paying the clone cost.
+Before cloning a state in chain mode, an exact cached
+$\{q: v_q(\sigma(p^{a}))\}$ map enables valuation contradiction detection
+*without* paying the clone cost.  The map is populated only when that
+assignment is actually reached.
 This eliminates wasted clones — the dominant structural overhead in
 factor-chain search where 49% of clones were previously discarded after
 post-clone factorisation.
 
 ### EXCLUDE_EXP_4 Pruning
 
-If $\sigma(p^{4})$'s every odd prime factor exceeds `MAX_PRIME`, the
+If $\sigma(p^{4})$ has any odd prime factor exceeding `MAX_PRIME`, the
 $a=4$ include branch is skipped.  This is **window-complete** logical
-pruning — the cofactor would deterministically become an unresolvable
-pending obligation.  $a=2$ is never filtered, preserving completeness.
+pruning: every such factor is mandatory and would become an unresolvable
+pending obligation.  $a=2$ is never filtered by this specialised check.
 
 ### Precise Next-Prime Interval Bounds (Nielsen Prop. 3)
 
 In chain mode, each expansion step computes lower and upper bounds on the
-next unknown prime, filtering the candidate set from ~60 to typically 3-8.
-Derived from $R \times (p+1)/p \leq T$ (lower) and $R \times p/(p-1) \times U \geq T$ (upper).
+next unknown prime. The lower bound comes from
+$R \times (p+1)/p \leq T$. For the upper bound, if only $r$ distinct-prime
+slots remain, the best relaxed tail is formed by the $r$ smallest available
+primes because $p/(p-1)$ decreases with $p$.
 
-### Fermat Prime Pruning (Nielsen Lemmas 3.6-3.7)
+The implementation multiplies at most `MAX_FACTORS` exact rational factors.
+Mandatory pending primes are included even when they precede `next_idx`, and
+they consume slots before optional primes are selected. The former full-suffix
+big-integer arrays are no longer allocated.
 
-Fermat primes $\{3,5,17,257,65537\}$ receive specialised contradiction
-detection at exponent $\geq 80$: when too many primes $\equiv 1 \pmod{p}$
-exist, a necessary large prime $> 10^{11}$ must appear — contradiction
-within a finite `MAX_PRIME` window.
+### Exact Reverse Valuations and Fermat-Prime Debt
 
-### Infinite-Power Approximation
+For an outstanding Fermat-prime valuation debt, the engine uses the exact
+order/LTE identity for $v_q(\sigma(p^a))$.  It computes the maximum amount
+each still-available component can contribute and sums the largest capacities
+over the remaining factor slots.  A branch is pruned only if even this relaxed
+upper bound cannot pay the debt.  The former high-exponent congruence-count
+heuristic was removed because it was not a valid consequence of the cited
+Nielsen lemmas.
 
-When $p^a > 10^{30}$, $\sigma(p^a)$ factorisation is skipped.  The prime
-contributes only its asymptotic maximum $p/(p-1)$ to ratio bounds.
+### Large-Power Thresholds
+
+`is_prime_infinite()` retains the four piecewise thresholds used by the
+Mathematica reference as classification metadata.  Factor-chain propagation
+is never skipped merely because $p^a$ crosses one of these thresholds:
+omitting the odd factors of $\sigma(p^a)$ would lose mandatory obligations.
 
 ### Friend-of-10 Verification Mode
 

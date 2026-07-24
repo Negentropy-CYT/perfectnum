@@ -33,3 +33,7 @@ test = ["pytest>=7"]
 
 [project.urls]
 Repository = "https://github.com/Negentropy-CYT/perfectnum"
+
+[tool.pytest.ini_options]
+testpaths = ["test_opn.py"]
+norecursedirs = ["improvements", "legacy", "reference"]

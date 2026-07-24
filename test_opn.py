@@ -6,22 +6,22 @@ Covers:
   - Touchard: congruence pruning correctness
   - Pseudo-solution: known Descartes spoof must be found (regression)
   - Early ratio prune: exact-ratio guard (>= → > fix verification)
-  - Fermat: contradiction check
+  - Reverse valuations and Fermat-prime debt capacity
   - Infinite-power: threshold function
   - Friend-of-10: Euler skip, 5-force, 3-exclude
   - Checkpoint: save/restore round-trip
   - Regression: Descartes spoof found in DFS mode
 
 Usage:
-    cd improvements && pytest test_opn.py -v
+    pytest test_opn.py -v
     pytest test_opn.py -v -k "slow"   # only long-running tests
 """
 
 import math
 import os
 import sys
-import tempfile
-from collections import deque
+from fractions import Fraction
+from itertools import combinations
 
 import pytest
 from gmpy2 import mpz
@@ -42,8 +42,8 @@ from opn_core import (
     OPN_MODE,
     SEARCH_MODE,
     brent_rho,
-    check_fermat_contradiction,
     check_touchard,
+    exp4_forced_outside_window,
     factorize,
     generate_odd_primes,
     is_prime_infinite,
@@ -51,28 +51,30 @@ from opn_core import (
     next_prime_upper_bound,
     power_pa,
     precompute_sig_factors,
-    precompute_suffix_bounds,
     ratio_lower_bound,
     ratio_upper_bound,
+    residue_class_count,
+    sigma_valuation_map,
+    sigma_valuation_from_order,
     sigma_prime_power,
     touchard_force_3,
     valid_euler_exponents,
     valid_even_exponents,
 )
-from opn_search import (
-    ContradictionCache,
-    _check_pseudo,
-    _verify_solution,
-    search_opn,
-)
+from opn_search import _check_pseudo, _heap_snapshot, _verify_solution, search_opn
 from opn_state import (
     ChainState,
     DFSState,
+    _capacity_ranking,
     _compute_priority,
     _early_ratio_prune,
     _euler_ok,
+    _max_possible_valuation,
+    _source_valuation_capacity,
     assign_prime_chain,
     assign_prime_dfs,
+    fermat_debt_capacity,
+    valuation_debts,
 )
 
 
@@ -88,6 +90,9 @@ def clear_caches():
     FACTOR_CACHE.clear()
     _SIG_FACTORS.clear()
     _SIG_VALUATIONS.clear()
+    sigma_valuation_from_order.cache_clear()
+    _source_valuation_capacity.cache_clear()
+    _capacity_ranking.cache_clear()
 
 
 @pytest.fixture
@@ -176,24 +181,138 @@ class TestIntervalBounds:
         assert lo == 0
 
     def test_upper_bound_last_prime(self):
-        """With next_idx at the last prime, ub_n=ub_d=1 and
+        """With the candidate at the last prime, the tail is 1 and
         hi = 2*1*9/(2*9*1 - 13*1) = 18/5 = 3.  This is correct."""
         primes = generate_odd_primes(30)
-        s_ub_n, s_ub_d, _, _ = precompute_suffix_bounds(primes)
-        n = len(primes)
-        # next_idx = n-1 → suffix at n is 1/1.  Formula gives hi=3.
-        hi = next_prime_upper_bound(mpz(13), mpz(9), n - 1,
-                                    2, 1, s_ub_n, s_ub_d, n)
+        hi = next_prime_upper_bound(
+            mpz(13), mpz(9), len(primes) - 1, 1,
+            2, 1, primes, {}, set(),
+        )
         assert hi == 3  # verified by hand: 18//5 = 3
+
+    def test_upper_bound_uses_only_remaining_slots(self):
+        """R=13/9, candidate 5, one tail slot gives U=7/6 and hi=6."""
+        primes = [3, 5, 7]
+        hi = next_prime_upper_bound(
+            mpz(13), mpz(9), 1, 2,
+            2, 1, primes, {}, set(),
+        )
+        assert hi == 6
 
     def test_upper_bound_unbounded(self):
         """When denom ≤ 0, return 0 (no finite upper bound)."""
         primes = generate_odd_primes(30)
-        s_ub_n, s_ub_d, _, _ = precompute_suffix_bounds(primes)
-        # ratio=1, ub_n/ub_d >> 2 → denom < 0 → unbounded
-        hi = next_prime_upper_bound(mpz(1), mpz(1), 0,
-                                    2, 1, s_ub_n, s_ub_d, len(primes))
+        hi = next_prime_upper_bound(
+            mpz(1), mpz(1), 0, len(primes),
+            2, 1, primes, {}, set(),
+        )
         assert hi == 0  # unbounded
+
+    def test_candidate_bound_never_discards_a_reachable_tail(self):
+        primes = [3, 5, 7, 11, 13, 17]
+        target = Fraction(2, 1)
+        current = Fraction(13, 9)
+
+        for candidate_idx in range(len(primes)):
+            for slots in range(1, 4):
+                hi = next_prime_upper_bound(
+                    current.numerator,
+                    current.denominator,
+                    candidate_idx,
+                    slots,
+                    target.numerator,
+                    target.denominator,
+                    primes,
+                    {},
+                    set(),
+                )
+                candidate = primes[candidate_idx]
+                tail = primes[candidate_idx + 1:]
+                best = current * Fraction(candidate, candidate - 1)
+                best *= max(
+                    (
+                        math.prod(Fraction(p, p - 1) for p in subset)
+                        for size in range(min(slots - 1, len(tail)) + 1)
+                        for subset in combinations(tail, size)
+                    ),
+                    default=Fraction(1, 1),
+                )
+                if best >= target:
+                    assert hi == 0 or candidate <= hi
+
+
+class TestFactorSlotUpperBound:
+    @staticmethod
+    def _brute_tail(primes, start_idx, slots, assigned, excluded, pending):
+        mandatory = set(pending) - set(assigned)
+        optional = [
+            p for p in primes[start_idx:]
+            if p not in assigned
+            and p not in excluded
+            and p not in mandatory
+        ]
+        choose = min(slots - len(mandatory), len(optional))
+        best = Fraction(0, 1)
+        for subset in combinations(optional, choose):
+            value = math.prod(
+                (Fraction(p, p - 1) for p in mandatory | set(subset)),
+                start=Fraction(1, 1),
+            )
+            best = max(best, value)
+        return best
+
+    @pytest.mark.parametrize("start_idx", range(4))
+    @pytest.mark.parametrize("slots", range(1, 4))
+    def test_matches_exhaustive_subset_maximum(self, start_idx, slots):
+        primes = [3, 5, 7, 11, 13, 17]
+        assigned = {11: 2}
+        excluded = {7}
+        pending = {3} if start_idx > 0 else set()
+        if len(pending) > slots:
+            return
+
+        num, den = ratio_upper_bound(
+            mpz(1), mpz(1), assigned, excluded, primes,
+            next_idx=start_idx,
+            remaining_slots=slots,
+            pending=pending,
+        )
+        assert Fraction(int(num), int(den)) == self._brute_tail(
+            primes, start_idx, slots, assigned, excluded, pending,
+        )
+
+    def test_pending_before_next_idx_is_included(self):
+        primes = [3, 5, 7, 11, 13, 17]
+        num, den = ratio_upper_bound(
+            mpz(1), mpz(1), {13: 2}, set(), primes,
+            next_idx=5,
+            remaining_slots=2,
+            pending={3},
+        )
+        assert Fraction(int(num), int(den)) == Fraction(3, 2) * Fraction(17, 16)
+
+    def test_pending_consumes_a_factor_slot(self):
+        primes = [3, 5, 7, 11, 13]
+        num, den = ratio_upper_bound(
+            mpz(1), mpz(1), {}, set(), primes,
+            next_idx=1,
+            remaining_slots=2,
+            pending={13},
+        )
+        assert Fraction(int(num), int(den)) == Fraction(13, 12) * Fraction(5, 4)
+
+    def test_invalid_pending_invariants_are_rejected(self):
+        primes = [3, 5, 7]
+        with pytest.raises(ValueError):
+            ratio_upper_bound(
+                mpz(1), mpz(1), {}, {3}, primes,
+                next_idx=0, remaining_slots=1, pending={3},
+            )
+        with pytest.raises(ValueError):
+            ratio_upper_bound(
+                mpz(1), mpz(1), {}, set(), primes,
+                next_idx=0, remaining_slots=1, pending={3, 5},
+            )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -228,29 +347,69 @@ class TestTouchard:
 
 
 # ══════════════════════════════════════════════════════════════
-# Fermat Contradiction
+# Reverse valuation and Fermat-prime debt capacity
 # ══════════════════════════════════════════════════════════════
 
-class TestFermat:
-    def test_non_fermat_prime(self):
-        assert not check_fermat_contradiction(7, 100, {}, {})
+class TestReverseValuation:
+    def test_known_values(self):
+        assert sigma_valuation_from_order(7, 2, 3) == 1
+        assert sigma_valuation_from_order(13, 2, 3) == 1
+        assert sigma_valuation_from_order(3, 2, 13) == 1
+        assert sigma_valuation_from_order(3, 4, 11) == 2
 
-    def test_fermat_low_exponent(self):
-        assert not check_fermat_contradiction(3, 2, {}, {})
+    def test_matches_direct_sigma_valuation(self):
+        for p in generate_odd_primes(50):
+            for q in generate_odd_primes(50):
+                if p == q:
+                    continue
+                for a in range(1, 9):
+                    value = int(sigma_prime_power(p, a))
+                    expected = 0
+                    while value % q == 0:
+                        value //= q
+                        expected += 1
+                    assert sigma_valuation_from_order(p, a, q) == expected
 
-    def test_fermat_no_congruent_primes(self):
-        """No primes ≡1 mod 3 → no contradiction."""
-        assert not check_fermat_contradiction(3, 100, {7: 2}, set())
+    def test_residue_count_zero_does_not_forbid_split_debt(self):
+        assert residue_class_count(3, 2, 3) == 0
+        assert sigma_valuation_from_order(7, 2, 3) == 1
+        assert sigma_valuation_from_order(13, 2, 3) == 1
 
-    def test_fermat_contradiction_many_congruent(self):
-        """Many primes ≡1 mod 3, count > τ=51."""
-        assigned = {p: 2 for p in [7, 13, 19, 31, 37, 43, 61, 67, 73, 79, 97,
-                                    103, 109, 127, 139, 151, 157, 163, 181, 193,
-                                    199, 211, 223, 229, 241, 271, 277, 283, 307,
-                                    313, 331, 337, 349, 367, 373, 379, 397, 409,
-                                    421, 433, 439, 457, 463, 487, 499, 523, 541,
-                                    547, 571, 577, 601, 607]}
-        assert check_fermat_contradiction(3, 100, assigned, set())
+    def test_target_must_be_an_odd_prime(self):
+        with pytest.raises(ValueError):
+            residue_class_count(9, 1, 3)
+        with pytest.raises(ValueError):
+            sigma_valuation_from_order(7, 2, 9)
+
+
+class TestFermatDebt:
+    def test_debt_ledger_direction(self):
+        st = ChainState(
+            current_v={3: 8, 13: 2},
+            required_v={3: 3, 13: 2},
+        )
+        assert valuation_debts(st) == {3: 5}
+
+    def test_split_debt_is_feasible(self):
+        st = ChainState(assigned={3: 2}, current_v={3: 2})
+        ok, detail = fermat_debt_capacity(
+            st, [3, 7, 13], max_factors=3, max_exp=2,
+        )
+        assert ok
+        assert detail is None
+
+    def test_capacity_shortfall_prunes(self):
+        st = ChainState(assigned={3: 8}, current_v={3: 8})
+        ok, detail = fermat_debt_capacity(
+            st, [3, 5, 7, 11, 13], max_factors=2, max_exp=2,
+        )
+        assert not ok
+        assert detail == (3, 8, 1)
+
+    def test_unselected_euler_budget_includes_exp_9(self):
+        assert _max_possible_valuation(13, None, 9) == 9
+        assert _max_possible_valuation(13, 5, 9) == 8
+        assert _max_possible_valuation(3, None, 9) == 8
 
 
 # ══════════════════════════════════════════════════════════════
@@ -261,11 +420,13 @@ class TestInfinitePower:
     def test_small_power(self):
         assert not is_prime_infinite(3, 2)
 
-    def test_at_limit(self):
-        assert not is_prime_infinite(10, 30)   # 10^30 == INFINITE_POWER_LIMIT
-
-    def test_exceeds_limit(self):
-        assert is_prime_infinite(10, 31)       # 10^31 > 10^30
+    def test_piecewise_cutoffs(self):
+        assert not is_prime_infinite(3, 100)
+        assert is_prime_infinite(3, 500)
+        assert not is_prime_infinite(31, 10)
+        assert is_prime_infinite(101, 100)
+        assert not is_prime_infinite(1009, 10)
+        assert is_prime_infinite(10007, 8)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -306,6 +467,22 @@ class TestChainState:
         assert ns is not None
         assert ns.assigned == {3: 2}
 
+    def test_sigma_factor_map_is_populated_lazily(self):
+        assert (3, 2) not in _SIG_VALUATIONS
+        assert sigma_valuation_map(3, 2) == {13: 1}
+        assert _SIG_FACTORS[(3, 2)] == {13}
+
+    def test_euler_precompute_respects_prime_congruence(self):
+        precompute_sig_factors([3, 5], 5)
+        assert (5, 1) in _SIG_VALUATIONS
+        assert (5, 5) in _SIG_VALUATIONS
+        assert (3, 1) not in _SIG_VALUATIONS
+        assert (3, 5) not in _SIG_VALUATIONS
+
+    def test_exp4_filter_rejects_one_out_of_window_factor(self):
+        # sigma(5^4) = 11 * 71: 11 is in the window, but mandatory 71 is not.
+        assert exp4_forced_outside_window(5, 13)
+
 
 # ══════════════════════════════════════════════════════════════
 # Pending > MAX_PRIME pruning (P0-1 regression)
@@ -330,7 +507,7 @@ class TestMaxprimePrune:
             called.append(item)
 
         result = _drain_and_process_pending(
-            st, heap, small_primes, max_exp=2, _push=fake_push, cache=None,
+            st, heap, small_primes, max_exp=2, _push=fake_push,
         )
         assert result is True, "P0-1: must return True to signal prune"
         assert len(called) == 0, "no branches should be pushed"
@@ -411,38 +588,81 @@ class TestSearchEngine:
         p = _compute_priority(mpz(1), mpz(1), 0.0, 0)
         assert p > 0  # |2.0 - 1.0| - 0 = 1.0
 
+    def test_exact_dedup_preserves_solution_set(self, small_primes):
+        def signatures(use_cache):
+            return [
+                (tuple(sorted(st.assigned.items())), st.euler_prime, st.pseudo)
+                for st in search_opn(
+                    small_primes,
+                    max_factors=5,
+                    max_exp=2,
+                    propagate=False,
+                    use_cache=use_cache,
+                )
+            ]
+
+        assert signatures(use_cache=True) == signatures(use_cache=False)
+
+    def test_heap_snapshot_reestablishes_heap_order(self):
+        states = [ChainState(priority=float(value)) for value in [5, 2, 4, 1]]
+        snapshot = _heap_snapshot([
+            (5.0, 10, states[0]),
+            (2.0, 11, states[1]),
+            (4.0, 12, states[2]),
+            (1.0, 13, states[3]),
+        ])
+        for child in range(1, len(snapshot)):
+            parent = (child - 1) // 2
+            assert snapshot[parent][:2] <= snapshot[child][:2]
+
 
 # ══════════════════════════════════════════════════════════════
 # Checkpoint round-trip
 # ══════════════════════════════════════════════════════════════
 
 class TestCheckpoint:
-    def test_round_trip(self, small_primes):
+    def test_round_trip(self, small_primes, tmp_path, monkeypatch):
         """Save state_holder, reload, verify keys."""
-        from opn_io import save_checkpoint, load_checkpoint, CHECKPOINT_FILE
-        # Clean up any existing checkpoint
-        if os.path.exists(CHECKPOINT_FILE):
-            os.remove(CHECKPOINT_FILE)
-        try:
-            holder = {
-                "primes": small_primes,
-                "max_factors": 5,
-                "max_exp": 2,
-                "heap": [],
-                "heap_counter": 0,
-                "total_states": 100,
-                "elapsed": 10.0,
-                "use_heap": False,
-            }
-            solutions = [({3: 2, 7: 2}, None, True)]
-            save_checkpoint(holder, solutions)
-            chk = load_checkpoint()
-            assert chk is not None
-            assert chk["total_states"] == 100
-            assert len(chk["solutions"]) == 1
-        finally:
-            if os.path.exists(CHECKPOINT_FILE):
-                os.remove(CHECKPOINT_FILE)
+        import opn_io
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        holder = {
+            "primes": small_primes,
+            "max_factors": 5,
+            "max_exp": 2,
+            "heap": [],
+            "heap_counter": 0,
+            "total_states": 100,
+            "elapsed": 10.0,
+            "use_heap": opn_io.PROPAGATE,
+        }
+        solutions = [({3: 2, 7: 2}, None, True)]
+        opn_io.save_checkpoint(holder, solutions)
+        chk = opn_io.load_checkpoint()
+        assert chk is not None
+        assert chk["total_states"] == 100
+        assert len(chk["solutions"]) == 1
+
+    def test_mode_mismatch_is_not_resumed(self, small_primes, tmp_path, monkeypatch):
+        import opn_io
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        holder = {
+            "primes": small_primes,
+            "max_factors": 5,
+            "max_exp": 2,
+            "heap": [],
+            "heap_counter": 0,
+            "total_states": 100,
+            "elapsed": 10.0,
+            "use_heap": opn_io.PROPAGATE,
+        }
+        opn_io.save_checkpoint(holder, [])
+        monkeypatch.setattr(opn_io, "PROPAGATE", not opn_io.PROPAGATE)
+        assert opn_io.load_checkpoint() is None
+        assert checkpoint.exists()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -460,3 +680,30 @@ class TestFriendMode:
         """OPN_MODE (default) — normal Euler rules apply."""
         assert _euler_ok(5, 1, None)       # 5%4=1, ok
         assert not _euler_ok(3, 1, None)   # 3%4≠1, rejected
+
+    def test_target_numerator_absorbs_two_factors_of_3(self, monkeypatch):
+        monkeypatch.setattr("opn_state.SEARCH_MODE", FRIEND_10_MODE)
+        st = ChainState(excluded={3})
+
+        first = assign_prime_chain(st, 7, 2, propagate=True, max_exp=4)
+        assert first is not None
+        assert first.required_v[3] == 1
+        assert 3 not in first.pending_set
+
+        second = assign_prime_chain(first, 13, 2, propagate=True, max_exp=4)
+        assert second is not None
+        assert second.required_v[3] == 2
+        assert 3 not in second.pending_set
+
+        # sigma(19^2) contributes a third factor of 3, exceeding v_3(9)=2.
+        assert assign_prime_chain(
+            second, 19, 2, propagate=True, max_exp=4,
+        ) is None
+
+    def test_target_denominator_reduces_5_debt(self, monkeypatch):
+        monkeypatch.setattr("opn_state.SEARCH_MODE", FRIEND_10_MODE)
+        st = ChainState(
+            assigned={5: 2},
+            current_v={5: 2},
+        )
+        assert valuation_debts(st) == {5: 1}

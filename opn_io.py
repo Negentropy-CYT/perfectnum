@@ -15,7 +15,7 @@ import time
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
 
-from gmpy2 import mpz
+from gmpy2 import is_prime, mpz
 
 from opn_core import (
     CASCADE_DEPTH_HIST,
@@ -42,7 +42,6 @@ from opn_core import (
     SOLUTIONS_FILE,
     MAX_FACTORS,
     MAX_EXP,
-    PROPAGATE,
     valid_euler_exponents,
     valid_even_exponents,
     factorize,
@@ -50,6 +49,19 @@ from opn_core import (
     sigma_prime_power,
 )
 from opn_state import ChainState, DFSState, validate_chain_state
+
+
+CHECKPOINT_FORMAT_VERSION = 2
+
+
+def _search_mode_fingerprint() -> dict:
+    return {
+        "target_num": SEARCH_MODE.target_num,
+        "target_den": SEARCH_MODE.target_den,
+        "require_euler": SEARCH_MODE.require_euler,
+        "forced_primes": sorted(SEARCH_MODE.forced_primes.items()),
+        "excluded_primes": sorted(SEARCH_MODE.excluded_primes),
+    }
 
 
 # ── display ───────────────────────────────────────────────────
@@ -111,7 +123,7 @@ def _display_true_opn(st, sol_num: int, elapsed: float) -> None:
     print(f"  digits     = {len(str(n_val))}")
     print(f"  |factors|  = {len(st.assigned)}")
     print(f"  Euler      = {st.euler_prime}")
-    print(f"  σ(N)/N     = {float(st.ratio_num) / float(st.ratio_den):.12f}")
+    print(f"  σ(N)/N     = {float(st.ratio_num / st.ratio_den):.12f}")
     print(f"  verified   = {_verify(st)}")
     res = getattr(st, 'resonance', 0.0)
     print(f"  resonance  = {res:+.2f}")
@@ -155,6 +167,8 @@ def _print_factor_chain(st) -> None:
 def save_checkpoint(state_holder: dict, solutions: list) -> None:
     """Atomically persist search state + solutions + telemetry to disk."""
     chk = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "search_mode":   _search_mode_fingerprint(),
         "primes":       state_holder.get("primes", []),
         "max_factors":  state_holder.get("max_factors", MAX_FACTORS),
         "max_exp":      state_holder.get("max_exp", MAX_EXP),
@@ -204,7 +218,8 @@ def load_checkpoint() -> Optional[dict]:
         print("警告: 检查点一致性检查发现问题:")
         for issue in issues:
             print(f"  - {issue}")
-        print("将继续使用，但建议删除检查点文件重新开始。")
+        print("为保证搜索完备性，本次不会恢复该检查点。文件保持不变。")
+        return None
 
     # restore telemetry counters so stats accumulate across sessions
     if chk.get("prune_stats"):
@@ -512,8 +527,10 @@ def validate_checkpoint(chk: dict) -> List[str]:
     """Validate a deserialised checkpoint dict.  Returns list of issues (empty = OK)."""
     issues: List[str] = []
 
-    required_keys = ["primes", "max_factors", "max_exp", "heap", "total_states",
-                     "elapsed", "use_heap"]
+    required_keys = [
+        "format_version", "search_mode", "primes", "max_factors", "max_exp",
+        "heap", "total_states", "elapsed", "use_heap",
+    ]
     for k in required_keys:
         if k not in chk:
             issues.append(f"missing key: {k}")
@@ -521,15 +538,57 @@ def validate_checkpoint(chk: dict) -> List[str]:
     if issues:
         return issues  # structural damage, stop early
 
-    # primes list vs current MAX_PRIME
-    if chk["primes"] and chk["primes"][-1] > MAX_EXP * 500:
-        issues.append("prime list looks mismatched (check MAX_PRIME)")
+    if chk["format_version"] != CHECKPOINT_FORMAT_VERSION:
+        issues.append(
+            f"unsupported checkpoint format: {chk['format_version']} "
+            f"(expected {CHECKPOINT_FORMAT_VERSION})"
+        )
+    if chk["search_mode"] != _search_mode_fingerprint():
+        issues.append("search mode differs from the current target/Euler rules")
+    if bool(chk["use_heap"]) != bool(PROPAGATE):
+        issues.append("PROPAGATE mode differs from the saved search strategy")
+
+    primes = chk["primes"]
+    if not primes:
+        issues.append("prime list is empty")
+    elif primes != sorted(set(primes)):
+        issues.append("prime list is not strictly increasing and unique")
+    elif any(p < 3 or p % 2 == 0 or not is_prime(p) for p in primes):
+        issues.append("prime list contains a non-odd-prime candidate")
+    if chk["max_factors"] < 1 or chk["max_exp"] < 1:
+        issues.append("max_factors and max_exp must be positive")
 
     # heap counter consistency
     heap = chk.get("heap", [])
     heap_counter = chk.get("heap_counter", 0)
-    if len(heap) > 0 and heap_counter < len(heap):
-        issues.append(f"heap_counter ({heap_counter}) < heap length ({len(heap)})")
+    if chk.get("use_heap", False) and heap:
+        tie_ids = []
+        valid_entries = True
+        for entry in heap:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 3:
+                valid_entries = False
+                break
+            tie_ids.append(entry[1])
+        if not valid_entries:
+            issues.append("heap contains a malformed priority entry")
+        elif any(not isinstance(tie_id, int) for tie_id in tie_ids):
+            issues.append("heap contains a non-integer tie-break identifier")
+        else:
+            if len(tie_ids) != len(set(tie_ids)):
+                issues.append("heap contains duplicate tie-break identifiers")
+            if heap_counter <= max(tie_ids):
+                issues.append(
+                    "heap_counter is not greater than every saved identifier"
+                )
+            for child in range(1, len(heap)):
+                parent = (child - 1) // 2
+                if tuple(heap[parent][:2]) > tuple(heap[child][:2]):
+                    issues.append(
+                        "saved priority queue does not satisfy heap order"
+                    )
+                    break
+    elif len(heap) > 0 and heap_counter < len(heap):
+        issues.append(f"stack counter ({heap_counter}) < stack length ({len(heap)})")
 
     # validate ChainState invariants (only in factor-chain mode)
     if chk.get("use_heap", False):

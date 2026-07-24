@@ -10,6 +10,7 @@ user-configurable constants.
 import math
 import random
 from collections import Counter
+from functools import lru_cache
 from typing import Dict, List, Tuple
 
 import gmpy2
@@ -20,10 +21,10 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 200       # largest odd prime considered
+MAX_PRIME         = 10000       # largest odd prime considered
 MAX_FACTORS       = 10        # max distinct prime factors in N
-MAX_EXP           = 2         # max exponent (2 = a_i=1 restriction)
-PROPAGATE         = False     # False = pseudo-solution DFS; True = true OPN chain
+MAX_EXP           = 9         # max exponent (2 = a_i=1 restriction)
+PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 
 # ── search mode (target + Euler + forced/excluded primes) ─────
@@ -72,7 +73,6 @@ RESONANCE_NEWF_W    = 0.7
 RESONANCE_GIANT_W   = 0.15
 PRIORITY_RESONANCE_W = 0.0  # disabled: resonance is structurally negative in chain mode
 PRIORITY_DEPTH_W     = 0.01
-HEAP_MAX_SIZE        = 200_000
 
 # ── caches ────────────────────────────────────────────────────
 SIGMA_CACHE:   Dict[Tuple[int, int], mpz] = {}
@@ -99,7 +99,7 @@ OBLIGATION_SIGS: "Counter[Tuple]"     = Counter()  # (frozen-pending, |f|, coars
 
 # ── search-policy data (derived from telemetry) ───────────────
 TOXIC_SKIP: set[int] = set()
-EXCLUDE_EXP_4: set[int] = set()        # primes whose σ(p^4) factors all > MAX_PRIME
+EXCLUDE_EXP_4: set[int] = set()        # primes whose sigma(p^4) has a factor > window
 EXP4_FILTER_HITS: "Counter[int]" = Counter()  # per-prime filter verification
 
 
@@ -187,6 +187,79 @@ def sigma_prime_power(p: int, a: int) -> mpz:
     return val
 
 
+def _valuation(n: int, q: int) -> int:
+    """Return v_q(n) for positive *n* and prime *q*."""
+    value = int(n)
+    exponent = 0
+    while value % q == 0:
+        value //= q
+        exponent += 1
+    return exponent
+
+
+def _power_minus_one_valuation(p: int, d: int, q: int) -> int:
+    """Return v_q(p^d-1) using modular powers instead of constructing p^d."""
+    if pow(p, d, q) != 1:
+        return 0
+    exponent = 1
+    modulus = q * q
+    while pow(p, d, modulus) == 1:
+        exponent += 1
+        modulus *= q
+    return exponent
+
+
+def residue_class_count(q: int, e: int, n: int) -> int:
+    """Count units x mod q^e with q^e dividing 1+x+...+x^(n-1).
+
+    This exact count describes one prospective source component.  A zero
+    count for exponent ``n-1`` must not by itself prune a valuation debt:
+    several future source components may split that debt.
+    """
+    if q < 3 or q % 2 == 0 or not gmpy2.is_prime(q):
+        raise ValueError("q must be an odd prime")
+    if e < 1 or n < 1:
+        raise ValueError("e and n must be positive")
+    t = _valuation(n, q)
+    g = math.gcd(n, q - 1)
+    nonsingular = (g - 1) * q ** min(t, e - 1)
+    singular = q ** (e - 1) if t >= e else 0
+    return nonsingular + singular
+
+
+@lru_cache(maxsize=None)
+def sigma_valuation_from_order(p: int, a: int, q: int) -> int:
+    """Compute ``v_q(sigma(p^a))`` without factoring ``sigma(p^a)``.
+
+    For distinct odd primes p and q, put n=a+1.  If d=ord_q(p), the
+    valuation is zero when d does not divide n, is v_q(n) when d=1,
+    and otherwise is v_q(p^d-1)+v_q(n/d).  Only divisors of n need to
+    be tested, so the calculation stays small even when q is large.
+    """
+    if a < 0:
+        raise ValueError("exponent must be non-negative")
+    if q < 3 or q % 2 == 0 or not gmpy2.is_prime(q):
+        raise ValueError("q must be an odd prime")
+    if p == q or p % q == 0:
+        return 0
+
+    n = a + 1
+    if p % q == 1:
+        return _valuation(n, q)
+
+    order = None
+    for d in range(2, n + 1):
+        if n % d == 0 and pow(p, d, q) == 1:
+            order = d
+            break
+    if order is None:
+        return 0
+    return (
+        _power_minus_one_valuation(p, order, q)
+        + _valuation(n // order, q)
+    )
+
+
 def power_pa(p: int, a: int) -> int:
     """p^a (as Python int; fits the search range)."""
     key = (p, a)
@@ -216,6 +289,20 @@ def valid_euler_exponents(lb: int, max_exp: int) -> List[int]:
 
 
 # ── σ-factor sets (precomputation for resonance heuristic) ────
+def sigma_valuation_map(p: int, a: int) -> Dict[int, int]:
+    """Return the odd-prime valuation map of sigma(p^a), cached exactly."""
+    key = (p, a)
+    cached = _SIG_VALUATIONS.get(key)
+    if cached is not None:
+        return cached
+
+    sig = int(sigma_prime_power(p, a))
+    valuations = {q: e for q, e in factorize(sig) if q != 2}
+    _SIG_VALUATIONS[key] = valuations
+    _SIG_FACTORS[key] = set(valuations)
+    return valuations
+
+
 def precompute_sig_factors(primes: List[int], max_exp: int) -> None:
     """Populate ``_SIG_FACTORS`` and ``_SIG_VALUATIONS`` for all (p, a).
 
@@ -226,83 +313,98 @@ def precompute_sig_factors(primes: List[int], max_exp: int) -> None:
     _SIG_VALUATIONS.clear()
     for p in primes:
         for a in range(2, max_exp + 1, 2):
-            sig = int(sigma_prime_power(p, a))
-            facs = factorize(sig)
-            _SIG_FACTORS[(p, a)] = {q for q, _ in facs if q != 2}
-            _SIG_VALUATIONS[(p, a)] = {q: e for q, e in facs if q != 2}
-        for a in valid_euler_exponents(1, max_exp):
-            sig = int(sigma_prime_power(p, a))
-            facs = factorize(sig)
-            _SIG_FACTORS[(p, a)] = {q for q, _ in facs if q != 2}
-            _SIG_VALUATIONS[(p, a)] = {q: e for q, e in facs if q != 2}
+            sigma_valuation_map(p, a)
+        if p % 4 == 1:
+            for a in valid_euler_exponents(1, max_exp):
+                sigma_valuation_map(p, a)
 
 
-# ── suffix-product precomputation (O(1) ratio bounds) ──────────
+# ── factor-slot-aware ratio bounds ─────────────────────────────
 
-def precompute_suffix_bounds(primes: List[int]):
-    """Build suffix arrays for O(1) ratio bounds.
+def _top_component_ratio(
+    primes: List[int],
+    start_idx: int,
+    slots: int,
+    assigned,
+    excluded,
+    reserved,
+) -> Tuple[mpz, mpz]:
+    """Return the largest relaxed ratio from ``slots`` optional components.
 
-    suffix_ub[i] = ∏_{j≥i} p_j/(p_j-1)   (upper bound: max ratio contribution)
-    suffix_lb[i] = ∏_{j≥i} (p_j+1)/p_j   (lower bound: min ratio contribution)
+    Every finite prime-power component satisfies
+
+        sigma(p^a) / p^a < p / (p - 1).
+
+    The right-hand side is strictly decreasing in p, so the maximum over at
+    most ``slots`` distinct available primes is obtained from the smallest
+    available primes. Only those primes are multiplied; no full suffix
+    products are materialized.
     """
-    n = len(primes)
-    ub_num = [mpz(1)] * (n + 1)
-    ub_den = [mpz(1)] * (n + 1)
-    lb_num = [mpz(1)] * (n + 1)
-    lb_den = [mpz(1)] * (n + 1)
-    for i in range(n - 1, -1, -1):
-        p = primes[i]
-        ub_num[i] = ub_num[i + 1] * p
-        ub_den[i] = ub_den[i + 1] * (p - 1)
-        lb_num[i] = lb_num[i + 1] * (p + 1)
-        lb_den[i] = lb_den[i + 1] * p
-    return ub_num, ub_den, lb_num, lb_den
+    num = mpz(1)
+    den = mpz(1)
+    if slots <= 0:
+        return num, den
 
-
-# ── ratio bounds (suffix-based, O(1) per query) ───────────────
+    selected = 0
+    for idx in range(max(start_idx, 0), len(primes)):
+        p = primes[idx]
+        if p in assigned or p in excluded or p in reserved:
+            continue
+        num *= p
+        den *= p - 1
+        selected += 1
+        if selected == slots:
+            break
+    return num, den
 
 def ratio_upper_bound(
     ratio_num: mpz, ratio_den: mpz,
     assigned: Dict[int, int], excluded: set[int],
     primes: List[int],
-    next_idx: int = -1,
-    suffix_ub_num: list = None,
-    suffix_ub_den: list = None,
+    *,
+    next_idx: int,
+    remaining_slots: int,
+    pending=(),
 ) -> Tuple[mpz, mpz]:
-    """Maximum possible σ(N)/N — O(1) with suffix, O(|primes|) fallback."""
-    if suffix_ub_num is not None and next_idx >= 0:
-        n = len(primes)
-        if next_idx >= n:
-            return mpz(ratio_num), mpz(ratio_den)
-        # full suffix product for all remaining primes
-        num = mpz(ratio_num) * suffix_ub_num[next_idx]
-        den = mpz(ratio_den) * suffix_ub_den[next_idx]
-        # remove contribution of primes already decided (assigned / excluded)
-        limit = primes[next_idx]
-        for p in assigned:
-            if p >= limit:
-                num //= p           # factor p was in suffix_ub_num
-        for p in excluded:
-            if p >= limit:
-                num //= p
-        # den contains ∏(p-1); assigned/excluded primes' (p-1) factors
-        # must also be removed — do it in a second pass over the same sets
-        for p in assigned:
-            if p >= limit:
-                den //= (p - 1)
-        for p in excluded:
-            if p >= limit:
-                den //= (p - 1)
-        return num, den
+    """Return a rigorous completion upper bound for sigma(N)/N.
 
-    # fallback: O(|primes|)
+    ``remaining_slots`` is the maximum number of new distinct prime factors.
+    Live pending primes are mandatory, may lie before ``next_idx``, and consume
+    slots before the smallest optional primes are selected.
+
+    The caller must reject a state first if a live pending prime is excluded,
+    outside the finite prime window, or if there are more pending primes than
+    remaining slots.
+    """
+    if remaining_slots < 0:
+        raise ValueError("remaining_slots must be non-negative")
+
+    mandatory = {
+        int(p) for p in pending
+        if p not in assigned
+    }
+    if mandatory & excluded:
+        raise ValueError("a pending prime is excluded")
+    if len(mandatory) > remaining_slots:
+        raise ValueError("pending primes exceed remaining factor slots")
+
     num = mpz(ratio_num)
     den = mpz(ratio_den)
-    for p in primes:
-        if p in assigned or p in excluded:
-            continue
+
+    for p in mandatory:
         num *= p
         den *= (p - 1)
+
+    optional_num, optional_den = _top_component_ratio(
+        primes,
+        next_idx,
+        remaining_slots - len(mandatory),
+        assigned,
+        excluded,
+        mandatory,
+    )
+    num *= optional_num
+    den *= optional_den
     return num, den
 
 
@@ -371,10 +473,10 @@ def touchard_force_3(euler_prime, assigned, excluded):
 
 def compute_exclude_exp4(primes: List[int], max_exp: int,
                          max_prime: int) -> None:
-    """Populate EXCLUDE_EXP_4: primes whose σ(p^4) factors ALL exceed
-    MAX_PRIME.  These a=4 include branches deterministically produce
-    cofactors that enter pending but can never be resolved within the
-    current prime window.
+    """Populate EXCLUDE_EXP_4 when sigma(p^4) has a factor above the window.
+
+    Every odd sigma factor is mandatory, so one out-of-window factor is
+    sufficient to make the branch impossible in the finite search box.
 
     This is WINDOW-COMPLETE (not globally complete): a factor > MAX_PRIME
     today may be resolvable if MAX_PRIME is increased later (e.g. 197^4
@@ -382,19 +484,24 @@ def compute_exclude_exp4(primes: List[int], max_exp: int,
     The filter is parameter-sensitive; rerunning with a larger prime pool
     automatically reclassifies borderline primes.
 
-    Conservative: only filters when ALL odd factors > max_prime.
-    If at least one factor fits in the pool, the branch is kept.
     a=2 is NEVER filtered.
     """
     EXCLUDE_EXP_4.clear()
     if max_exp < 4:
         return
     for p in primes:
-        facs = _SIG_FACTORS.get((p, 4))
-        if facs is None:
-            continue          # not precomputed — conservative, don't filter
-        if facs and all(q > max_prime for q in facs):
+        facs = set(sigma_valuation_map(p, 4))
+        if any(q > max_prime for q in facs):
             EXCLUDE_EXP_4.add(p)
+
+
+def exp4_forced_outside_window(p: int, max_prime: int) -> bool:
+    """Return whether an odd factor of sigma(p^4) exceeds the window."""
+    factors = set(sigma_valuation_map(p, 4))
+    outside = any(q > max_prime for q in factors)
+    if outside:
+        EXCLUDE_EXP_4.add(p)
+    return outside
 
 
 def compute_toxic_skip_list() -> None:
@@ -424,23 +531,33 @@ def next_prime_lower_bound(ratio_num, ratio_den, target_num, target_den):
     return (ratio_num * target_den + denom - 1) // denom
 
 
-def next_prime_upper_bound(ratio_num, ratio_den, next_idx,
-                           target_num, target_den,
-                           suffix_ub_num, suffix_ub_den,
-                           n_primes):
-    """Largest prime p such that:
-       current_ratio × p/(p−1) × suffix_ub_ratio ≥ target.
+def next_prime_upper_bound(
+    ratio_num,
+    ratio_den,
+    candidate_idx,
+    remaining_slots,
+    target_num,
+    target_den,
+    primes,
+    assigned,
+    excluded,
+):
+    """Return the largest candidate allowed by the best remaining tail.
 
-    Derived from: R × p/(p−1) × U ≥ T  ⇒  p ≤ 1/(1 − R×U/T).
-    p is clamped to MAX_PRIME (window constraint).
-
-    Returns 0 if no finite upper bound exists (interval is unbounded).
+    The tail contains at most ``remaining_slots - 1`` components and uses
+    the smallest available primes after the candidate. The calculation is
+    exact and returns zero when no finite upper bound exists.
     """
-    if next_idx >= n_primes:
+    if candidate_idx >= len(primes) or remaining_slots <= 0:
         return 0
-    # suffix ratio for primes AFTER the one we're assigning
-    ub_n = suffix_ub_num[next_idx + 1] if next_idx + 1 < n_primes else mpz(1)
-    ub_d = suffix_ub_den[next_idx + 1] if next_idx + 1 < n_primes else mpz(1)
+    ub_n, ub_d = _top_component_ratio(
+        primes,
+        candidate_idx + 1,
+        remaining_slots - 1,
+        assigned,
+        excluded,
+        (),
+    )
 
     # R × p/(p−1) × ub_n/ub_d ≥ T
     # → p/(p−1) ≥ T×ub_d / (R×ub_n)
@@ -453,44 +570,19 @@ def next_prime_upper_bound(ratio_num, ratio_den, next_idx,
     return int(num // den)
 
 
-# ═══════════════════════════════════════════════════════════════
-# Stage 2: Fermat prime pruning (Nielsen Lemma 3.6-3.7)
-# ═══════════════════════════════════════════════════════════════
-
+# Used by the rigorous reverse-valuation debt bound in opn_state.  The
+# previous "assigned + excluded congruent primes" check was not implied by
+# Nielsen's Lemmas 3.6-3.7 and has deliberately been removed.
 FERMAT_PRIMES = {3, 5, 17, 257, 65537}
 
 
-def check_fermat_contradiction(p, exp, assigned, excluded):
-    """Nielsen Lemmas 3.6-3.7: Fermat prime high-exponent pruning.
-
-    When a Fermat prime has exponent ≥ 80, the number of primes
-    ≡ 1 (mod p) in N is bounded by a τ value derived from
-    v_p(σ(p^a)).  If the count exceeds the bound, a prime > 10^11
-    must exist — contradiction within a finite MAX_PRIME window.
-
-    Returns True if contradiction detected (prune this branch).
-    """
-    if p not in FERMAT_PRIMES:
-        return False
-    if exp < 80:
-        return False
-
-    cnt_in = sum(1 for q in assigned if q % p == 1)
-    cnt_ex = sum(1 for q in excluded if q % p == 1)
-    total = cnt_in + cnt_ex
-
-    # Conservative τ bound:  τ = floor(exp / 2) + 1
-    tau = (exp // 2) + 1
-    return total > tau
-
-
-# ═══════════════════════════════════════════════════════════════
-# Stage 3: Infinite-power approximation
-# ═══════════════════════════════════════════════════════════════
-
-INFINITE_POWER_LIMIT = 10**30
-
-
 def is_prime_infinite(p, a):
-    """Return True if p^a exceeds the factorisation threshold."""
-    return pow(p, a) > INFINITE_POWER_LIMIT
+    """Match the four factorisation cutoffs in Nielsen's Mathematica code."""
+    pa = pow(p, a)
+    if p < 30:
+        return pa > 10**200
+    if p < 104:
+        return pa > 10**150
+    if p < 10000:
+        return pa > 10**50
+    return pa > 10**30

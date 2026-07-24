@@ -6,8 +6,8 @@ candidates of the form  N = q^{4k+1} × ∏ p_i^{2a_i}.
 
 Usage
 -----
-    python opn_main.py            # pseudo-solution search (default)
-    # edit PROPAGATE = True       # true-OPN factor-chain search
+    python opn_main.py            # run the configured finite search box
+    # edit PROPAGATE              # switch pseudo/true-OPN mode
     # edit MAX_PRIME / MAX_EXP    # adjust search scope
 
 Modules
@@ -102,7 +102,7 @@ def main() -> None:
             f"\r[Progress] States: {total_states:>12,} | "
             f"Time: {elapsed:>7.1f}s | Rate: {rate:>8.0f}/s | "
             f"|f|={len(st.assigned)} "
-            f"ratio={float(st.ratio_num) / float(st.ratio_den):.8f} "
+            f"ratio={float(st.ratio_num / st.ratio_den):.8f} "
             f"reson={getattr(st, 'resonance', 0.0):+.2f}"
         )
         sys.stdout.flush()

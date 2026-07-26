@@ -19,11 +19,13 @@ Modules
 """
 
 import os
+import signal
 import sys
 import time
 from typing import List
 
 from opn_core import (
+    CHECKPOINT_INTERVAL_SECONDS,
     CHECKPOINT_FILE,
     MAX_PRIME,
     MAX_FACTORS,
@@ -42,7 +44,7 @@ from opn_io import (
     save_solutions_txt,
     write_telemetry_report,
 )
-from opn_search import search_opn
+from opn_search import SearchStopped, search_opn
 
 
 # ── main ──────────────────────────────────────────────────────
@@ -70,6 +72,7 @@ def main() -> None:
             "total_states": chk.get("total_states", 0),
             "elapsed":      chk.get("elapsed", 0.0),
             "use_heap":     chk.get("use_heap", PROPAGATE),
+            "snapshot_id":  chk.get("snapshot_id", 0),
         } if chk.get("heap") else None
     else:
         primes      = generate_odd_primes(MAX_PRIME)
@@ -86,14 +89,17 @@ def main() -> None:
     print(f"Euler 指数:  {valid_euler_exponents(1, max_exp)}")
     print(f"非 Euler:    {valid_even_exponents(2, max_exp)}")
     print(f"搜索模式:    {mode_str}")
+    print(f"自动检查点:  每 {CHECKPOINT_INTERVAL_SECONDS:g} 秒")
     print("=" * 60)
-    print("按 Ctrl+C 安全中断并保存进度\n")
+    print("按一次 Ctrl+C 在当前状态完成后安全保存；再次按下立即中断\n")
 
     solutions    = list(prev_solutions)
     state_holder: dict = {}
     t0           = time.time()
     found_true   = 0
     found_pseudo = 0
+    stop_requested = False
+    interrupt_count = 0
 
     # ── progress callback (decoupled from search engine) ──
     def _show_progress(total_states: int, st, elapsed: float) -> None:
@@ -107,6 +113,27 @@ def main() -> None:
         )
         sys.stdout.flush()
 
+    def _save_stable_boundary(holder: dict, reason: str) -> None:
+        if reason in {"initial", "periodic"}:
+            save_checkpoint(holder, solutions)
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+
+    def _handle_sigint(signum, frame) -> None:
+        nonlocal stop_requested, interrupt_count
+        interrupt_count += 1
+        if interrupt_count == 1:
+            stop_requested = True
+            sys.stderr.write(
+                "\n收到中断请求；当前状态完成后将精确保存。"
+                "再次按 Ctrl+C 可立即中断并回退到最近的自动检查点。\n"
+            )
+            sys.stderr.flush()
+            return
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+
     try:
         for st in search_opn(
             primes, max_factors, max_exp,
@@ -114,6 +141,9 @@ def main() -> None:
             resume_state=resume_state,
             propagate=PROPAGATE,
             progress_callback=_show_progress,
+            checkpoint_callback=_save_stable_boundary,
+            checkpoint_interval_seconds=CHECKPOINT_INTERVAL_SECONDS,
+            stop_requested=lambda: stop_requested,
         ):
             if st.pseudo:
                 found_pseudo += 1
@@ -125,20 +155,32 @@ def main() -> None:
             save_checkpoint(state_holder, solutions)
             save_solutions_txt(solutions)
 
-    except KeyboardInterrupt:
-        print("\n\n收到中断信号，正在保存 ...")
+    except SearchStopped:
+        print("\n\n已到达稳定搜索边界，正在保存 ...")
         save_checkpoint(state_holder, solutions)
         save_solutions_txt(solutions)
         write_telemetry_report(time.time() - t0, found_true + found_pseudo)
         display_telemetry_brief()
         print(
-            f"已保存。已完成 {state_holder.get('total_states', 0):,} 个状态"
+            f"已精确保存。已完成 "
+            f"{state_holder.get('total_states', 0):,} 个状态；"
+            f"前沿还有 {state_holder.get('frontier_size', 0):,} 个状态。"
         )
-        print(
-            f"已找到 {found_true} 个真解 + {found_pseudo} 个伪解。"
-            f"下次运行将从中断处继续。"
-        )
-        sys.exit(0)
+        return
+
+    except KeyboardInterrupt:
+        print("\n\n已立即中断搜索。")
+        save_solutions_txt(solutions)
+        write_telemetry_report(time.time() - t0, found_true + found_pseudo)
+        display_telemetry_brief()
+        if os.path.exists(CHECKPOINT_FILE):
+            print("保留了最近一次完整的原子检查点；恢复时可能重算少量状态。")
+        else:
+            print("中断发生在首次检查点完成前，本次没有可恢复的完整检查点。")
+        return
+
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
 
     elapsed = time.time() - t0
     print(

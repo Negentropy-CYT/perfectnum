@@ -19,6 +19,7 @@ Usage:
 
 import math
 import os
+import pickle
 import sys
 from fractions import Fraction
 from itertools import combinations
@@ -61,7 +62,13 @@ from opn_core import (
     valid_euler_exponents,
     valid_even_exponents,
 )
-from opn_search import _check_pseudo, _heap_snapshot, _verify_solution, search_opn
+from opn_search import (
+    SearchStopped,
+    _check_pseudo,
+    _heap_snapshot,
+    _verify_solution,
+    search_opn,
+)
 from opn_state import (
     ChainState,
     DFSState,
@@ -615,6 +622,193 @@ class TestSearchEngine:
             parent = (child - 1) // 2
             assert snapshot[parent][:2] <= snapshot[child][:2]
 
+    def test_state_holder_does_not_copy_frontier_per_state(
+        self, small_primes, monkeypatch,
+    ):
+        import opn_search
+
+        calls = 0
+
+        def counted_snapshot(entries):
+            nonlocal calls
+            calls += 1
+            return list(entries)
+
+        monkeypatch.setattr(opn_search, "_heap_snapshot", counted_snapshot)
+        holder = {}
+        list(search_opn(
+            small_primes,
+            max_factors=5,
+            max_exp=4,
+            state_holder=holder,
+            propagate=True,
+            checkpoint_interval_seconds=None,
+        ))
+
+        assert calls == 0
+        assert holder["snapshot_reason"] == "complete"
+        assert holder["heap"] == []
+        assert holder["live_total_states"] == holder["total_states"]
+
+    def test_periodic_callback_runs_only_at_serializable_boundaries(
+        self, small_primes, monkeypatch,
+    ):
+        import opn_search
+
+        reasons = []
+        tick = 0
+
+        def monotonic():
+            nonlocal tick
+            tick += 1
+            return float(tick)
+
+        monkeypatch.setattr(opn_search.time, "monotonic", monotonic)
+
+        def checkpoint_callback(holder, reason):
+            pickle.dumps(holder["heap"], pickle.HIGHEST_PROTOCOL)
+            reasons.append(reason)
+
+        list(search_opn(
+            small_primes,
+            max_factors=5,
+            max_exp=2,
+            state_holder={},
+            propagate=True,
+            checkpoint_callback=checkpoint_callback,
+            checkpoint_interval_seconds=0.5,
+        ))
+
+        assert reasons[0] == "initial"
+        assert "periodic" in reasons
+        assert reasons[-1] == "complete"
+
+    def test_cooperative_stop_and_resume_preserves_dfs_results(
+        self, small_primes,
+    ):
+        def signature(st):
+            return (
+                tuple(sorted(st.assigned.items())),
+                st.euler_prime,
+                st.pseudo,
+            )
+
+        baseline_holder = {}
+        baseline = [
+            signature(st)
+            for st in search_opn(
+                small_primes,
+                max_factors=5,
+                max_exp=2,
+                state_holder=baseline_holder,
+                propagate=False,
+                checkpoint_interval_seconds=None,
+            )
+        ]
+
+        checks = 0
+
+        def should_stop():
+            nonlocal checks
+            checks += 1
+            return checks >= 20
+
+        stopped_holder = {}
+        partial = []
+        with pytest.raises(SearchStopped):
+            partial.extend(
+                signature(st)
+                for st in search_opn(
+                    small_primes,
+                    max_factors=5,
+                    max_exp=2,
+                    state_holder=stopped_holder,
+                    propagate=False,
+                    checkpoint_interval_seconds=None,
+                    stop_requested=should_stop,
+                )
+            )
+
+        assert stopped_holder["snapshot_reason"] == "stop"
+        assert stopped_holder["heap"]
+
+        resume_state = {
+            key: stopped_holder[key]
+            for key in (
+                "heap",
+                "heap_counter",
+                "total_states",
+                "elapsed",
+                "use_heap",
+                "snapshot_id",
+            )
+        }
+        resumed_holder = {}
+        resumed = [
+            signature(st)
+            for st in search_opn(
+                small_primes,
+                max_factors=5,
+                max_exp=2,
+                state_holder=resumed_holder,
+                resume_state=resume_state,
+                propagate=False,
+                checkpoint_interval_seconds=None,
+            )
+        ]
+
+        assert partial + resumed == baseline
+        assert resumed_holder["total_states"] == baseline_holder["total_states"]
+
+    def test_solution_boundary_does_not_requeue_reported_solution(
+        self, small_primes,
+    ):
+        holder = {}
+        generator = search_opn(
+            small_primes,
+            max_factors=5,
+            max_exp=2,
+            state_holder=holder,
+            propagate=False,
+            checkpoint_interval_seconds=None,
+        )
+        solution = next(generator)
+        solution_signature = (
+            tuple(sorted(solution.assigned.items())),
+            solution.euler_prime,
+            solution.pseudo,
+        )
+        assert holder["snapshot_reason"] == "solution"
+
+        resume_state = {
+            key: holder[key]
+            for key in (
+                "heap",
+                "heap_counter",
+                "total_states",
+                "elapsed",
+                "use_heap",
+                "snapshot_id",
+            )
+        }
+        generator.close()
+        resumed = [
+            (
+                tuple(sorted(st.assigned.items())),
+                st.euler_prime,
+                st.pseudo,
+            )
+            for st in search_opn(
+                small_primes,
+                max_factors=5,
+                max_exp=2,
+                resume_state=resume_state,
+                propagate=False,
+                checkpoint_interval_seconds=None,
+            )
+        ]
+        assert solution_signature not in resumed
+
 
 # ══════════════════════════════════════════════════════════════
 # Checkpoint round-trip
@@ -643,6 +837,87 @@ class TestCheckpoint:
         assert chk is not None
         assert chk["total_states"] == 100
         assert len(chk["solutions"]) == 1
+
+    def test_checkpoint_flushes_before_atomic_replace(
+        self, small_primes, tmp_path, monkeypatch,
+    ):
+        import opn_io
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        fsync_calls = []
+        monkeypatch.setattr(opn_io.os, "fsync", fsync_calls.append)
+        holder = {
+            "primes": small_primes,
+            "max_factors": 5,
+            "max_exp": 2,
+            "heap": [],
+            "heap_counter": 0,
+            "total_states": 1,
+            "elapsed": 0.1,
+            "use_heap": opn_io.PROPAGATE,
+        }
+
+        opn_io.save_checkpoint(holder, [])
+
+        assert checkpoint.exists()
+        assert len(fsync_calls) == 1
+
+    def test_failed_replace_preserves_previous_checkpoint(
+        self, small_primes, tmp_path, monkeypatch,
+    ):
+        import opn_io
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        holder = {
+            "primes": small_primes,
+            "max_factors": 5,
+            "max_exp": 2,
+            "heap": [],
+            "heap_counter": 0,
+            "total_states": 1,
+            "elapsed": 0.1,
+            "use_heap": opn_io.PROPAGATE,
+        }
+        opn_io.save_checkpoint(holder, [])
+        holder["total_states"] = 2
+
+        def fail_replace(source, destination):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(opn_io.os, "replace", fail_replace)
+        with pytest.raises(OSError, match="simulated replace failure"):
+            opn_io.save_checkpoint(holder, [])
+
+        with checkpoint.open("rb") as f:
+            assert pickle.load(f)["total_states"] == 1
+
+    def test_nonempty_dfs_frontier_round_trip(
+        self, small_primes, tmp_path, monkeypatch,
+    ):
+        import opn_io
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        monkeypatch.setattr(opn_io, "PROPAGATE", False)
+        holder = {
+            "primes": small_primes,
+            "max_factors": 5,
+            "max_exp": 2,
+            "heap": [DFSState(), DFSState(next_idx=1)],
+            "heap_counter": 0,
+            "total_states": 10,
+            "elapsed": 0.2,
+            "use_heap": False,
+        }
+
+        opn_io.save_checkpoint(holder, [])
+        chk = opn_io.load_checkpoint()
+
+        assert chk is not None
+        assert len(chk["heap"]) == 2
+        assert chk["heap_counter"] == 0
 
     def test_mode_mismatch_is_not_resumed(self, small_primes, tmp_path, monkeypatch):
         import opn_io

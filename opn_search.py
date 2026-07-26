@@ -19,6 +19,7 @@ from typing import List, Optional, Union
 from gmpy2 import mpz
 
 from opn_core import (
+    CHECKPOINT_INTERVAL_SECONDS,
     CLONE_STATS,
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
@@ -51,6 +52,10 @@ from opn_state import (
 
 State = Union[DFSState, ChainState]
 """Type alias covering both concrete state classes."""
+
+
+class SearchStopped(RuntimeError):
+    """Raised after a cooperative stop reaches a stable search boundary."""
 
 
 def _state_signature(st: State) -> tuple:
@@ -127,12 +132,17 @@ def search_opn(
     *,
     propagate: bool = True,
     progress_callback=None,
+    checkpoint_callback=None,
+    checkpoint_interval_seconds: Optional[float] = CHECKPOINT_INTERVAL_SECONDS,
+    stop_requested=None,
     use_cache: bool = False,
 ):
     """Generator yielding State objects for each candidate found.
 
     *propagate* selects DFSState (False) or ChainState (True).
     *use_cache* enables sound exact-state deduplication.
+    *checkpoint_callback* runs synchronously at stable frontier boundaries.
+    *stop_requested* is polled between fully processed states.
     """
     n = len(primes)
     seen_states = set() if use_cache else None
@@ -188,27 +198,62 @@ def search_opn(
             return heapq.heappop(container)[2]
         return container.pop()
 
-    def _snapshot(container):
-        if use_heap:
-            return _heap_snapshot(container)
-        return list(container)
-
     t0 = time.time() - elapsed_offset
 
     if state_holder is not None:
         state_holder["primes"]       = primes
         state_holder["max_factors"]  = max_factors
         state_holder["max_exp"]      = max_exp
-        state_holder["heap"]         = _snapshot(heap)
-        state_holder["heap_counter"] = heap_counter
-        state_holder["total_states"] = total_states
         state_holder["use_heap"]     = use_heap
+
+    snapshot_id = (
+        int(resume_state.get("snapshot_id", 0))
+        if resume_state is not None else 0
+    )
+    last_checkpoint = time.monotonic()
+
+    def _publish_frontier(reason: str) -> None:
+        """Expose a coherent frontier while the search loop is paused."""
+        nonlocal snapshot_id, last_checkpoint
+        if state_holder is None:
+            last_checkpoint = time.monotonic()
+            return
+        snapshot_id += 1
+        snapshot_elapsed = time.time() - t0
+        # The callback runs synchronously before this live frontier mutates.
+        state_holder.update({
+            "heap": heap,
+            "heap_counter": heap_counter,
+            "total_states": total_states,
+            "elapsed": snapshot_elapsed,
+            "snapshot_id": snapshot_id,
+            "snapshot_reason": reason,
+            "frontier_size": len(heap),
+            "live_total_states": total_states,
+            "live_elapsed": snapshot_elapsed,
+        })
+        if checkpoint_callback is not None:
+            checkpoint_callback(state_holder, reason)
+        last_checkpoint = time.monotonic()
+
+    _publish_frontier("initial")
 
     # ── progress (time-based: ~1 Hz, plus first state) ──
     _last_progress = 0.0
 
     # ── main loop ──
     while heap:
+        if stop_requested is not None and stop_requested():
+            _publish_frontier("stop")
+            raise SearchStopped("search stopped at a stable frontier boundary")
+
+        if (
+            checkpoint_interval_seconds is not None
+            and checkpoint_interval_seconds > 0
+            and time.monotonic() - last_checkpoint >= checkpoint_interval_seconds
+        ):
+            _publish_frontier("periodic")
+
         st = _pop(heap)
 
         if seen_states is not None:
@@ -218,14 +263,11 @@ def search_opn(
                 continue
             seen_states.add(signature)
 
-        if state_holder is not None:
-            front = [(st.priority, heap_counter, st)] if use_heap else [st]
-            state_holder["heap"]         = _snapshot(front + heap)
-            state_holder["heap_counter"]  = heap_counter + int(use_heap)
-            state_holder["total_states"]  = total_states
-            state_holder["elapsed"]       = time.time() - t0
-
         total_states += 1
+        if state_holder is not None:
+            state_holder["live_total_states"] = total_states
+            state_holder["live_elapsed"] = time.time() - t0
+            state_holder["frontier_size"] = len(heap)
         if progress_callback is not None:
             elapsed = time.time() - t0
             if total_states == 1 or elapsed - _last_progress >= 1.0:
@@ -241,11 +283,13 @@ def search_opn(
             and _verify_solution(st)
         ):
             st.pseudo = False
+            _publish_frontier("solution")
             yield st
             continue
 
         # ── pseudo-solution check ──
         if _check_pseudo(st):
+            _publish_frontier("solution")
             yield st
             continue
 
@@ -379,11 +423,7 @@ def search_opn(
     elapsed = time.time() - t0
     print()  # end inline progress line cleanly
     print(f"搜索完成: {total_states:,} states, {elapsed:.1f}s")
-    if state_holder is not None:
-        state_holder["heap"]         = []
-        state_holder["heap_counter"]  = heap_counter
-        state_holder["total_states"]  = total_states
-        state_holder["elapsed"]       = elapsed
+    _publish_frontier("complete")
 
 
 # ── polymorphic assign dispatch ──────────────────────────────

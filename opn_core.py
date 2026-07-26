@@ -26,6 +26,7 @@ MAX_FACTORS       = 10        # max distinct prime factors in N
 MAX_EXP           = 9         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
+CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
 
 # ── search mode (target + Euler + forced/excluded primes) ─────
 # Single configuration point for OPN vs. friend-of-10 searches.

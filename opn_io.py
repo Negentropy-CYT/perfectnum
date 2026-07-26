@@ -177,6 +177,7 @@ def save_checkpoint(state_holder: dict, solutions: list) -> None:
         "total_states": state_holder.get("total_states", 0),
         "elapsed":      state_holder.get("elapsed", 0.0),
         "use_heap":     state_holder.get("use_heap", True),
+        "snapshot_id":  state_holder.get("snapshot_id", 0),
         "solutions":    solutions,
         "prune_stats":  dict(PRUNE_STATS),
         "depth_stats":  dict(DEPTH_STATS),
@@ -195,6 +196,8 @@ def save_checkpoint(state_holder: dict, solutions: list) -> None:
     tmp = CHECKPOINT_FILE + ".tmp"
     with open(tmp, "wb") as f:
         pickle.dump(chk, f, pickle.HIGHEST_PROTOCOL)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, CHECKPOINT_FILE)
 
 
@@ -587,8 +590,8 @@ def validate_checkpoint(chk: dict) -> List[str]:
                         "saved priority queue does not satisfy heap order"
                     )
                     break
-    elif len(heap) > 0 and heap_counter < len(heap):
-        issues.append(f"stack counter ({heap_counter}) < stack length ({len(heap)})")
+    elif not chk.get("use_heap", False) and heap_counter < 0:
+        issues.append("stack counter must be non-negative")
 
     # validate ChainState invariants (only in factor-chain mode)
     if chk.get("use_heap", False):

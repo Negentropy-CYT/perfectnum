@@ -257,6 +257,7 @@ MAX_EXP     = 2          # max exponent for any prime
                          #   2 = original a_i=1 restriction
 PROPAGATE   = False      # False → pseudo-solution search
                          # True  → true-OPN factor-chain search
+CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic stable-boundary save
 ```
 
 ### Search Modes
@@ -375,10 +376,24 @@ Clone effectiveness:
 
 ### Checkpoint / Resume
 
-Press `Ctrl+C` at any time — the search state (including the full
-heap/stack and all telemetry counters) is atomically saved to
-`checkpoint_merged.pkl`.  Running `python opn_main.py` again will
-resume from the interruption point with cumulative statistics.
+The engine writes `checkpoint_merged.pkl` at startup and then every
+`CHECKPOINT_INTERVAL_SECONDS` at a stable boundary between states.
+The active heap/stack is serialised synchronously at that boundary, so
+the hot search loop no longer copies and heapifies the full frontier
+after every processed state.
+
+Press `Ctrl+C` once to request a cooperative stop.  The current state is
+finished, the exact remaining frontier and telemetry counters are
+atomically saved, and the program exits.  Press `Ctrl+C` a second time
+to stop immediately; in that case the last completed periodic
+checkpoint is retained and at most one checkpoint interval of work is
+replayed on resume.  A forced interruption never overwrites a valid
+checkpoint with a partially processed frontier.
+
+Running `python opn_main.py` again resumes from the saved frontier with
+cumulative statistics.  Checkpoint writes use a temporary file,
+`flush`/`fsync`, and atomic replacement, so an interrupted write leaves
+the previous checkpoint intact.
 
 On resume the checkpoint is validated for internal consistency
 (pending/pending_set agreement, non-negative valuations, heap counter

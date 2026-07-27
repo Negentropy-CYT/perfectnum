@@ -47,10 +47,16 @@ from opn_core import (
     SEARCH_MODE,
     SigmaPoolAnalyzer,
     _remove_all,
+    _scan_blocks_flat,
+    _scan_blocks_hierarchical,
+    build_filtered_prime_pools_vectorized,
+    build_prime_block_plan,
     build_prime_blocks,
     build_prime_superblocks,
     brent_rho,
+    distinct_prime_factors,
     mpz,
+    squarefree_kernel,
     check_touchard,
     euler_max_exp_capacity,
     even_max_exp_capacity,
@@ -1248,7 +1254,9 @@ class TestPoolAnalyzer:
         a = SigmaPoolAnalyzer(primes, block_size=16, superblock_fanout=4,
                               gcd_mode="hierarchical")
         plan = a.plan_for_exp(2)  # n=3, odd → filtered
-        assert isinstance(plan.primes, array)
+        # ponytail: vectorized plans use np.ndarray; the legacy path uses
+        # array.array.  Both are compact (not list); int(primes[idx]) works.
+        assert not isinstance(plan.primes, list)
         assert plan.primes.itemsize >= 4
 
     def test_full_plan_reuses_master_prime_array(self):
@@ -1320,3 +1328,153 @@ class TestSuperblockGCD:
         r = a.analyze(3511, 10)
         assert not r.exact
         assert r.residual > 1
+
+
+class TestVectorizedPrimePlans:
+    """Tests for radical-shared, vectorized prime pool plans."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (1, 1),
+            (3, 3),
+            (5, 5),
+            (9, 3),
+            (15, 15),
+            (27, 3),
+            (45, 15),
+            (75, 15),
+        ],
+    )
+    def test_squarefree_kernel(self, value, expected):
+        assert squarefree_kernel(value) == expected
+
+    @staticmethod
+    def _scalar_eligible(primes, n):
+        return [
+            int(q)
+            for q in primes
+            if (
+                n % int(q) == 0
+                or math.gcd(int(q) - 1, n) > 1
+            )
+        ]
+
+    @pytest.mark.parametrize("limit", [100, 1_000, 10_000, 100_000])
+    def test_vectorized_filter_matches_scalar(self, limit):
+        primes = generate_odd_primes(limit)
+
+        exponents = [
+            2, 4, 6, 8, 10,
+            12, 14, 16, 18,
+        ]
+
+        radicals = sorted({
+            squarefree_kernel(exp + 1)
+            for exp in exponents
+        })
+
+        outputs = build_filtered_prime_pools_vectorized(
+            primes,
+            radicals,
+            chunk_primes=17,
+        )
+
+        for exp in exponents:
+            n = exp + 1
+            radical = squarefree_kernel(n)
+
+            assert list(outputs[radical]) == (
+                self._scalar_eligible(primes, n)
+            )
+
+    def test_exp_2_and_exp_8_share_plan(self):
+        primes = generate_odd_primes(10_000)
+
+        analyzer = SigmaPoolAnalyzer(
+            primes,
+            block_size=16,
+            superblock_fanout=4,
+            gcd_mode="hierarchical",
+            plan_chunk_primes=31,
+        )
+
+        analyzer.prebuild_plans([2, 8])
+
+        assert (
+            analyzer.plan_for_exp(2)
+            is analyzer.plan_for_exp(8)
+        )
+
+        assert len(analyzer._plans_by_radical) == 1
+
+    def test_all_odd_exponents_share_full_plan(self):
+        primes = generate_odd_primes(10_000)
+
+        analyzer = SigmaPoolAnalyzer(
+            primes,
+            block_size=16,
+            superblock_fanout=4,
+            gcd_mode="hierarchical",
+            plan_chunk_primes=31,
+        )
+
+        analyzer.prebuild_plans([1, 5, 9, 13, 17])
+
+        plans = [
+            analyzer.plan_for_exp(exp)
+            for exp in [1, 5, 9, 13, 17]
+        ]
+
+        assert all(plan is plans[0] for plan in plans)
+
+    def test_vectorized_filtered_plan_matches_full_plan(self):
+        primes = generate_odd_primes(20_000)
+
+        full_plan = build_prime_block_plan(
+            primes,
+            block_size=13,
+            superblock_fanout=4,
+            build_superblocks=False,
+        )
+
+        analyzer = SigmaPoolAnalyzer(
+            primes,
+            block_size=13,
+            superblock_fanout=4,
+            gcd_mode="hierarchical",
+            plan_chunk_primes=37,
+        )
+
+        exponents = [
+            1, 2, 4, 5, 6,
+            8, 9, 10, 12,
+            13, 14, 16, 17, 18,
+        ]
+
+        analyzer.prebuild_plans(exponents)
+
+        for p in list(primes)[:30]:
+            for exp in exponents:
+                expected_residual, expected_values = (
+                    analyze_with_plan(
+                        int(p),
+                        exp,
+                        full_plan,
+                        _scan_blocks_flat,
+                    )
+                )
+
+                filtered_plan = analyzer.plan_for_exp(exp)
+
+                actual_residual, actual_values = (
+                    analyze_with_plan(
+                        int(p),
+                        exp,
+                        filtered_plan,
+                        _scan_blocks_hierarchical,
+                    )
+                )
+
+                assert actual_residual == expected_residual
+                assert actual_values == expected_values

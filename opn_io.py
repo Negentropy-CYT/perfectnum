@@ -419,6 +419,46 @@ def write_telemetry_report(elapsed: float, solutions_found: int) -> None:
         if ns_val:
             w(f"  analysis_seconds        {ns_val*1e-9:>12.1f}")
 
+        timing_fields = [
+            ("plan prebuild seconds", "plan_prebuild_ns"),
+            ("plan filter total", "plan_filter_ns"),
+            ("  filter count pass", "plan_filter_count_ns"),
+            ("  filter fill pass", "plan_filter_fill_ns"),
+            ("leaf product seconds", "leaf_product_ns"),
+            ("superblock product seconds", "superblock_product_ns"),
+            ("cold scan seconds", "cold_scan_ns"),
+        ]
+
+        for label, key in timing_fields:
+            nanoseconds = SIGMA_POOL_STATS.get(key, 0)
+
+            if nanoseconds:
+                w(
+                    f"  {label:<28} "
+                    f"{nanoseconds * 1e-9:>12.3f}"
+                )
+
+        filtered_bytes = SIGMA_POOL_STATS.get(
+            "filtered_prime_bytes",
+            0,
+        )
+
+        if filtered_bytes:
+            w(
+                f"  {'filtered pool storage MiB':<28} "
+                f"{filtered_bytes / 1024**2:>12.1f}"
+            )
+
+        w(
+            f"  {'filtered plans':<28} "
+            f"{SIGMA_POOL_STATS.get('filtered_plan_count', 0):>12,}"
+        )
+
+        w(
+            f"  {'full plan built':<28} "
+            f"{SIGMA_POOL_STATS.get('full_plan_built', 0):>12,}"
+        )
+
     if OUTSIDE_POOL_SOURCES:
         w("\n## Outside-pool residual sources (top-10)")
         for (p, exp, bits), count in OUTSIDE_POOL_SOURCES.most_common(10):

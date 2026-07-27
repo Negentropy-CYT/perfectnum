@@ -21,11 +21,13 @@ from gmpy2 import mpz
 from opn_core import (
     CHECKPOINT_INTERVAL_SECONDS,
     CLONE_STATS,
+    EAGER_POOL_PLAN_BUILD,
     ENABLE_FERMAT_DEBT,
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
     PERF_STATS,
     POOL_GCD_MODE,
+    POOL_PLAN_CHUNK_PRIMES,
     POOL_SUPERBLOCK_FANOUT,
     SEARCH_MODE,
     PRUNE_STATS,
@@ -166,6 +168,7 @@ def search_opn(
             block_size=256,
             superblock_fanout=POOL_SUPERBLOCK_FANOUT,
             gcd_mode=POOL_GCD_MODE,
+            plan_chunk_primes=POOL_PLAN_CHUNK_PRIMES,
             stats=SIGMA_POOL_STATS,
         )
 
@@ -174,6 +177,43 @@ def search_opn(
     if propagate:
         EXCLUDE_EXP_4.clear()
         print("sigma-factor maps will be populated lazily")
+
+    if (
+        sigma_pool_analyzer is not None
+        and EAGER_POOL_PLAN_BUILD
+    ):
+        required_exponents = list(
+            valid_even_exponents(2, max_exp)
+        )
+
+        if SEARCH_MODE.require_euler:
+            required_exponents.extend(
+                valid_euler_exponents(1, max_exp)
+            )
+
+        print(
+            "[init] prebuilding sigma-pool plans "
+            f"for exponents={sorted(set(required_exponents))} ...",
+            flush=True,
+        )
+
+        plan_started = time.perf_counter()
+
+        sigma_pool_analyzer.prebuild_plans(
+            required_exponents
+        )
+
+        plan_elapsed = (
+            time.perf_counter() - plan_started
+        )
+
+        print(
+            "[init] sigma-pool plans ready: "
+            f"filtered={SIGMA_POOL_STATS.get('filtered_plan_count', 0)}, "
+            f"full={SIGMA_POOL_STATS.get('full_plan_built', 0)}, "
+            f"time={plan_elapsed:.3f}s",
+            flush=True,
+        )
 
     if resume_state is not None:
         heap = resume_state["heap"]

@@ -34,6 +34,15 @@ ENABLE_FERMAT_DEBT = False
 POOL_GCD_MODE = "hierarchical"          # "flat" or "hierarchical"
 POOL_SUPERBLOCK_FANOUT = 16
 
+# Build exponent-specific prime plans before active search.
+EAGER_POOL_PLAN_BUILD = True
+
+# Number of master-pool primes processed by one NumPy chunk.
+# At 2,000,000:
+#   uint32 temporary working memory is roughly 30–40 MiB;
+#   uint64 temporary working memory is roughly 45–60 MiB.
+POOL_PLAN_CHUNK_PRIMES = 2_000_000
+
 # ── search mode (target + Euler + forced/excluded primes) ─────
 # Single configuration point for OPN vs. friend-of-10 searches.
 # All ratio comparisons read target from SEARCH_MODE.
@@ -178,6 +187,288 @@ def _remove_all(value: mpz, q: int) -> Tuple[mpz, int]:
     return value, e
 
 
+@lru_cache(maxsize=None)
+def distinct_prime_factors(value: int) -> Tuple[int, ...]:
+    """Return the distinct prime factors of a positive integer."""
+    if value < 1:
+        raise ValueError("value must be positive")
+
+    factors: list[int] = []
+    remainder = value
+    divisor = 2
+
+    while divisor * divisor <= remainder:
+        if remainder % divisor == 0:
+            factors.append(divisor)
+
+            while remainder % divisor == 0:
+                remainder //= divisor
+
+        divisor = 3 if divisor == 2 else divisor + 2
+
+    if remainder > 1:
+        factors.append(remainder)
+
+    return tuple(factors)
+
+
+@lru_cache(maxsize=None)
+def squarefree_kernel(value: int) -> int:
+    """Return rad(value), the product of its distinct prime factors."""
+    result = 1
+
+    for factor in distinct_prime_factors(value):
+        result *= factor
+
+    return result
+
+
+def _numpy_prime_view(
+    primes: Sequence[int],
+) -> Tuple[np.ndarray, np.dtype]:
+    """Return a zero-copy NumPy view when the pool is array('I'/'Q').
+
+    A normal Python sequence is converted to one compact NumPy array.
+    """
+    if isinstance(primes, array):
+        if primes.typecode == "I" and primes.itemsize == 4:
+            dtype = np.dtype("=u4")
+        elif primes.typecode == "Q" and primes.itemsize == 8:
+            dtype = np.dtype("=u8")
+        else:
+            raise TypeError(
+                "compact prime pool must use array('I') or array('Q')"
+            )
+
+        return np.frombuffer(primes, dtype=dtype), dtype
+
+    if len(primes) == 0:
+        raise ValueError("prime pool must not be empty")
+
+    dtype = np.dtype(
+        "=u4"
+        if int(primes[-1]) <= 0xFFFFFFFF
+        else "=u8"
+    )
+
+    return np.asarray(primes, dtype=dtype), dtype
+
+
+def _factor_masks_for_chunk(
+    prime_chunk: np.ndarray,
+    factors: Tuple[int, ...],
+) -> Dict[int, np.ndarray]:
+    """Build the necessary-order mask for each small factor.
+
+    For one factor ell, the mask represents:
+
+        q == ell  or  q ≡ 1 (mod ell)
+
+    The first case covers q | n; the second covers ell | gcd(q-1, n).
+    """
+    q_minus_one = np.empty_like(prime_chunk)
+    np.subtract(prime_chunk, 1, out=q_minus_one)
+
+    remainders = np.empty_like(prime_chunk)
+    temporary = np.empty(prime_chunk.shape, dtype=np.bool_)
+
+    masks: Dict[int, np.ndarray] = {}
+
+    for factor in factors:
+        mask = np.empty(prime_chunk.shape, dtype=np.bool_)
+
+        # q divides n. Since q is prime, q must equal one of rad(n)'s factors.
+        np.equal(prime_chunk, factor, out=mask)
+
+        # factor divides q - 1.
+        np.remainder(
+            q_minus_one,
+            factor,
+            out=remainders,
+        )
+        np.equal(
+            remainders,
+            0,
+            out=temporary,
+        )
+        np.logical_or(
+            mask,
+            temporary,
+            out=mask,
+        )
+
+        masks[factor] = mask
+
+    return masks
+
+
+def _mask_for_factors(
+    factor_masks: Dict[int, np.ndarray],
+    factors: Tuple[int, ...],
+) -> np.ndarray:
+    """Combine factor masks for one radical's prime factors."""
+    if len(factors) == 1:
+        return factor_masks[factors[0]]
+
+    result = factor_masks[factors[0]].copy()
+
+    for factor in factors[1:]:
+        np.logical_or(
+            result,
+            factor_masks[factor],
+            out=result,
+        )
+
+    return result
+
+
+def build_filtered_prime_pools_vectorized(
+    primes: Sequence[int],
+    radicals: Sequence[int],
+    *,
+    chunk_primes: int = POOL_PLAN_CHUNK_PRIMES,
+    stats: Optional[Counter] = None,
+) -> Dict[int, np.ndarray]:
+    """Build every requested radical-filtered pool in two chunked passes.
+
+    Pass 1 counts exact output lengths.
+    Pass 2 fills preallocated arrays.
+
+    No repeated np.concatenate() is used, so output construction is linear
+    and temporary memory depends on chunk_primes rather than MAX_PRIME.
+    """
+    if chunk_primes <= 0:
+        raise ValueError("chunk_primes must be positive")
+
+    radical_keys = tuple(
+        sorted(set(int(value) for value in radicals))
+    )
+
+    if not radical_keys:
+        return {}
+
+    factors_by_radical = {
+        radical: distinct_prime_factors(radical)
+        for radical in radical_keys
+    }
+
+    all_factors = tuple(
+        sorted({
+            factor
+            for factors in factors_by_radical.values()
+            for factor in factors
+        })
+    )
+
+    prime_view, dtype = _numpy_prime_view(primes)
+    source_count = len(prime_view)
+
+    counts = {
+        radical: 0
+        for radical in radical_keys
+    }
+
+    # ── pass 1: count exact output lengths ────────────────────
+    count_started = time.perf_counter_ns()
+
+    for start in range(0, source_count, chunk_primes):
+        stop = min(start + chunk_primes, source_count)
+        chunk = prime_view[start:stop]
+
+        factor_masks = _factor_masks_for_chunk(
+            chunk,
+            all_factors,
+        )
+
+        for radical in radical_keys:
+            factors = factors_by_radical[radical]
+            mask = _mask_for_factors(
+                factor_masks,
+                factors,
+            )
+
+            counts[radical] += int(
+                np.count_nonzero(mask)
+            )
+
+    count_ns = time.perf_counter_ns() - count_started
+
+    # Allocate final arrays exactly once.
+    outputs = {
+        radical: np.empty(
+            counts[radical],
+            dtype=dtype,
+        )
+        for radical in radical_keys
+    }
+
+    positions = {
+        radical: 0
+        for radical in radical_keys
+    }
+
+    # ── pass 2: fill exact-size outputs ───────────────────────
+    fill_started = time.perf_counter_ns()
+
+    for start in range(0, source_count, chunk_primes):
+        stop = min(start + chunk_primes, source_count)
+        chunk = prime_view[start:stop]
+
+        factor_masks = _factor_masks_for_chunk(
+            chunk,
+            all_factors,
+        )
+
+        for radical in radical_keys:
+            factors = factors_by_radical[radical]
+            mask = _mask_for_factors(
+                factor_masks,
+                factors,
+            )
+
+            selected = chunk[mask]
+            selected_count = len(selected)
+
+            destination_start = positions[radical]
+            destination_stop = (
+                destination_start + selected_count
+            )
+
+            outputs[radical][
+                destination_start:destination_stop
+            ] = selected
+
+            positions[radical] = destination_stop
+
+    fill_ns = time.perf_counter_ns() - fill_started
+
+    for radical in radical_keys:
+        if positions[radical] != counts[radical]:
+            raise RuntimeError(
+                f"filtered-plan fill mismatch for rad={radical}: "
+                f"{positions[radical]} != {counts[radical]}"
+            )
+
+    if stats is not None:
+        stats["plan_filter_count_ns"] += count_ns
+        stats["plan_filter_fill_ns"] += fill_ns
+        stats["plan_filter_ns"] += count_ns + fill_ns
+
+        # Two complete vectorized passes.
+        stats["plan_filter_source_values"] += (
+            2 * source_count
+        )
+        stats["filtered_prime_values"] = sum(
+            counts.values()
+        )
+        stats["filtered_prime_bytes"] = sum(
+            output.nbytes
+            for output in outputs.values()
+        )
+
+    return outputs
+
+
 def build_prime_blocks(primes, block_size: int = 256):
     """Partition a compact prime sequence into indexed blocks."""
     if block_size <= 0:
@@ -206,16 +497,59 @@ def build_prime_superblocks(blocks: tuple, fanout: int):
     return tuple(result)
 
 
-def build_prime_block_plan(primes, *, block_size: int, superblock_fanout: int,
-                           eligible_primes=None, build_superblocks: bool = True):
+def build_prime_block_plan(
+    primes,
+    *,
+    block_size: int,
+    superblock_fanout: int,
+    eligible_primes=None,
+    build_superblocks: bool = True,
+    stats: Optional[Counter] = None,
+):
     """Build a block plan over full or exponent-filtered primes."""
-    pool = eligible_primes if eligible_primes is not None else primes
-    blocks = build_prime_blocks(pool, block_size)
-    superblocks = (
-        build_prime_superblocks(blocks, superblock_fanout)
-        if build_superblocks else ()
+    pool = (
+        eligible_primes
+        if eligible_primes is not None
+        else primes
     )
-    return PrimeBlockPlan(primes=pool, blocks=blocks, superblocks=superblocks)
+
+    leaf_started = time.perf_counter_ns()
+
+    blocks = build_prime_blocks(
+        pool,
+        block_size,
+    )
+
+    leaf_ns = time.perf_counter_ns() - leaf_started
+
+    superblock_ns = 0
+
+    if build_superblocks:
+        super_started = time.perf_counter_ns()
+
+        superblocks = build_prime_superblocks(
+            blocks,
+            superblock_fanout,
+        )
+
+        superblock_ns = (
+            time.perf_counter_ns() - super_started
+        )
+    else:
+        superblocks = ()
+
+    if stats is not None:
+        stats["leaf_product_ns"] += leaf_ns
+        stats["superblock_product_ns"] += superblock_ns
+        stats["plans_built"] += 1
+        stats["plan_leaf_blocks"] += len(blocks)
+        stats["plan_superblocks"] += len(superblocks)
+
+    return PrimeBlockPlan(
+        primes=pool,
+        blocks=blocks,
+        superblocks=superblocks,
+    )
 
 
 def _strip_prime_block(residual: mpz, inside: dict, plan, block, stats) -> mpz:
@@ -278,6 +612,7 @@ class SigmaPoolAnalyzer:
     def __init__(self, primes, *, block_size: int = 256,
                  superblock_fanout: int = 16,
                  gcd_mode: str = "flat",
+                 plan_chunk_primes: int = POOL_PLAN_CHUNK_PRIMES,
                  stats=None) -> None:
         if not primes:
             raise ValueError("prime pool must not be empty")
@@ -301,21 +636,99 @@ class SigmaPoolAnalyzer:
         self.block_size = block_size
         self.superblock_fanout = superblock_fanout
         self.gcd_mode = gcd_mode
+        self.plan_chunk_primes = plan_chunk_primes
         self._scan = _scan_blocks_hierarchical if gcd_mode == "hierarchical" else _scan_blocks_flat
         self._use_superblocks = (gcd_mode == "hierarchical")
 
         # Single shared full-pool plan for even n (no filter benefit)
         self._full_plan: PrimeBlockPlan | None = None
-        # Per-(odd n) filtered plans
-        self._plans_by_n: Dict[int, PrimeBlockPlan] = {}
+        # Plans are keyed by rad(exp + 1), not exp + 1 itself.
+        # Example: exp=2 (n=3) and exp=8 (n=9) share one plan.
+        self._plans_by_radical: Dict[int, PrimeBlockPlan] = {}
 
         self._cache: Dict[Tuple[int, int], SigmaPoolAnalysis] = {}
         self.stats: "Counter[str]" = stats if stats is not None else Counter()
         self.slowest: List[Tuple[float, int, int, int, bool]] = []
 
+    def prebuild_plans(
+        self,
+        exponents: Sequence[int],
+    ) -> None:
+        """Prebuild every plan required by the configured exponent set."""
+        started = time.perf_counter_ns()
+
+        unique_exponents = tuple(
+            sorted(set(int(exp) for exp in exponents))
+        )
+
+        need_full_plan = any(
+            (exp + 1) % 2 == 0
+            for exp in unique_exponents
+        )
+
+        radical_keys = tuple(
+            sorted({
+                squarefree_kernel(exp + 1)
+                for exp in unique_exponents
+                if (exp + 1) % 2 == 1
+            })
+        )
+
+        missing_radicals = tuple(
+            radical
+            for radical in radical_keys
+            if radical not in self._plans_by_radical
+        )
+
+        if missing_radicals:
+            filtered_pools = (
+                build_filtered_prime_pools_vectorized(
+                    self.primes,
+                    missing_radicals,
+                    chunk_primes=self.plan_chunk_primes,
+                    stats=self.stats,
+                )
+            )
+
+            for radical in missing_radicals:
+                self._plans_by_radical[radical] = (
+                    build_prime_block_plan(
+                        self.primes,
+                        block_size=self.block_size,
+                        superblock_fanout=self.superblock_fanout,
+                        eligible_primes=filtered_pools[radical],
+                        build_superblocks=self._use_superblocks,
+                        stats=self.stats,
+                    )
+                )
+
+        if need_full_plan and self._full_plan is None:
+            self._full_plan = build_prime_block_plan(
+                self.primes,
+                block_size=self.block_size,
+                superblock_fanout=self.superblock_fanout,
+                eligible_primes=None,
+                build_superblocks=self._use_superblocks,
+                stats=self.stats,
+            )
+
+        self.stats["filtered_plan_count"] = len(
+            self._plans_by_radical
+        )
+        self.stats["full_plan_built"] = int(
+            self._full_plan is not None
+        )
+
+        self.stats["plan_prebuild_ns"] += (
+            time.perf_counter_ns() - started
+        )
+
     def plan_for_exp(self, exp: int) -> PrimeBlockPlan:
-        """Return the block plan for *exp*, filtered by necessary-order condition."""
+        """Return the necessary-order block plan for one exponent."""
         n = exp + 1
+
+        # When n is even, every odd q has gcd(q-1, n) >= 2.
+        # Therefore the complete prime pool is required.
         if n % 2 == 0:
             if self._full_plan is None:
                 self._full_plan = build_prime_block_plan(
@@ -324,28 +737,41 @@ class SigmaPoolAnalyzer:
                     superblock_fanout=self.superblock_fanout,
                     eligible_primes=None,
                     build_superblocks=self._use_superblocks,
+                    stats=self.stats,
                 )
+
             return self._full_plan
 
-        cached = self._plans_by_n.get(n)
+        radical = squarefree_kernel(n)
+
+        cached = self._plans_by_radical.get(radical)
+
         if cached is not None:
             return cached
-        # Use same storage type as the master pool (defaults to uint32).
-        type_code = getattr(self.primes, "typecode", "I")
-        eligible = array(type_code)
-        append = eligible.append
-        for raw_q in self.primes:
-            q = int(raw_q)
-            if n % q == 0 or math.gcd(q - 1, n) > 1:
-                append(q)
+
+        # Correct fallback when eager prebuild is disabled or a new exponent
+        # is requested dynamically.
+        filtered = build_filtered_prime_pools_vectorized(
+            self.primes,
+            [radical],
+            chunk_primes=self.plan_chunk_primes,
+            stats=self.stats,
+        )[radical]
+
         plan = build_prime_block_plan(
             self.primes,
             block_size=self.block_size,
             superblock_fanout=self.superblock_fanout,
-            eligible_primes=eligible,
+            eligible_primes=filtered,
             build_superblocks=self._use_superblocks,
+            stats=self.stats,
         )
-        self._plans_by_n[n] = plan
+
+        self._plans_by_radical[radical] = plan
+        self.stats["filtered_plan_count"] = len(
+            self._plans_by_radical
+        )
+
         return plan
 
     def analyze(self, p: int, exp: int) -> SigmaPoolAnalysis:
@@ -382,7 +808,19 @@ class SigmaPoolAnalyzer:
 
         plan = self.plan_for_exp(exp)
         self.stats["candidate_leaf_blocks"] += len(plan.blocks)
-        residual = self._scan(residual, inside, plan, self.stats)
+
+        scan_started = time.perf_counter_ns()
+
+        residual = self._scan(
+            residual,
+            inside,
+            plan,
+            self.stats,
+        )
+
+        self.stats["cold_scan_ns"] += (
+            time.perf_counter_ns() - scan_started
+        )
         # backward-compat alias
         self.stats["blocks_tested"] = self.stats["leaf_blocks_tested"]
 

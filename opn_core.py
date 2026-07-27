@@ -24,7 +24,7 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 5000000000     # largest odd prime considered
+MAX_PRIME         = 4000000000     # largest odd prime considered
 MAX_FACTORS       = 60         # max distinct prime factors in N
 MAX_EXP           = 18         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chain

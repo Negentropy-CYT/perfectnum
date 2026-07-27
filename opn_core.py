@@ -29,7 +29,7 @@ PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chai
 PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
 ENABLE_FERMAT_DEBT = False
-POOL_GCD_MODE = "flat"          # "flat" or "hierarchical"
+POOL_GCD_MODE = "hierarchical"          # "flat" or "hierarchical"
 POOL_SUPERBLOCK_FANOUT = 16
 
 # ── search mode (target + Euler + forced/excluded primes) ─────
@@ -102,7 +102,7 @@ class PrimeSuperBlock:
 class PrimeBlockPlan:
     """Leaf blocks plus a two-level screening structure."""
     blocks: Tuple[PrimeBlock, ...]
-    superblocks: Tuple[PrimeSuperBlock, ...]
+    superblocks: Tuple[PrimeSuperBlock, ...] = ()
 
 
 # ── friend-of-10 preset [INACTIVE] ──────────────────────────────
@@ -201,11 +201,14 @@ def build_prime_superblocks(blocks: tuple, fanout: int):
 
 
 def build_prime_block_plan(primes, *, block_size: int, superblock_fanout: int,
-                           eligible_primes=None):
+                           eligible_primes=None, build_superblocks: bool = True):
     """Build a two-level block plan for *primes* (or *eligible_primes*)."""
     pool = eligible_primes if eligible_primes is not None else primes
     blocks = build_prime_blocks(pool, block_size)
-    superblocks = build_prime_superblocks(blocks, superblock_fanout)
+    superblocks = (
+        build_prime_superblocks(blocks, superblock_fanout)
+        if build_superblocks else ()
+    )
     return PrimeBlockPlan(blocks=blocks, superblocks=superblocks)
 
 
@@ -289,9 +292,12 @@ class SigmaPoolAnalyzer:
         self.superblock_fanout = superblock_fanout
         self.gcd_mode = gcd_mode
         self._scan = _scan_blocks_hierarchical if gcd_mode == "hierarchical" else _scan_blocks_flat
+        self._use_superblocks = (gcd_mode == "hierarchical")
 
-        # Cached full-pool plans: prime blocks for each (a+1) value
-        self._plans_by_exp: Dict[int, PrimeBlockPlan] = {}
+        # Single shared full-pool plan for even n (no filter benefit)
+        self._full_plan: PrimeBlockPlan | None = None
+        # Per-(odd n) filtered plans
+        self._plans_by_n: Dict[int, PrimeBlockPlan] = {}
 
         self._cache: Dict[Tuple[int, int], SigmaPoolAnalysis] = {}
         self.stats: "Counter[str]" = stats if stats is not None else Counter()
@@ -300,22 +306,31 @@ class SigmaPoolAnalyzer:
     def plan_for_exp(self, exp: int) -> PrimeBlockPlan:
         """Return the block plan for *exp*, filtered by necessary-order condition."""
         n = exp + 1
-        cached = self._plans_by_exp.get(n)
+        if n % 2 == 0:
+            # All even n share the same full-pool plan (no filter benefit).
+            if self._full_plan is None:
+                self._full_plan = build_prime_block_plan(
+                    self.primes,
+                    block_size=self.block_size,
+                    superblock_fanout=self.superblock_fanout,
+                    eligible_primes=None,
+                    build_superblocks=self._use_superblocks,
+                )
+            return self._full_plan
+
+        cached = self._plans_by_n.get(n)
         if cached is not None:
             return cached
-        if n % 2 == 0:
-            # For even n, gcd(q-1, n) ≥ 2 for all odd q → no filter benefit
-            eligible = None
-        else:
-            eligible = [q for q in self.primes
-                        if n % q == 0 or math.gcd(q - 1, n) > 1]
+        eligible = [q for q in self.primes
+                    if n % q == 0 or math.gcd(q - 1, n) > 1]
         plan = build_prime_block_plan(
             self.primes,
             block_size=self.block_size,
             superblock_fanout=self.superblock_fanout,
             eligible_primes=eligible,
+            build_superblocks=self._use_superblocks,
         )
-        self._plans_by_exp[n] = plan
+        self._plans_by_n[n] = plan
         return plan
 
     def analyze(self, p: int, exp: int) -> SigmaPoolAnalysis:

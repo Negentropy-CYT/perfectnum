@@ -45,9 +45,11 @@ from opn_core import (
     OPN_MODE,
     SEARCH_MODE,
     SigmaPoolAnalyzer,
+    _remove_all,
     build_prime_blocks,
     build_prime_superblocks,
     brent_rho,
+    mpz,
     check_touchard,
     euler_max_exp_capacity,
     even_max_exp_capacity,
@@ -92,6 +94,21 @@ from opn_state import (
     fermat_debt_capacity,
     valuation_debts,
 )
+
+
+# ══════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════
+
+def analyze_with_plan(p: int, exp: int, plan, scanner):
+    """Run a pool analysis using a specific block plan and scanner."""
+    from collections import Counter
+    residual = mpz(sigma_prime_power(p, exp))
+    residual, _ = _remove_all(residual, 2)
+    inside = {}
+    stats = Counter()
+    residual = scanner(residual, inside, plan, stats)
+    return residual, inside
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1150,20 +1167,37 @@ class TestPoolAnalyzer:
 
     def test_blocks_for_exp_matches_full_blocks(self):
         """Filtered blocks produce identical results to full-pool analysis."""
-        primes = generate_odd_primes(500)
-        for p in primes[:30]:
-            for exp in [2, 4, 6, 8, 10, 12, 14, 16, 18, 1, 5, 9, 13]:
-                if exp % 2 == 1 and p % 4 != 1:
-                    continue
-                a_full = SigmaPoolAnalyzer(primes)
-                a_full.blocks_for_exp = lambda e: a_full.blocks
+        from opn_core import build_prime_block_plan, _scan_blocks_flat
 
-                r_full = a_full.analyze(p, exp)
-                r_filt = SigmaPoolAnalyzer(primes).analyze(p, exp)
+        primes = generate_odd_primes(1000)
+        full_plan = build_prime_block_plan(
+            primes, block_size=16, superblock_fanout=4,
+            eligible_primes=list(primes), build_superblocks=False,
+        )
+        a = SigmaPoolAnalyzer(primes, block_size=16, superblock_fanout=4,
+                              gcd_mode="flat")
+        for p in generate_odd_primes(200):
+            for exp in [2, 4, 6, 8, 10, 12, 14, 16, 18]:
+                filtered_plan = a.plan_for_exp(exp)
+                # Compare full vs filtered using the flat scanner
+                r_full = analyze_with_plan(p, exp, full_plan, _scan_blocks_flat)
+                r_filt = analyze_with_plan(p, exp, filtered_plan, _scan_blocks_flat)
+                assert r_full[0] == r_filt[0]
+                assert r_full[1] == r_filt[1]
 
-                assert r_full.exact == r_filt.exact
-                assert r_full.valuations == r_filt.valuations
-                assert r_full.residual == r_filt.residual
+    def test_even_n_reuses_single_full_plan(self):
+        """All even n share the same full-pool plan object."""
+        a = SigmaPoolAnalyzer(generate_odd_primes(500), gcd_mode="hierarchical")
+        p1 = a.plan_for_exp(1)   # n=2
+        p5 = a.plan_for_exp(5)   # n=6
+        p9 = a.plan_for_exp(9)   # n=10
+        assert p1 is p5 is p9
+
+    def test_flat_plan_does_not_build_superblocks(self):
+        """Flat mode must not construct superblocks."""
+        a = SigmaPoolAnalyzer(generate_odd_primes(500), gcd_mode="flat")
+        plan = a.plan_for_exp(2)  # even n → full plan
+        assert plan.superblocks == ()
 
 
 # ══════════════════════════════════════════════════════════════

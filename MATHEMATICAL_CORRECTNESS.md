@@ -15,17 +15,43 @@ relative to this finite-box contract.
 For an Euler-form box, its maximum possible total multiplicity is
 
 ```text
-max_euler_exponent + (max_factors - 1) * max_even_exponent.
+E_euler + (F - 1) * E_even
 ```
 
-With the checked-in values `MAX_FACTORS=10` and `MAX_EXP=9`, this is only
-`9 + 9*8 = 81`; `MAX_PRIME=10000` is also a hard finite cutoff. These
-settings are therefore an algorithm experiment, not a box capable of
-containing an OPN under the standard published lower bounds.
+where `E_euler` is the largest allowed exponent ≡ 1 mod 4 and `E_even`
+the largest allowed even exponent.  The box is determined by the active
+values of `MAX_PRIME`, `MAX_FACTORS`, and `MAX_EXP` at the top of
+`opn_core.py`.  See the validated-regression configuration in the README
+for a concrete example with known search-tree stability.
 
 Live states are never discarded because of heap size or priority. If a future
 resource budget is added, reaching that budget must produce an explicit
 `UNRESOLVED` result rather than an empty search frontier.
+
+## Sigma-Pool Analysis Contract
+
+The pool analyser (`SigmaPoolAnalyzer`) classifies each σ(p^a) against the
+configured odd-prime pool.  Four correctness invariants hold:
+
+1. The prime pool **must** be the complete ordered set of odd primes from 3
+   through `prime_limit`.  The analyser validates "starts at 3, odd, strictly
+   increasing" but does **not** independently re-verify primality or
+   completeness — it trusts the sieve output.
+
+2. `exact=True` means the odd part of σ(p^a) has been fully stripped of
+   every prime in the pool; `residual == 1` and the returned `valuations`
+   is a complete map that can be written to `_SIG_VALUATIONS`.
+
+3. `exact=False` means the residual after stripping all in-pool primes
+   exceeds 1.  By construction the residual is coprime to every pool prime,
+   so it certifies the existence of an out-of-window prime factor.  The
+   returned `valuations` is **partial** and must **not** be used for
+   factor-chain propagation or written to the global exact cache.
+
+4. The exponent-order filter and hierarchical superblock GCD are
+   **semantics-preserving**: they only reduce the number of primes/blocks
+   tested, never change the valuation map or the residual.  This is
+   guaranteed by `gcd(r, S) = 1 ⇒ gcd(r, B_i) = 1` for all child blocks.
 
 ## Factor-Slot Tail Bound
 
@@ -108,6 +134,10 @@ contradiction because several future components may split a valuation debt.
 
 ## Fermat-Debt Capacity Prune
 
+> **Note:** this prune is implemented but **disabled by default**
+> (`ENABLE_FERMAT_DEBT = False` in `opn_core.py`).  It can be re-enabled
+> for controlled experiments.
+
 For each future prime p, the engine computes the maximum valuation that one
 allowed component p^a could contribute to a Fermat-prime debt q. If h component
 slots remain, the sum of the h largest individual capacities is an upper bound
@@ -129,8 +159,10 @@ B(u) = 1/2 * sum_{d|u, d>1} φ(d)²    where   u = oddpart(R-1).
 ```
 
 This is a necessary-condition theorem that uses only `R` itself — no search
-window, exponent cap, or abundance margin.  The theorem is proved in Lean as
-`all_odd_order_layers_cyclotomic_exponent_sum_le_budget` (see `D:\leans\`).
+window, exponent cap, or abundance margin.  A Lean formalisation exists in
+the author's local development tree but is not currently distributed with
+this repository.  The Python implementation should not be treated as
+independently machine-checked from this repository alone.
 
 **In the search engine:** `max_prime_capacity(p)` in `opn_core.py` computes
 `B(oddpart(p-1))`.  The check fires only when the current expansion candidate

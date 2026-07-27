@@ -13,11 +13,15 @@ $$\sigma(N) = 2N \qquad\text{(perfect number condition)}$$
 ## Quick Start
 
 ```bash
-pip install gmpy2
+python -m pip install -r requirements.txt
 python opn_main.py
 ```
 
+**Requirements:** Python 3.10+, gmpy2, numpy.
+
 The active finite search box is configured at the top of `opn_core.py`.
+See [MATHEMATICAL_CORRECTNESS.md](MATHEMATICAL_CORRECTNESS.md) before
+interpreting an exhausted search.
 Set `PROPAGATE = True` for factor-chain OPN mode or `False` for the
 Descartes-type pseudo-candidate DFS.  A friend-of-10 verification mode is
 included via `SEARCH_MODE = FRIEND_10_MODE`.
@@ -92,12 +96,12 @@ and obligation-signature recurrence patterns across parameter configurations.
 ```
 opn_main.py        Entry point (configuration + main loop)
 opn_core.py        Arithmetic engine
-                     · prime generation (sieve)
-                     · Brent Pollard-Rho + cyclotomic factorisation
-                     · σ(p^a) computation + full valuation maps (cached)
-                     · factor / power / sigma / totient caches
+                     · segmented odd-prime sieve → compact uint32/64 array
+                     · exponent-specific necessary-order filtering
+                     · indexed prime blocks + hierarchical GCD screening
+                     · exact / outside-window σ-pool analysis
+                     · general-purpose Brent Pollard-Rho factorisation
                      · factor-slot-aware ratio bounds
-                     · Touchard congruence + EXCLUDE_EXP_4 pruning
                      · max-prime capacity bound + LTE valuation helpers
                      · telemetry counters + all user-configurable constants
 opn_state.py       Search state & constraint propagation
@@ -201,10 +205,8 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 - **The legacy engine cannot search beyond $a_i = 1$.**  Adding variable exponents
   requires the factor-chain framework — factorising $\sigma(p^{a})$ is mandatory
   to determine which new primes are forced into $N$.
-- **Resonance guidance reduces the state count to the first solution.**  In
-  factor-chain mode, the best-first heap explores high-resonance branches
-  first, often reaching candidates in thousands of states instead of hundreds
-  of millions.
+- **Resonance telemetry** is computed but its priority weight is currently
+  zero — it does not affect search order.
 - **The additive q-adic valuation** provides a correctness guarantee that the
   legacy `max()` heuristic lacks: tracking $\sum v_q(\sigma(\cdot))$ against
   $v_q(N)$ enables precise contradiction detection.
@@ -251,19 +253,32 @@ python opn_main.py
 
 ### Configuration
 
-Edit the constants at the top of `opn_core.py` (or override them
-programmatically):
+Edit the constants at the top of `opn_core.py`.
 
+**Safe demonstration** (completes in seconds):
 ```python
-# opn_core.py
+MAX_PRIME  = 100_000; MAX_FACTORS = 12; MAX_EXP = 6
+```
 
-MAX_PRIME   = 200        # largest odd prime considered
-MAX_FACTORS = 10         # max distinct prime factors in N
-MAX_EXP     = 2          # max exponent for any prime
-                         #   2 = original a_i=1 restriction
-PROPAGATE   = False      # False → pseudo-solution search
-                         # True  → true-OPN factor-chain search
-CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic stable-boundary save
+**Validated regression** (proven search-tree stability):
+```python
+MAX_PRIME  = 1_000_000_000; MAX_FACTORS = 60; MAX_EXP = 18
+```
+
+**Experimental** (large-pool feasibility only):
+```python
+MAX_PRIME  = 5_000_000_000  # requires ~2 GiB prime storage
+```
+
+`PROPAGATE=True` enables factor-chain (true-OPN) search;
+`PROPAGATE=False` runs Descartes-spoof DFS.
+
+Additional controls:
+```python
+POOL_GCD_MODE = "hierarchical"  # "flat" or "hierarchical"
+POOL_SUPERBLOCK_FANOUT = 16
+ENABLE_FERMAT_DEBT = False      # conservative debt-capacity bound (off)
+CHECKPOINT_INTERVAL_SECONDS = 300.0
 ```
 
 ### Search Modes
@@ -403,17 +418,23 @@ the previous checkpoint intact.
 
 On resume the checkpoint is validated for internal consistency
 (pending/pending_set agreement, non-negative valuations, heap counter
-coherence).  Issues are reported as warnings.
+coherence, mode fingerprint, format version).  Issues cause the
+checkpoint to be rejected (not silently continued).
 
-Delete `checkpoint_merged.pkl` to force a fresh start (resets all
-telemetry).
+Selected search-state and telemetry counters are persisted.  Per-run
+pool timing, slowest-analysis records, and some diagnostic counters
+are not guaranteed to survive resume.  The checkpoint also stores the
+generated prime pool — for very large `MAX_PRIME` this can produce
+large checkpoint files.
+
+Delete `checkpoint_merged.pkl` to force a fresh start.
 
 ### Telemetry Report
 
 On completion (or Ctrl+C), a structured Markdown report is written to
-`telemetry.txt` covering prune statistics, clone economics, depth
-histograms, obligation-signature recurrence, and propagation edge analysis.
-All counters persist across checkpoint/resume cycles.
+`telemetry.txt` covering prune statistics, clone economics, pool
+analysis, core timings, depth histograms, and propagation edges.
+Counters marked as checkpointed persist across resume cycles.
 
 ---
 

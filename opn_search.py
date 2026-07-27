@@ -21,8 +21,10 @@ from gmpy2 import mpz
 from opn_core import (
     CHECKPOINT_INTERVAL_SECONDS,
     CLONE_STATS,
+    ENABLE_FERMAT_DEBT,
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
+    PERF_STATS,
     SEARCH_MODE,
     PRUNE_STATS,
     SIGMA_POOL_STATS,
@@ -32,8 +34,6 @@ from opn_core import (
     check_touchard,
     euler_max_exp_capacity,
     even_max_exp_capacity,
-    exp4_forced_outside_window,
-    exponent_forces_outside_window,
     max_prime_capacity,
     next_prime_lower_bound,
     next_prime_upper_bound,
@@ -158,7 +158,8 @@ def search_opn(
     # ── pool-aware sigma analyser (OPN chain mode only) ──
     sigma_pool_analyzer = None
     if propagate and SEARCH_MODE.target_num == 2 and SEARCH_MODE.target_den == 1:
-        sigma_pool_analyzer = SigmaPoolAnalyzer(primes)
+        SIGMA_POOL_STATS.clear()
+        sigma_pool_analyzer = SigmaPoolAnalyzer(primes, stats=SIGMA_POOL_STATS)
 
     print("using exact factor-slot tail bounds", flush=True)
 
@@ -349,6 +350,7 @@ def search_opn(
         if lb_num * SEARCH_MODE.target_den > SEARCH_MODE.target_num * lb_den:
             continue
 
+        _t0 = time.perf_counter_ns()
         ub_num, ub_den = ratio_upper_bound(
             st.ratio_num, st.ratio_den,
             st.assigned, st.excluded, primes,
@@ -356,14 +358,19 @@ def search_opn(
             remaining_slots=k_remain,
             pending=live_pending,
         )
+        PERF_STATS["ratio_upper_ns"] += time.perf_counter_ns() - _t0
+        PERF_STATS["ratio_upper_calls"] += 1
         if ub_num * SEARCH_MODE.target_den < SEARCH_MODE.target_num * ub_den:
             PRUNE_STATS["ratio_upper"] += 1
             continue
 
-        if use_heap:
+        if use_heap and ENABLE_FERMAT_DEBT:
+            _t1 = time.perf_counter_ns()
             debt_ok, _debt_detail = fermat_debt_capacity(
                 st, primes, max_factors, max_exp,
             )
+            PERF_STATS["fermat_debt_ns"] += time.perf_counter_ns() - _t1
+            PERF_STATS["fermat_debt_calls"] += 1
             if not debt_ok:
                 PRUNE_STATS["fermat_debt"] += 1
                 continue
@@ -468,12 +475,6 @@ def search_opn(
                     CLONE_STATS["saved"] += 1
                     continue
                 if _terminal_prune(st, p, e, k_remain):
-                    continue
-                if use_heap and exponent_forces_outside_window(p, e, primes[-1]):
-                    PRUNE_STATS["window_exp"] += 1
-                    CLONE_STATS["saved"] += 1
-                    if e == 4:
-                        EXP4_FILTER_HITS[p] += 1
                     continue
                 # Prospective ratio before pool-analyser fast path
                 new_num = mpz(st.ratio_num) * sigma_prime_power(p, e)

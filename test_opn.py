@@ -1122,3 +1122,26 @@ class TestPoolAnalyzer:
         assert r.exact
         assert r.valuations == {13: 1}
         assert a.stats.get("exact_from_global_cache", 0) == 1
+
+    def test_3511_10_never_calls_full_factorize(self, monkeypatch):
+        """Regression lock: SigmaPoolAnalyzer must not call factorize()."""
+        import opn_core
+
+        def forbidden_factorize(_value):
+            raise AssertionError("SigmaPoolAnalyzer called full factorize()")
+
+        monkeypatch.setattr(opn_core, "factorize", forbidden_factorize)
+        a = SigmaPoolAnalyzer(generate_odd_primes(5000))
+        r = a.analyze(3511, 10)
+        assert not r.exact
+        assert r.residual > 1
+
+    def test_analyzer_updates_external_stats(self):
+        """External Counter receives stats from analyzer."""
+        from collections import Counter
+        stats = Counter()
+        a = SigmaPoolAnalyzer([3, 5, 7, 11, 13], stats=stats)
+        a.analyze(3, 2)
+        assert stats["misses"] == 1
+        assert stats["exact"] == 1
+        assert stats["analysis_ns"] > 0

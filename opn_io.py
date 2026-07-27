@@ -42,6 +42,7 @@ from opn_core import (
     SIGMA_POOL_STATS,
     ANALYZER_SLOWEST,
     OUTSIDE_POOL_SOURCES,
+    PERF_STATS,
     WINDOW_KNOWN_HITS,
     PRUNE_STATS,
     RATIO_HEADROOM,
@@ -420,6 +421,26 @@ def write_telemetry_report(elapsed: float, solutions_found: int) -> None:
         w(f"  {'p^exp':>10}  {'cached rejects':>15}")
         for (p, exp), count in WINDOW_KNOWN_HITS.most_common(10):
             w(f"  {p:>6}^{exp:<3}  {count:>15,}")
+
+    # ── core runtime timings ──
+    pool_ns = SIGMA_POOL_STATS.get("analysis_ns", 0)
+    pool_calls = (SIGMA_POOL_STATS.get("hits", 0)
+                  + SIGMA_POOL_STATS.get("misses", 0))
+    ratio_ns = PERF_STATS.get("ratio_upper_ns", 0)
+    ratio_calls = PERF_STATS.get("ratio_upper_calls", 0)
+    debt_ns = PERF_STATS.get("fermat_debt_ns", 0)
+    debt_calls = PERF_STATS.get("fermat_debt_calls", 0)
+    if pool_calls or ratio_calls or debt_calls:
+        w("\n## Core timings")
+        w(f"  {'phase':<20} {'calls':>10} {'seconds':>12} {'us/call':>12} {'%runtime':>11}")
+        def _write_timing(name, calls, ns_val):
+            s = ns_val * 1e-9
+            us = ns_val / calls / 1000.0 if calls else 0.0
+            pct = 100.0 * s / elapsed if elapsed > 0 else 0.0
+            w(f"  {name:<20} {calls:>10,} {s:>12.3f} {us:>12.1f} {pct:>10.1f}%")
+        _write_timing("pool analysis", pool_calls, pool_ns)
+        _write_timing("ratio upper", ratio_calls, ratio_ns)
+        _write_timing("fermat debt", debt_calls, debt_ns)
 
     if ANALYZER_SLOWEST:
         w("\n## Slowest pool analyses (top-15)")

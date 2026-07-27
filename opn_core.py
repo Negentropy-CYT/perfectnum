@@ -22,12 +22,13 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 2000000     # largest odd prime considered
-MAX_FACTORS       = 30         # max distinct prime factors in N
-MAX_EXP           = 15         # max exponent (2 = a_i=1 restriction)
+MAX_PRIME         = 1000000000     # largest odd prime considered
+MAX_FACTORS       = 50         # max distinct prime factors in N
+MAX_EXP           = 18         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
+ENABLE_FERMAT_DEBT = False
 
 # ── search mode (target + Euler + forced/excluded primes) ─────
 # Single configuration point for OPN vs. friend-of-10 searches.
@@ -135,6 +136,7 @@ OUTSIDE_WINDOW_SOURCE: "Counter[Tuple[int,int,int]]" = Counter()  # (p,exp,q) th
 SIGMA_POOL_STATS:   "Counter[str]"           = Counter()  # pool analysis telemetry
 OUTSIDE_POOL_SOURCES: "Counter[Tuple[int,int,int]]" = Counter()  # (p,exp,residual_bits)
 WINDOW_KNOWN_HITS: "Counter[Tuple[int,int]]" = Counter()  # (p,exp) → times reused via is_known_outside
+PERF_STATS: "Counter[str]" = Counter()
 ANALYZER_SLOWEST: "List[Tuple[float,int,int,int,bool]]" = []  # top-15 slowest pool analyses
 
 # ── search-policy data (derived from telemetry) ───────────────
@@ -175,7 +177,8 @@ class SigmaPoolAnalyzer:
     running full Pollard–Rho factorisation.
     """
 
-    def __init__(self, primes: List[int], *, block_size: int = 256) -> None:
+    def __init__(self, primes: List[int], *, block_size: int = 256,
+                 stats=None) -> None:
         if not primes:
             raise ValueError("prime pool must not be empty")
         if primes != sorted(primes):
@@ -191,7 +194,7 @@ class SigmaPoolAnalyzer:
         self.blocks = build_prime_blocks(primes, block_size)
 
         self._cache: Dict[Tuple[int, int], SigmaPoolAnalysis] = {}
-        self.stats: "Counter[str]" = Counter()
+        self.stats: "Counter[str]" = stats if stats is not None else Counter()
         self.slowest: List[Tuple[float, int, int, int, bool]] = []
 
     def analyze(self, p: int, exp: int) -> SigmaPoolAnalysis:

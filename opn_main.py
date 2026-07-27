@@ -152,7 +152,11 @@ def main() -> None:
             solutions.append((dict(st.assigned), st.euler_prime, st.pseudo))
             display_solution(st, len(solutions), time.time() - t0)
             export_factor_graph(st, path=f"factor_graph_{len(solutions)}")
-            save_checkpoint(state_holder, solutions)
+            # ponytail: chain-mode pseudo is non-terminal — the heap at
+            # this point lacks st and its successors.  The periodic
+            # checkpoint covers the live frontier; skip the snapshot here.
+            if not st.pseudo or not PROPAGATE:
+                save_checkpoint(state_holder, solutions)
             save_solutions_txt(solutions)
 
     except SearchStopped:

@@ -30,8 +30,12 @@ from opn_core import (
     SEARCH_MODE,
     HEADROOM_BY_FACTOR,
     OBLIGATION_SIGS,
+    OUTSIDE_POOL_SOURCES,
+    OUTSIDE_WINDOW_SOURCE,
+    PENDING_PRIME_FREQ,
     PENDING_SIZE_HIST,
     PROPAGATION_EDGES,
+    PROPAGATION_EXP_EDGES,
     PRUNE_STATS,
     RATIO_HEADROOM,
     _SIG_FACTORS,
@@ -150,7 +154,8 @@ def _reject(reason: str):
     for clone-effectiveness telemetry.
     """
     PRUNE_STATS[reason] += 1
-    if reason in ("excluded", "ratio", "euler", "valuation_pre"):
+    if reason in ("excluded", "ratio", "euler", "valuation_pre",
+                  "window_prime_pre", "window_residual_pre"):
         CLONE_STATS["saved"] += 1   # clone was avoided
     else:
         CLONE_STATS["wasted"] += 1  # clone was already paid
@@ -258,13 +263,16 @@ def _capacity_ranking(
     return tuple(sorted(ranked, reverse=True))
 
 
+# ponytail: cached per (primes_tuple) — the prime list is constant once search begins
+_prime_index_cache: Dict[tuple, Dict[int, int]] = {}
+
 def fermat_debt_capacity(
     st: ChainState,
     primes,
     max_factors: int,
     max_exp: int,
 ) -> Tuple[bool, Optional[Tuple[int, int, int]]]:
-    """Prove whether remaining slots can still pay every Fermat-prime debt.
+    """Prove whether remaining slots can still pay valuation debts.
 
     For each future prime p, the exact order/LTE formula gives an upper bound
     on how much q-adic valuation p can supply over all allowed exponents.  The
@@ -272,6 +280,9 @@ def fermat_debt_capacity(
     bound on every completion.  We intentionally allow more than one future
     component to use the Euler exponent while forming this bound; that only
     makes the bound larger and keeps the prune conservative.
+
+    All Fermat-prime debts are always checked.  When ``slots > 2`` only the
+    top-3 non-Fermat debts are added to limit cost.
 
     Returns ``(False, (q, debt, capacity))`` only after a rigorous capacity
     shortfall has been proved.
@@ -287,9 +298,26 @@ def fermat_debt_capacity(
     allow_euler = st.euler_prime is None
     prime_tuple = tuple(primes)
     unavailable = st.assigned.keys() | st.excluded
-    for q, debt in valuation_debts(st).items():
-        if q not in FERMAT_PRIMES:
-            continue
+
+    # prime index: cached once per primes list
+    if prime_tuple not in _prime_index_cache:
+        _prime_index_cache[prime_tuple] = {p: i for i, p in enumerate(prime_tuple)}
+    prime_idx = _prime_index_cache[prime_tuple]
+
+    all_debts = valuation_debts(st)
+
+    # always check all Fermat debts (preserve existing prune strength)
+    fermat_items = [(q, d) for q, d in all_debts.items() if q in FERMAT_PRIMES]
+
+    # selectively check non-Fermat debts
+    nonfermat_items = [
+        (q, d) for q, d in all_debts.items() if q not in FERMAT_PRIMES
+    ]
+    if slots > 2:
+        nonfermat_items.sort(key=lambda item: -item[1])
+        nonfermat_items = nonfermat_items[:3]
+
+    for q, debt in fermat_items + nonfermat_items:
         capacity = 0
         selected = 0
         for contribution, p in _capacity_ranking(
@@ -299,6 +327,17 @@ def fermat_debt_capacity(
                 break
             if p in unavailable:
                 continue
+
+            # With one slot left a prime before the cursor that is not
+            # already pending cannot be both introduced and assigned:
+            # introducing it via σ(s^a) and then assigning it needs ≥2 slots.
+            if (
+                slots == 1
+                and p not in st.pending_set
+                and prime_idx[p] < st.next_idx
+            ):
+                continue
+
             capacity += contribution
             selected += 1
         if capacity < debt:
@@ -339,12 +378,18 @@ def assign_prime_dfs(st: DFSState, p: int, exp: int,
 
 def assign_prime_chain(st: ChainState, p: int, exp: int, *,
                        propagate: bool = True,
-                       max_exp: int = MAX_EXP) -> Optional[ChainState]:
+                       max_exp: int = MAX_EXP,
+                       prime_limit: int | None = None,
+                       sigma_pool_analyzer=None) -> Optional[ChainState]:
     """Assign p^exp to a ChainState with full factor-chain propagation.
 
     The exact sigma-valuation map is populated on demand before cloning, so
     valuation contradictions avoid both unnecessary clones and global eager
     factorisation of unreachable (p, a) pairs.
+
+    When *sigma_pool_analyzer* is provided and the analysis is not exact
+    (residual > 1 after stripping all in-pool primes), the branch is pruned
+    via ``window_residual_pre`` without running full Pollard–Rho.
     """
     if p in st.excluded or p in st.assigned:
         return _reject("excluded")
@@ -358,12 +403,31 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
     # The _reject path here is for future per-assign interval checks.
 
     # ── pre-clone valuation check (populates the exact map lazily) ──
+    pre_vals = None
     if propagate:
-        pre_vals = sigma_valuation_map(p, exp)
-        for q, e in pre_vals.items():
+        if sigma_pool_analyzer is not None:
+            analysis = sigma_pool_analyzer.analyze(p, exp)
+            if not analysis.exact:
+                residual_bits = int(analysis.residual).bit_length()
+                OUTSIDE_POOL_SOURCES[(p, exp, residual_bits)] += 1
+                return _reject("window_residual_pre")
+            pre_vals = analysis.valuations
+        else:
+            pre_vals = sigma_valuation_map(p, exp)
+
+        for q, incoming in pre_vals.items():
             # q is an odd prime factor of σ(p^a) with exponent e
             offset = _target_valuation_offset(q)
-            new_req = st.required_v.get(q, 0) + e
+            new_req = st.required_v.get(q, 0) + incoming
+
+            # Finite-window prune: q is outside the configured prime pool,
+            # the target offset cannot absorb the required valuation,
+            # so q would be forced into N — impossible in this window.
+            if prime_limit is not None and q > prime_limit and new_req > offset:
+                CONTRADICTION_ATTR[(q, "maxprime_pre")] += 1
+                OUTSIDE_WINDOW_SOURCE[(p, exp, q)] += 1
+                return _reject("window_prime_pre")
+
             if q in st.excluded and new_req > offset:
                 CONTRADICTION_ATTR[(q, "excluded_pre")] += 1
                 return _reject("valuation_pre")
@@ -413,13 +477,15 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
 
     # factor-chain propagation (additive valuation)
     cascade_steps = 0
-    post_vals = sigma_valuation_map(p, exp)
-    for q, e in post_vals.items():
+    # ponytail: reuse the exact map already computed pre-clone
+    post_vals = pre_vals if pre_vals is not None else {}
+    for q, incoming in post_vals.items():
         if q == 2:
             continue
         PROPAGATION_EDGES[(p, q)] += 1
+        PROPAGATION_EXP_EDGES[(p, exp, q)] += 1
         offset = _target_valuation_offset(q)
-        new_req = ns.required_v.get(q, 0) + e
+        new_req = ns.required_v.get(q, 0) + incoming
         if q in ns.excluded and new_req > offset:
             CONTRADICTION_ATTR[(q, "excluded_post")] += 1
             return _reject("valuation_post")
@@ -493,6 +559,8 @@ def _record_productive_telemetry(ns) -> None:
     RATIO_HEADROOM[bucket] += 1
     DEPTH_FACTOR_MAP[(ns.depth, len(ns.assigned))] += 1
     HEADROOM_BY_FACTOR[(len(ns.assigned), bucket)] += 1
+    for q in ns.pending_set:
+        PENDING_PRIME_FREQ[q] += 1
     # coarse headroom for signature dedup
     if headroom > 0:
         coarse = int(math.floor(-math.log10(headroom)))

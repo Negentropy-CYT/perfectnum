@@ -9,9 +9,10 @@ user-configurable constants.
 
 import math
 import random
+import time
 from collections import Counter
 from functools import lru_cache
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import gmpy2
 from gmpy2 import mpz
@@ -21,9 +22,9 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 100000     # largest odd prime considered
-MAX_FACTORS       = 15         # max distinct prime factors in N
-MAX_EXP           = 10         # max exponent (2 = a_i=1 restriction)
+MAX_PRIME         = 2000000     # largest odd prime considered
+MAX_FACTORS       = 30         # max distinct prime factors in N
+MAX_EXP           = 15         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
@@ -59,6 +60,33 @@ FRIEND_10_MODE = SearchMode(target_num=9, target_den=5, require_euler=False,
 # Active mode — set by the friend preset, or override in code.
 SEARCH_MODE = OPN_MODE
 
+
+# ── pool-analysis result types ─────────────────────────────────
+
+@dataclass(slots=True)
+class SigmaPoolAnalysis:
+    """Result of analysing the odd part of σ(p^a) against a prime pool.
+
+    exact=True: *valuations* is the complete odd-prime valuation map
+    and *residual* is 1.
+
+    exact=False: *residual* > 1 and has no prime factor in the pool.
+    *valuations* is only the pool-internal partial map and must not
+    be used for factor-chain propagation.
+    """
+    exact: bool
+    valuations: Dict[int, int]
+    residual: mpz
+    outside_witness: Optional[int] = None
+
+
+@dataclass(slots=True)
+class PrimeBlock:
+    """A contiguous block of odd primes with precomputed product for gcd."""
+    primes: Tuple[int, ...]
+    product: mpz
+
+
 # ── friend-of-10 preset [INACTIVE] ──────────────────────────────
 # Uncomment the block below to switch to friend-of-10 mode.
 #
@@ -81,6 +109,8 @@ POWER_CACHE:   Dict[Tuple[int, int], int] = {}
 FACTOR_CACHE:  Dict[int, List[Tuple[int, int]]] = {}
 _SIG_FACTORS:  Dict[Tuple[int, int], set[int]] = {}
 _SIG_VALUATIONS: Dict[Tuple[int, int], Dict[int, int]] = {}  # (p,a) → {q: v_q(σ(p^a))}
+SIGMA_MAP_STATS: "Counter[str]" = Counter()  # hits, misses, factor_seconds
+SIGMA_MISS_TIMES: "List[Tuple[int,int,int,float,int]]" = []  # (p, a, sigma_bits, seconds, max_odd_factor)
 _TOTIENT_CACHE: Dict[int, int] = {}
 _CAPACITY_CACHE: Dict[int, int] = {}
 
@@ -94,11 +124,18 @@ CONTRADICTION_ATTR: "Counter[Tuple[int,str]]" = Counter()  # (prime, reason)
 PENDING_SIZE_HIST:  "Counter[int]"           = Counter()  # pending queue size
 CASCADE_DEPTH_HIST: "Counter[int]"           = Counter()  # propagation chain length
 PROPAGATION_EDGES:  "Counter[Tuple[int,int]]"= Counter()  # (source, introduced)
+PROPAGATION_EXP_EDGES: "Counter[Tuple[int,int,int]]" = Counter()  # (source, exp, introduced)
 CLONE_PAYLOAD:      "Counter[int]"           = Counter()  # len(assigned) at clone
 RATIO_HEADROOM:     "Counter[str]"           = Counter()  # 2-ratio bucketed
 DEPTH_FACTOR_MAP:   "Counter[Tuple[int,int]]"= Counter()  # (depth, |f|) 2D histogram
 HEADROOM_BY_FACTOR: "Counter[Tuple[int,str]]"= Counter()  # (|f|, headroom_bucket)
 OBLIGATION_SIGS: "Counter[Tuple]"     = Counter()  # (frozen-pending, |f|, coarse-headroom)
+PENDING_PRIME_FREQ: "Counter[int]"    = Counter()  # global pending-prime histogram
+OUTSIDE_WINDOW_SOURCE: "Counter[Tuple[int,int,int]]" = Counter()  # (p,exp,q) that forced q>window
+SIGMA_POOL_STATS:   "Counter[str]"           = Counter()  # pool analysis telemetry
+OUTSIDE_POOL_SOURCES: "Counter[Tuple[int,int,int]]" = Counter()  # (p,exp,residual_bits)
+WINDOW_KNOWN_HITS: "Counter[Tuple[int,int]]" = Counter()  # (p,exp) → times reused via is_known_outside
+ANALYZER_SLOWEST: "List[Tuple[float,int,int,int,bool]]" = []  # top-15 slowest pool analyses
 
 # ── search-policy data (derived from telemetry) ───────────────
 TOXIC_SKIP: set[int] = set()
@@ -107,6 +144,128 @@ EXP4_FILTER_HITS: "Counter[int]" = Counter()  # per-prime filter verification
 
 
 # ── prime generation ──────────────────────────────────────────
+# ── pool-aware sigma analyser ──────────────────────────────────
+
+def _remove_all(value: mpz, q: int) -> Tuple[mpz, int]:
+    """Return (value / q^e, e) where q^e || value."""
+    e = 0
+    while value % q == 0:
+        value //= q
+        e += 1
+    return value, e
+
+
+def build_prime_blocks(primes: List[int], block_size: int = 256):
+    """Partition *primes* into blocks with precomputed product for gcd."""
+    blocks = []
+    for start in range(0, len(primes), block_size):
+        block_primes = tuple(primes[start:start + block_size])
+        product = mpz(1)
+        for q in block_primes:
+            product *= q
+        blocks.append(PrimeBlock(primes=block_primes, product=product))
+    return tuple(blocks)
+
+
+class SigmaPoolAnalyzer:
+    """Analyse σ(p^a) against the configured odd-prime pool.
+
+    Tries stripping all in-pool primes; if residual > 1 the branch
+    is certified to contain an out-of-pool factor without ever
+    running full Pollard–Rho factorisation.
+    """
+
+    def __init__(self, primes: List[int], *, block_size: int = 256) -> None:
+        if not primes:
+            raise ValueError("prime pool must not be empty")
+        if primes != sorted(primes):
+            raise ValueError("prime pool must be sorted")
+        if len(set(primes)) != len(primes):
+            raise ValueError("prime pool must not contain duplicates")
+        if any(q < 3 or q % 2 == 0 or not gmpy2.is_prime(q) for q in primes):
+            raise ValueError("prime pool must contain only odd primes")
+
+        self.primes = tuple(primes)
+        self.prime_set = frozenset(primes)
+        self.prime_limit = primes[-1]
+        self.blocks = build_prime_blocks(primes, block_size)
+
+        self._cache: Dict[Tuple[int, int], SigmaPoolAnalysis] = {}
+        self.stats: "Counter[str]" = Counter()
+        self.slowest: List[Tuple[float, int, int, int, bool]] = []
+
+    def analyze(self, p: int, exp: int) -> SigmaPoolAnalysis:
+        key = (p, exp)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self.stats["hits"] += 1
+            return cached
+
+        self.stats["misses"] += 1
+        started = time.perf_counter()
+
+        # Fast path: a globally exact factorisation already exists
+        exact_cached = _SIG_VALUATIONS.get(key)
+        if exact_cached is not None:
+            outside = next((q for q in exact_cached if q not in self.prime_set), None)
+            if outside is None:
+                result = SigmaPoolAnalysis(exact=True, valuations=exact_cached, residual=mpz(1))
+                self.stats["exact_from_global_cache"] += 1
+            else:
+                result = SigmaPoolAnalysis(
+                    exact=False,
+                    valuations={q: e for q, e in exact_cached.items() if q in self.prime_set},
+                    residual=mpz(outside),
+                    outside_witness=outside,
+                )
+                self.stats["outside_from_global_cache"] += 1
+            self._cache[key] = result
+            return result
+
+        residual = mpz(sigma_prime_power(p, exp))
+        residual, _v2 = _remove_all(residual, 2)
+        inside: Dict[int, int] = {}
+
+        for block in self.blocks:
+            if residual == 1:
+                break
+            self.stats["blocks_tested"] += 1
+            if gmpy2.gcd(residual, block.product) == 1:
+                continue
+            self.stats["positive_blocks"] += 1
+            for q in block.primes:
+                if residual == 1:
+                    break
+                if residual % q != 0:
+                    continue
+                residual, exponent = _remove_all(residual, q)
+                inside[q] = exponent
+                self.stats["pool_factors_removed"] += 1
+
+        if residual == 1:
+            result = SigmaPoolAnalysis(exact=True, valuations=inside, residual=mpz(1))
+            _SIG_VALUATIONS[key] = inside
+            _SIG_FACTORS[key] = set(inside)
+            self.stats["exact"] += 1
+        else:
+            result = SigmaPoolAnalysis(exact=False, valuations=inside, residual=residual)
+            self.stats["outside_certificates"] += 1
+
+        elapsed = time.perf_counter() - started
+        self.stats["analysis_ns"] += int(elapsed * 1_000_000_000)
+        self.slowest.append((elapsed, p, exp, int(residual).bit_length(), result.exact))
+        self.slowest.sort(reverse=True)
+        del self.slowest[15:]
+        ANALYZER_SLOWEST[:] = self.slowest
+
+        self._cache[key] = result
+        return result
+
+    def is_known_outside(self, p: int, exp: int) -> bool:
+        c = self._cache.get((p, exp))
+        return c is not None and not c.exact
+
+
 def generate_odd_primes(limit: int) -> List[int]:
     """Return all odd primes ≤ *limit* (Eratosthenes sieve)."""
     sieve = [True] * (limit + 1)
@@ -376,10 +535,17 @@ def sigma_valuation_map(p: int, a: int) -> Dict[int, int]:
     key = (p, a)
     cached = _SIG_VALUATIONS.get(key)
     if cached is not None:
+        SIGMA_MAP_STATS["hits"] += 1
         return cached
 
+    SIGMA_MAP_STATS["misses"] += 1
+    t0 = time.perf_counter()
     sig = int(sigma_prime_power(p, a))
     valuations = {q: e for q, e in factorize(sig) if q != 2}
+    elapsed = time.perf_counter() - t0
+    SIGMA_MAP_STATS["factor_seconds"] += elapsed
+    max_q = max(valuations) if valuations else 0
+    SIGMA_MISS_TIMES.append((p, a, sig.bit_length(), elapsed, max_q))
     _SIG_VALUATIONS[key] = valuations
     _SIG_FACTORS[key] = set(valuations)
     return valuations
@@ -575,6 +741,17 @@ def compute_exclude_exp4(primes: List[int], max_exp: int,
         facs = set(sigma_valuation_map(p, 4))
         if any(q > max_prime for q in facs):
             EXCLUDE_EXP_4.add(p)
+
+
+def exponent_forces_outside_window(p: int, exp: int, prime_limit: int) -> bool:
+    """True if σ(p^exp) has any odd prime factor > *prime_limit*.
+
+    In OPN mode every such factor is a mandatory obligation that cannot
+    be resolved within the finite prime window.  This is window-complete:
+    raising *prime_limit* may reclassify borderline primes.
+    """
+    vals = sigma_valuation_map(p, exp)
+    return any(q > prime_limit for q in vals)
 
 
 def exp4_forced_outside_window(p: int, max_prime: int) -> bool:

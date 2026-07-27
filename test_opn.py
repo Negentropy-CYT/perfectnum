@@ -44,6 +44,7 @@ from opn_core import (
     FRIEND_10_MODE,
     OPN_MODE,
     SEARCH_MODE,
+    SigmaPoolAnalyzer,
     brent_rho,
     check_touchard,
     euler_max_exp_capacity,
@@ -1069,3 +1070,55 @@ class TestFriendMode:
             current_v={5: 2},
         )
         assert valuation_debts(st) == {5: 1}
+
+
+# ══════════════════════════════════════════════════════════════
+# Pool Analyser — window-smoothness stripping
+# ══════════════════════════════════════════════════════════════
+
+class TestPoolAnalyzer:
+    def test_analyzer_exact_small(self):
+        """σ(3²)=13, pool includes 13 → exact"""
+        a = SigmaPoolAnalyzer([3, 5, 7, 11, 13])
+        r = a.analyze(3, 2)
+        assert r.exact
+        assert r.valuations == {13: 1}
+        assert r.residual == 1
+
+    def test_analyzer_outside_certificate(self):
+        """σ(7²)=57=3×19, 19 not in pool → outside certificate"""
+        a = SigmaPoolAnalyzer([3, 5, 7, 11, 13])
+        r = a.analyze(7, 2)
+        assert not r.exact
+        assert r.valuations == {3: 1}
+        assert r.residual > 1
+
+    def test_analyzer_cache_hit(self):
+        """Second call returns identical object."""
+        a = SigmaPoolAnalyzer([3, 5, 7, 11, 13])
+        r1 = a.analyze(3, 2)
+        r2 = a.analyze(3, 2)
+        assert r1 is r2
+
+    def test_3511_10_is_outside_certificate(self):
+        """Regression lock: (3511,10) must NOT use full factorisation."""
+        primes = generate_odd_primes(5000)
+        a = SigmaPoolAnalyzer(primes)
+        r = a.analyze(3511, 10)
+        assert not r.exact, (
+            "3511^10 should produce an outside-pool certificate "
+            "(both prime factors exceed 5000)"
+        )
+        assert r.residual > 1
+
+    def test_exact_from_global_cache(self):
+        """When _SIG_VALUATIONS already has a complete map, analyzer reuses it."""
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        # Pre-populate the global cache with an exact map
+        sigma_valuation_map(3, 2)  # σ(3²)=13
+        a = SigmaPoolAnalyzer([3, 5, 7, 11, 13])
+        r = a.analyze(3, 2)
+        assert r.exact
+        assert r.valuations == {13: 1}
+        assert a.stats.get("exact_from_global_cache", 0) == 1

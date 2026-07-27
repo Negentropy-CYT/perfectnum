@@ -34,6 +34,15 @@ from opn_core import (
     PENDING_SIZE_HIST,
     PROPAGATE,
     PROPAGATION_EDGES,
+    PROPAGATION_EXP_EDGES,
+    OUTSIDE_WINDOW_SOURCE,
+    PENDING_PRIME_FREQ,
+    SIGMA_MAP_STATS,
+    SIGMA_MISS_TIMES,
+    SIGMA_POOL_STATS,
+    ANALYZER_SLOWEST,
+    OUTSIDE_POOL_SOURCES,
+    WINDOW_KNOWN_HITS,
     PRUNE_STATS,
     RATIO_HEADROOM,
     SEARCH_MODE,
@@ -51,7 +60,7 @@ from opn_core import (
 from opn_state import ChainState, DFSState, validate_chain_state
 
 
-CHECKPOINT_FORMAT_VERSION = 2
+CHECKPOINT_FORMAT_VERSION = 3  # bumped: pseudo-completeness fix + capacity bound
 
 
 def _search_mode_fingerprint() -> dict:
@@ -278,33 +287,33 @@ def write_telemetry_report(elapsed: float, solutions_found: int) -> None:
     # ── prune stats ──
     pr_total = sum(PRUNE_STATS.values())
     cl_total = CLONE_STATS.get("total", 0)
+    saved     = CLONE_STATS.get("saved", 0)
+    attempted = cl_total + saved  # branches where a clone was considered
     if pr_total:
         w("\n## Prune statistics")
-        if cl_total:
-            w(f"{'reason':>14}  {'count':>10}  {'%prune':>7}  {'‰clone':>7}")
-        else:
-            w(f"{'reason':>14}  {'count':>10}  {'%prune':>7}")
+        w(f"{'reason':>14}  {'count':>10}  {'%prune':>7}  {'‰attempt':>8}")
         for k, v in PRUNE_STATS.most_common():
             pct = 100.0 * v / pr_total
-            if cl_total:
-                rate = 1000.0 * v / cl_total
-                w(f"{k:>14}  {v:>10,}  {pct:>6.1f}%  {rate:>6.1f}‰")
-            else:
-                w(f"{k:>14}  {v:>10,}  {pct:>6.1f}%")
+            rate = 1000.0 * v / attempted if attempted else 0.0
+            w(f"{k:>14}  {v:>10,}  {pct:>6.1f}%  {rate:>7.1f}‰")
 
     # ── clone effectiveness ──
     total = CLONE_STATS.get("total", 0)
-    if total:
+    saved = CLONE_STATS.get("saved", 0)
+    attempted = total + saved
+    if attempted:
         productive = CLONE_STATS.get("productive", 0)
-        saved      = CLONE_STATS.get("saved", 0)
         wasted     = CLONE_STATS.get("wasted", 0)
         overhead   = total - productive - wasted
+        avoid_rate = 100.0 * saved / attempted
         w("\n## Clone effectiveness")
-        w(f"  total clones     {total:>12,}")
-        w(f"  productive       {productive:>12,}  ({100.0*productive/total:5.1f}%)")
-        w(f"  saved (pre-clone){saved:>12,}  ({100.0*saved/total:5.1f}%)")
-        w(f"  wasted (post-cln){wasted:>12,}  ({100.0*wasted/total:5.1f}%)")
-        w(f"  overhead (other) {overhead:>12,}  ({100.0*overhead/total:5.1f}%)")
+        w(f"  attempted branches  {attempted:>10,}")
+        w(f"  actual clones       {total:>10,}")
+        w(f"  avoided (pre-clone) {saved:>10,}")
+        w(f"  avoidance rate      {avoid_rate:>10.1f}%")
+        w(f"    productive        {productive:>10,}  ({100.0*productive/total:5.1f}% of actual)")
+        w(f"    wasted (post-cln) {wasted:>10,}  ({100.0*wasted/total:5.1f}% of actual)")
+        w(f"    overhead (other)  {overhead:>10,}  ({100.0*overhead/total:5.1f}% of actual)")
 
     # ── depth histogram ──
     if DEPTH_STATS:
@@ -370,11 +379,79 @@ def write_telemetry_report(elapsed: float, solutions_found: int) -> None:
         for (p, q), count in PROPAGATION_EDGES.most_common(10):
             w(f"  {p:>4} → {q:<8}  {count:>10,}")
 
+    if PROPAGATION_EXP_EDGES:
+        w("\n## Propagation edges by exponent (top-10)")
+        for (p, exp, q), count in PROPAGATION_EXP_EDGES.most_common(10):
+            w(f"  {p:>4}^{exp} → {q:<8}  {count:>10,}")
+
+    # ── sigma map cache ──
+    if SIGMA_MAP_STATS:
+        hits = SIGMA_MAP_STATS.get("hits", 0)
+        misses = SIGMA_MAP_STATS.get("misses", 0)
+        total = hits + misses
+        factor_s = SIGMA_MAP_STATS.get("factor_seconds", 0.0)
+        w("\n## σ-map cache")
+        w(f"  hits:     {hits:>12,}")
+        w(f"  misses:   {misses:>12,}")
+        if total:
+            w(f"  hit rate: {100.0*hits/total:>11.1f}%")
+        w(f"  factor s: {factor_s:>12.1f}")
+
+    # ── pool analysis stats ──
+    if SIGMA_POOL_STATS:
+        w("\n## σ pool analysis")
+        for k in ["hits", "misses", "exact", "outside_certificates",
+                   "exact_from_global_cache", "outside_from_global_cache",
+                   "blocks_tested", "positive_blocks", "pool_factors_removed"]:
+            v = SIGMA_POOL_STATS.get(k, 0)
+            if v:
+                w(f"  {k:<28} {v:>12,}")
+        ns_val = SIGMA_POOL_STATS.get("analysis_ns", 0)
+        if ns_val:
+            w(f"  analysis_seconds        {ns_val*1e-9:>12.1f}")
+
+    if OUTSIDE_POOL_SOURCES:
+        w("\n## Outside-pool residual sources (top-10)")
+        for (p, exp, bits), count in OUTSIDE_POOL_SOURCES.most_common(10):
+            w(f"  {p:>6}^{exp} → residual ({bits} bits)  x{count:>6}")
+
+    if WINDOW_KNOWN_HITS:
+        w("\n## Known outside-pool cache hits (top-10)")
+        w(f"  {'p^exp':>10}  {'cached rejects':>15}")
+        for (p, exp), count in WINDOW_KNOWN_HITS.most_common(10):
+            w(f"  {p:>6}^{exp:<3}  {count:>15,}")
+
+    if ANALYZER_SLOWEST:
+        w("\n## Slowest pool analyses (top-15)")
+        w(f"  {'p':>6}  {'exp':>3}  {'residual bits':>13}  {'exact':>5}  {'seconds':>8}")
+        for elapsed, p, a, bits, exact in ANALYZER_SLOWEST:
+            w(f"  {p:>6}  {a:>3}  {bits:>13}  {str(exact):>5}  {elapsed:>8.3f}")
+
+    # ── slowest σ factorisations ──
+    if SIGMA_MISS_TIMES:
+        slowest = sorted(SIGMA_MISS_TIMES, key=lambda x: -x[3])[:15]
+        w("\n## Slowest σ factorisations (top-15)")
+        w(f"  {'p':>6}  {'exp':>3}  {'σ bits':>8}  {'seconds':>8}  {'max odd q':>10}")
+        for p, a, bits, sec, maxq in slowest:
+            w(f"  {p:>6}  {a:>3}  {bits:>8}  {sec:>8.3f}  {maxq:>10}")
+
     # ── depth × |f| ──
     if DEPTH_FACTOR_MAP:
         w("\n## Depth × |f| (top-15)")
         for (d, nf), count in DEPTH_FACTOR_MAP.most_common(15):
             w(f"  depth={d:>3}  |f|={nf}  {count:>12,}")
+
+    # ── pending-prime frequency (global) ──
+    if PENDING_PRIME_FREQ:
+        w("\n## Pending-prime frequency (top-15)")
+        for q, count in PENDING_PRIME_FREQ.most_common(15):
+            w(f"  {q:>12}  {count:>10,}")
+
+    # ── outside-window sources ──
+    if OUTSIDE_WINDOW_SOURCE:
+        w("\n## Outside-window sources (top-10)")
+        for (p, exp, q), count in OUTSIDE_WINDOW_SOURCE.most_common(10):
+            w(f"  {p:>4}^{exp} → {q:<12}  {count:>10,}")
 
     # ── exp4 filter verification ──
     if EXP4_FILTER_HITS:

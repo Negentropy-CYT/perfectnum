@@ -42,16 +42,47 @@ configured odd-prime pool.  Four correctness invariants hold:
    every prime in the pool; `residual == 1` and the returned `valuations`
    is a complete map that can be written to `_SIG_VALUATIONS`.
 
-3. `exact=False` means the residual after stripping all in-pool primes
-   exceeds 1.  By construction the residual is coprime to every pool prime,
-   so it certifies the existence of an out-of-window prime factor.  The
-   returned `valuations` is **partial** and must **not** be used for
-   factor-chain propagation or written to the global exact cache.
+3. `exact=False` means the cofactor after removing all in-pool primes
+   exceeds 1.  For a **cold** (first-time) analysis, this cofactor is the
+   complete residual after exhausting the pool.  For an
+   **exact-global-cache** fast path, the residual may be a single
+   certified outside-window witness rather than the full cofactor.
+   In both cases `residual > 1` is sufficient for the finite-window
+   rejection.  The returned `valuations` is **partial** and must **not**
+   be used for factor-chain propagation or written to the global exact
+   cache.
 
-4. The exponent-order filter and hierarchical superblock GCD are
-   **semantics-preserving**: they only reduce the number of primes/blocks
-   tested, never change the valuation map or the residual.  This is
-   guaranteed by `gcd(r, S) = 1 ⇒ gcd(r, B_i) = 1` for all child blocks.
+4. The hierarchical superblock GCD is **semantics-preserving**:
+   `gcd(r, S) = 1 ⇒ gcd(r, B_i) = 1` for all child blocks, so no factor
+   is ever missed.  The exponent-order filter is also a necessary
+   condition (see below).
+
+## Exponent Filter Correctness
+
+For an odd prime q ≠ p dividing σ(p^a), let n = a+1.  From
+
+```
+σ(p^a) = (p^n - 1) / (p - 1)
+```
+
+and q ∤ (p - 1) (since q is odd and 0 < p - 1 < q for all
+non-trivial cases), we have q | (p^n - 1).
+
+**Case 1:** p ≡ 1 (mod q).  Then σ(p^a) ≡ n (mod q), so q | n.
+
+**Case 2:** p ≢ 1 (mod q).  Let d = ord_q(p) > 1.  Then d | n
+and d | (q - 1).  Hence gcd(q - 1, n) ≥ d > 1.
+
+Therefore every odd prime factor q of σ(p^a) satisfies
+
+```
+q | (a + 1)   or   gcd(q - 1, a + 1) > 1.
+```
+
+This is a **necessary** condition — primes failing both tests cannot
+divide σ(p^a) and are safely excluded from the pool for exponent a.
+The filter is strict conservative: it may include primes that do not
+actually divide σ(p^a), but it never excludes a real divisor.
 
 ## Factor-Slot Tail Bound
 

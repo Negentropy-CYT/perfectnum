@@ -12,6 +12,11 @@ $$\sigma(N) = 2N \qquad\text{(perfect number condition)}$$
 
 ## Quick Start
 
+> **Note:** The checked-in configuration is **experimental**
+> (`MAX_PRIME=5e9`).  For a first run, set `MAX_PRIME = 100_000`
+> and `MAX_FACTORS = 12` at the top of `opn_core.py`.  See
+> [Configuration](#configuration-1) for safe defaults.
+
 ```bash
 python -m pip install -r requirements.txt
 python opn_main.py
@@ -19,13 +24,7 @@ python opn_main.py
 
 **Requirements:** Python 3.10+, gmpy2, numpy.
 
-The active finite search box is configured at the top of `opn_core.py`.
-See [MATHEMATICAL_CORRECTNESS.md](MATHEMATICAL_CORRECTNESS.md) before
-interpreting an exhausted search.
-Set `PROPAGATE = True` for factor-chain OPN mode or `False` for the
-Descartes-type pseudo-candidate DFS.  A friend-of-10 verification mode is
-included via `SEARCH_MODE = FRIEND_10_MODE`.
-
+The finite search box is configured at the top of `opn_core.py`.
 See [MATHEMATICAL_CORRECTNESS.md](MATHEMATICAL_CORRECTNESS.md) before
 interpreting an exhausted search.  Exhaustion proves only that no candidate
 exists inside the configured finite box; it is not a proof that odd perfect
@@ -81,8 +80,8 @@ additively, tracking q-adic valuations.
 The engine incorporates **Touchard's theorem** ($N \equiv 1 \pmod{12}$ or
 $N \equiv 9 \pmod{36}$) as an O(1) congruence check, pre-clone valuation
 contradiction detection using lazily cached $\sigma(p^a)$ factor maps, and
-finite-window logical pruning of exponent-4 branches whose $\sigma(p^4)$
-factors all exceed the search window.  A **maximum-prime capacity bound**
+finite-window logical pruning of exponent-4 branches where $\sigma(p^4)$
+has at least one mandatory odd prime factor beyond the window.  A **maximum-prime capacity bound**
 (proved in Lean) constrains the exponent of the largest prime factor via
 $B(\mathrm{oddpart}(R-1)) = \frac12\sum_{d\mid u,\,d>1}\varphi(d)^2$.
 A comprehensive telemetry system
@@ -107,7 +106,7 @@ opn_core.py        Arithmetic engine
 opn_state.py       Search state & constraint propagation
                      · DFSState (8 fields, 2 collections cloned) — lightweight
                        pseudo-solution DFS
-                     · ChainState (14 fields, 7 collections cloned) — full
+                     · ChainState (14 fields, 6 collections cloned) — full
                        factor-chain search
                      · assign_prime_dfs / assign_prime_chain — separate
                        constraint propagation per mode
@@ -232,13 +231,19 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 **Requirements:** Python 3.10+, [gmpy2](https://github.com/aleaxit/gmpy)
 
 ```bash
-pip install gmpy2
+python -m pip install -r requirements.txt
 ```
 
-Or via conda:
+Or:
 
 ```bash
-conda install -c conda-forge gmpy2
+python -m pip install "gmpy2>=2.0.0" numpy
+```
+
+Via conda:
+
+```bash
+conda install -c conda-forge gmpy2 numpy
 ```
 
 ---
@@ -260,7 +265,8 @@ Edit the constants at the top of `opn_core.py`.
 MAX_PRIME  = 100_000; MAX_FACTORS = 12; MAX_EXP = 6
 ```
 
-**Validated regression** (proven search-tree stability):
+**Regression-validated** (observed identical search-tree and classification
+counters across implementation changes):
 ```python
 MAX_PRIME  = 1_000_000_000; MAX_FACTORS = 60; MAX_EXP = 18
 ```
@@ -328,13 +334,10 @@ CHECKPOINT_INTERVAL_SECONDS = 300.0
 ### Factor Graph
 
 When a solution is found, the σ-factor dependency graph is automatically
-exported as two files:
+exported as two files (numbered by solution index):
 
-- `factor_graph.dot` — Graphviz DOT format.  Render with:
-  ```bash
-  dot -Tpng factor_graph.dot -o factor_graph.png
-  ```
-- `factor_graph.json` — machine-readable edge list with cycle detection.
+- `factor_graph_N.dot` — Graphviz DOT format.
+- `factor_graph_N.json` — machine-readable edge list with cycle detection.
 
 Each edge `p → q` means σ(p^a) contains prime factor q, i.e. assigning
 p forces q into N.  Cycles in this graph (e.g. 3 → 13 → 3) are the
@@ -348,7 +351,7 @@ All counters are serialised into the checkpoint and accumulate across
 interrupt/resume cycles, giving reliable long-run statistics.
 
 **Prune Statistics** — per-reason rejection rates, normalised against
-total clones (‰ = per 1000 clones):
+`attempted = actual_clones + avoided_pre_clone` (‰ = per 1000 clones):
 
 ```
 Prune statistics:
@@ -538,7 +541,7 @@ Thackeray (2024) result: $\omega \ge 10$ for friends of 10.
 
 **Chengyuan Tang**  ·  chengyuantang37@gmail.com
 
-> This project was developed with AI-assisted tooling (Claude Code).
+> This project was developed with AI-assisted tooling (Codex, Claude Code).
 > All algorithms, mathematical derivations, and code architecture were
 > reviewed and validated by the author.
 

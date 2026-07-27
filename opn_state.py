@@ -3,7 +3,7 @@ opn_state — polymorphic search states and constraint propagation.
 
 Defines two state classes:
   - DFSState   — minimal (5 fields) for pseudo-solution DFS
-  - ChainState — full (14 fields) for factor-chain best-first search
+  - ChainState — full (14 fields, 6 collections cloned) for factor-chain best-first search
 
 Key improvements over v1 unified State:
   - DFSState.clone() copies 2 collections vs 7 → ~60% less overhead

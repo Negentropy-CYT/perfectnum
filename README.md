@@ -80,7 +80,7 @@ contradiction detection using lazily cached $\sigma(p^a)$ factor maps, and
 finite-window logical pruning of exponent-4 branches whose $\sigma(p^4)$
 factors all exceed the search window.  A **maximum-prime capacity bound**
 (proved in Lean) constrains the exponent of the largest prime factor via
-$B(\operatorname{oddpart}(R-1)) = \frac12\sum_{d\mid u,\,d>1}\varphi(d)^2$.
+$B(\mathrm{oddpart}(R-1)) = \frac12\sum_{d\mid u,\,d>1}\varphi(d)^2$.
 A comprehensive telemetry system
 (`telemetry.txt`) records prune reasons, clone economics, depth histograms,
 and obligation-signature recurrence patterns across parameter configurations.

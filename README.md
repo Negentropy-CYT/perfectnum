@@ -286,7 +286,7 @@ CHECKPOINT_INTERVAL_SECONDS = 300.0
 | `PROPAGATE` | Strategy | Description |
 |:-----------:|----------|-------------|
 | `False` | DFS (stack) | Independent primes. Finds pseudo-candidates via composite‑r formula. Fast per-state. |
-| `True` | best-first (heap) | Factor-chain propagation. Resonance-guided priority queue. Searches for genuine Euler-prime OPN. |
+| `True` | best-first (heap) | Factor-chain propagation with pool-analyser outside-window pruning. Searches for genuine Euler-prime OPN. |
 
 ### Interpreting Output
 
@@ -445,8 +445,8 @@ Counters marked as checkpointed persist across resume cycles.
 When $p^{a}$ is assigned and $\sigma(p^{a})$ contains factor $q^{e}$, we track
 
 $$\begin{aligned}
-\mathrm{req}_v[q] &\mathrel{+}= e \qquad &\text{(total $q$-demand from the $\sigma$ side)} \\
-\mathrm{cur}_v[q]  &\mathrel{+}= a_q \qquad &\text{($q$'s exponent in $N$)}
+\mathrm{req}_v[q] &\gets \mathrm{req}_v[q] + e \qquad &\text{(total $q$-demand from the $\sigma$ side)} \\
+\mathrm{cur}_v[q]  &\gets \mathrm{cur}_v[q] + a_q \qquad &\text{($q$'s exponent in $N$)}
 \end{aligned}$$
 
 If `required_v[q] > current_v[q]`, the prime q is **forced** into the
@@ -456,7 +456,12 @@ satisfy the valuation balance from σ(N) = 2N.
 This additive formulation (summing contributions across all assigned
 primes) replaces the weaker `max()` heuristic used in earlier versions.
 
-### Resonance-Guided Best-First Search
+### Resonance Telemetry
+
+The engine computes a resonance diagnostic for structural analysis.
+Its priority weight is currently **zero** (`PRIORITY_RESONANCE_W = 0.0`
+in `opn_core.py`), so resonance does not affect search order or
+completeness in the checked-in configuration.
 
 For each candidate prime *p* with exponent *a*, the σ(p^a) factor set is
 compared against the primes already in N:
@@ -468,11 +473,8 @@ $$\begin{aligned}
                    &- 0.15 \cdot \log_{10}(\mathrm{largest} + 1)
 \end{aligned}$$
 
-where $\Sigma_{\sigma}$ is the set of odd prime factors of $\sigma(p^{a})$, and
-$\Delta\mathrm{res}$ is added to the running resonance score.
-
-States with high resonance (σ-factor recycling, characteristic of
-Descartes-type structures) are explored first via a priority heap.
+where $\Sigma_{\sigma}$ is the set of odd prime factors of $\sigma(p^{a})$.
+This score is recorded for telemetry but does not influence search order.
 
 ### Pre-Clone Valuation Check
 

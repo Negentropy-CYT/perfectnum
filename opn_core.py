@@ -24,7 +24,7 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 1000000000     # largest odd prime considered
+MAX_PRIME         = 5000000000     # largest odd prime considered
 MAX_FACTORS       = 60         # max distinct prime factors in N
 MAX_EXP           = 18         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chain
@@ -330,7 +330,9 @@ class SigmaPoolAnalyzer:
         cached = self._plans_by_n.get(n)
         if cached is not None:
             return cached
-        eligible = array("I")
+        # Use same storage type as the master pool (defaults to uint32).
+        type_code = getattr(self.primes, "typecode", "I")
+        eligible = array(type_code)
         append = eligible.append
         for raw_q in self.primes:
             q = int(raw_q)
@@ -409,17 +411,20 @@ class SigmaPoolAnalyzer:
 
 
 def generate_odd_primes(limit: int, *, segment_odds: int = 2_000_000) -> array:
-    """Return all odd primes ≤ *limit* as a compact uint32 ``array('I')``.
+    """Return all odd primes ≤ *limit* as a compact array.
 
-    The sieve is segmented: working memory is O(segment_odds) instead of
-    O(limit).  *limit* must fit in uint32.
+    Uses ``array('I')`` (32-bit) when *limit* ≤ 2³²-1, otherwise
+    ``array('Q')`` (64-bit).  The sieve is segmented: working memory
+    is O(segment_odds) instead of O(limit).
     """
     if limit < 3:
         return array("I")
-    if limit > 0xFFFFFFFF:
-        raise ValueError("MAX_PRIME exceeds uint32 range")
     if segment_odds <= 0:
         raise ValueError("segment_odds must be positive")
+
+    use_32bit = limit <= 0xFFFFFFFF
+    array_code = "I" if use_32bit else "Q"
+    np_uint = np.uint32 if use_32bit else np.uint64
 
     root = math.isqrt(limit)
     base_sieve = np.ones(root + 1, dtype=np.bool_)
@@ -430,7 +435,7 @@ def generate_odd_primes(limit: int, *, segment_odds: int = 2_000_000) -> array:
     base_primes = np.flatnonzero(base_sieve)
     odd_base = base_primes[base_primes >= 3]
 
-    result = array("I")
+    result = array(array_code)
     segment_span = 2 * segment_odds
     for low in range(3, limit + 1, segment_span):
         high = min(limit, low + segment_span - 2)
@@ -449,7 +454,7 @@ def generate_odd_primes(limit: int, *, segment_odds: int = 2_000_000) -> array:
             first = (start - low) // 2
             segment[first::p] = False
         indices = np.flatnonzero(segment)
-        values = (low + 2 * indices).astype(np.uint32, copy=False)
+        values = (low + 2 * indices).astype(np_uint, copy=False)
         result.frombytes(values.tobytes())
     return result
 

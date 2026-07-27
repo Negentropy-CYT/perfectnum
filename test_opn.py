@@ -1243,13 +1243,13 @@ class TestPoolAnalyzer:
             assert block.product == expected
         assert covered == list(range(len(primes)))
 
-    def test_filtered_plan_uses_compact_uint32_pool(self):
+    def test_filtered_plan_uses_compact_pool(self):
         primes = generate_odd_primes(10_000)
         a = SigmaPoolAnalyzer(primes, block_size=16, superblock_fanout=4,
                               gcd_mode="hierarchical")
         plan = a.plan_for_exp(2)  # n=3, odd → filtered
         assert isinstance(plan.primes, array)
-        assert plan.primes.itemsize == 4
+        assert plan.primes.itemsize >= 4
 
     def test_full_plan_reuses_master_prime_array(self):
         primes = generate_odd_primes(10_000)

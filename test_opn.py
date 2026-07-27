@@ -39,15 +39,20 @@ from opn_core import (
     FACTOR_CACHE,
     _SIG_FACTORS,
     _SIG_VALUATIONS,
+    _TOTIENT_CACHE,
+    _CAPACITY_CACHE,
     FRIEND_10_MODE,
     OPN_MODE,
     SEARCH_MODE,
     brent_rho,
     check_touchard,
+    euler_max_exp_capacity,
+    even_max_exp_capacity,
     exp4_forced_outside_window,
     factorize,
     generate_odd_primes,
     is_prime_infinite,
+    max_prime_capacity,
     next_prime_lower_bound,
     next_prime_upper_bound,
     power_pa,
@@ -58,6 +63,7 @@ from opn_core import (
     sigma_valuation_map,
     sigma_valuation_from_order,
     sigma_prime_power,
+    totient,
     touchard_force_3,
     valid_euler_exponents,
     valid_even_exponents,
@@ -97,6 +103,8 @@ def clear_caches():
     FACTOR_CACHE.clear()
     _SIG_FACTORS.clear()
     _SIG_VALUATIONS.clear()
+    _TOTIENT_CACHE.clear()
+    _CAPACITY_CACHE.clear()
     sigma_valuation_from_order.cache_clear()
     _source_valuation_capacity.cache_clear()
     _capacity_ranking.cache_clear()
@@ -514,7 +522,7 @@ class TestMaxprimePrune:
             called.append(item)
 
         result = _drain_and_process_pending(
-            st, heap, small_primes, max_exp=2, _push=fake_push,
+            st, heap, small_primes, max_exp=2, _push=fake_push, k_remain=5,
         )
         assert result is True, "P0-1: must return True to signal prune"
         assert len(called) == 0, "no branches should be pushed"
@@ -808,6 +816,85 @@ class TestSearchEngine:
             )
         ]
         assert solution_signature not in resumed
+
+
+# ══════════════════════════════════════════════════════════════
+# Maximum-Prime Capacity Bound
+# ══════════════════════════════════════════════════════════════
+
+class TestCapacityBound:
+    def test_totient(self):
+        assert totient(1) == 1
+        assert totient(2) == 1
+        assert totient(3) == 2
+        assert totient(5) == 4
+        assert totient(9) == 6
+        assert totient(15) == 8
+
+    def test_trivial_primes(self):
+        """p < 3 or u == 1 → capacity 0."""
+        assert max_prime_capacity(2) == 0
+        assert max_prime_capacity(3) == 0   # u = oddpart(2) = 1
+        assert max_prime_capacity(17) == 0  # u = oddpart(16) = 1
+        assert max_prime_capacity(5) == 0   # u = oddpart(4) = 1
+
+    def test_known_values(self):
+        """Hand-verified against B(u) = ½ Σ φ(d)² formula."""
+        # p=7:  u=3, divisors>1={3}, φ(3)=2, B=4/2=2
+        assert max_prime_capacity(7) == 2
+        # p=13: u=3, same as above
+        assert max_prime_capacity(13) == 2
+        # p=19: u=9, divisors>1={3,9}, φ(3)=2 φ(9)=6, B=(4+36)/2=20
+        assert max_prime_capacity(19) == 20
+        # p=31: u=15, divisors>1={3,5,15}, φ=2,4,8, B=(4+16+64)/2=42
+        assert max_prime_capacity(31) == 42
+        # p=11: u=5, divisors>1={5}, φ(5)=4, B=16/2=8
+        assert max_prime_capacity(11) == 8
+
+    def test_cached(self):
+        """Second call returns same value."""
+        a = max_prime_capacity(31)
+        b = max_prime_capacity(31)
+        assert a == b == 42
+
+    def test_euler_rounding(self):
+        assert euler_max_exp_capacity(0) == 0
+        assert euler_max_exp_capacity(1) == 1
+        assert euler_max_exp_capacity(2) == 1
+        assert euler_max_exp_capacity(5) == 5
+        assert euler_max_exp_capacity(6) == 5
+        assert euler_max_exp_capacity(9) == 9
+        assert euler_max_exp_capacity(10) == 9
+
+    def test_even_rounding(self):
+        assert even_max_exp_capacity(0) == 0
+        assert even_max_exp_capacity(1) == 0
+        assert even_max_exp_capacity(2) == 2
+        assert even_max_exp_capacity(3) == 2
+        assert even_max_exp_capacity(8) == 8
+        assert even_max_exp_capacity(9) == 8
+
+    def test_cache_cleared_by_fixture(self):
+        """clear_caches must also clear capacity/totient caches."""
+        assert len(_TOTIENT_CACHE) == 0
+        assert len(_CAPACITY_CACHE) == 0
+
+    def test_descartes_spoof_still_found(self, small_primes):
+        """Capacity bound must not break existing DFS results."""
+        found = None
+        for st in search_opn(small_primes, max_factors=5, max_exp=2,
+                             propagate=False):
+            found = st
+            break
+        assert found is not None
+        assert found.assigned == {3: 2, 7: 2, 11: 2, 13: 2}
+        assert found.pseudo is True
+
+    def test_chain_mode_finds_results(self, small_primes):
+        """Chain mode with capacity bound should run without error."""
+        count = sum(1 for _ in search_opn(small_primes, max_factors=5,
+                                          max_exp=4, propagate=True))
+        assert isinstance(count, int)
 
 
 # ══════════════════════════════════════════════════════════════

@@ -119,6 +119,46 @@ upper bound. This can make the bound too large and miss a prune, but it cannot
 make the bound too small. A state is rejected only when this relaxed capacity
 is still less than the outstanding debt.
 
+## Maximum-Prime Exponent Capacity
+
+For the largest prime factor `R` of an odd perfect number `N`, the exponent
+`v_R(N)` is bounded by the purely local quantity
+
+```
+B(u) = 1/2 * sum_{d|u, d>1} φ(d)²    where   u = oddpart(R-1).
+```
+
+This is a necessary-condition theorem that uses only `R` itself — no search
+window, exponent cap, or abundance margin.  The theorem is proved in Lean as
+`all_odd_order_layers_cyclotomic_exponent_sum_le_budget` (see `D:\leans\`).
+
+**In the search engine:** `max_prime_capacity(p)` in `opn_core.py` computes
+`B(oddpart(p-1))`.  The check fires only when the current expansion candidate
+`p` is guaranteed to be the largest prime factor of the completed `N`:
+
+- in DFS mode when one free slot remains (`k_remain == 1`);
+- in chain mode when one free slot remains and the pending queue is empty, or
+  when the pending prime `q` satisfies `q >= all assigned primes` and
+  `q >= all remaining pending primes`.
+
+The guard is conservative: it never rejects an exponent that could be valid
+for the maximum prime.  The rounding helpers `euler_max_exp_capacity` and
+`even_max_exp_capacity` match the Lean theorems `euler_rounding` and
+`nonEuler_rounding`.
+
+**At current search parameters** (small `MAX_EXP`) the existing
+`_max_possible_valuation` bound is often tighter.  The capacity bound
+becomes the dominant constraint when `MAX_EXP` is raised significantly.
+
+## Pseudo-Solution Expansion
+
+In factor-chain (true-OPN) mode a state that satisfies the Descartes-spoof
+formula (`_check_pseudo`) is yielded but **not** terminated: the state may
+still accept more real prime-power components and evolve into a genuine
+`σ(N) = 2N` solution.  The `continue` is guarded by `not use_heap`, i.e.
+it stops expansion only in DFS (pseudo-solution) mode where the spoof is
+the intended end product.
+
 ## Deferred Constraints
 
 The following ideas are not active proof prunes:

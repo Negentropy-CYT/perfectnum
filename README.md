@@ -78,7 +78,10 @@ The engine incorporates **Touchard's theorem** ($N \equiv 1 \pmod{12}$ or
 $N \equiv 9 \pmod{36}$) as an O(1) congruence check, pre-clone valuation
 contradiction detection using lazily cached $\sigma(p^a)$ factor maps, and
 finite-window logical pruning of exponent-4 branches whose $\sigma(p^4)$
-factors all exceed the search window.  A comprehensive telemetry system
+factors all exceed the search window.  A **maximum-prime capacity bound**
+(proved in Lean) constrains the exponent of the largest prime factor via
+$B(\operatorname{oddpart}(R-1)) = \frac12\sum_{d\mid u,\,d>1}\varphi(d)^2$.
+A comprehensive telemetry system
 (`telemetry.txt`) records prune reasons, clone economics, depth histograms,
 and obligation-signature recurrence patterns across parameter configurations.
 
@@ -92,9 +95,10 @@ opn_core.py        Arithmetic engine
                      · prime generation (sieve)
                      · Brent Pollard-Rho + cyclotomic factorisation
                      · σ(p^a) computation + full valuation maps (cached)
-                     · factor / power / sigma caches
-                     · suffix-product precomputation (O(1) ratio bounds)
+                     · factor / power / sigma / totient caches
+                     · factor-slot-aware ratio bounds
                      · Touchard congruence + EXCLUDE_EXP_4 pruning
+                     · max-prime capacity bound + LTE valuation helpers
                      · telemetry counters + all user-configurable constants
 opn_state.py       Search state & constraint propagation
                      · DFSState (8 fields, 2 collections cloned) — lightweight
@@ -109,7 +113,9 @@ opn_search.py      Search engine
                      · DFS (stack) for pseudo-solution mode (DFSState)
                      · best-first (heap) for factor-chain mode (ChainState)
                      · Touchard congruence pruning + exact-state deduplication
+                     · capacity-bound prune on last-slot expansions + pending drain
                      · true-OPN & pseudo-solution checks
+                     · pseudo-solutions continue expanding in chain mode
 opn_io.py          Display, checkpoint, file I/O
                      · display_solution()
                      · factor-chain trace

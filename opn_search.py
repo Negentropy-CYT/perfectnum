@@ -27,7 +27,10 @@ from opn_core import (
     PRUNE_STATS,
     TOXIC_SKIP,
     check_touchard,
+    euler_max_exp_capacity,
+    even_max_exp_capacity,
     exp4_forced_outside_window,
+    max_prime_capacity,
     next_prime_lower_bound,
     next_prime_upper_bound,
     ratio_lower_bound,
@@ -291,7 +294,9 @@ def search_opn(
         if _check_pseudo(st):
             _publish_frontier("solution")
             yield st
-            continue
+            if not use_heap:
+                continue  # DFS: spoof is the end goal; stop expansion
+            # chain mode: pseudo-solution may still expand to a true OPN
 
         # ── pruning ──
         if st.ratio_num * SEARCH_MODE.target_den >= SEARCH_MODE.target_num * st.ratio_den:
@@ -351,7 +356,7 @@ def search_opn(
         # ── pending (chain mode) ──
         if use_heap:
             if _drain_and_process_pending(
-                st, heap, primes, max_exp, _push,
+                st, heap, primes, max_exp, _push, k_remain,
             ):
                 continue
 
@@ -387,6 +392,16 @@ def search_opn(
                     PRUNE_STATS["interval_hi"] += 1
                     break
 
+            # capacity bound: when this prime is guaranteed to be the max
+            is_max_candidate = (
+                k_remain == 1
+                and (not use_heap or not st.pending)
+            )
+            if is_max_candidate:
+                raw_cap = max_prime_capacity(p)
+                euler_cap = euler_max_exp_capacity(raw_cap)
+                even_cap = even_max_exp_capacity(raw_cap)
+
             # skip branch
             skip_st = st.clone()
             skip_st.excluded.add(p)
@@ -396,6 +411,10 @@ def search_opn(
             # Euler-include
             if st.euler_prime is None and p % 4 == 1:
                 for e in reversed(valid_euler_exponents(1, max_exp)):
+                    if is_max_candidate and e > euler_cap:
+                        PRUNE_STATS["capacity_bound"] += 1
+                        CLONE_STATS["saved"] += 1
+                        continue
                     ns = _assign(st, p, e, use_heap, propagate, max_exp)
                     if ns is not None:
                         ns.next_idx = idx + 1
@@ -403,6 +422,10 @@ def search_opn(
 
             # non-Euler include
             for e in reversed(valid_even_exponents(2, max_exp)):
+                if is_max_candidate and e > even_cap:
+                    PRUNE_STATS["capacity_bound"] += 1
+                    CLONE_STATS["saved"] += 1
+                    continue
                 if (
                     e == 4
                     and use_heap
@@ -441,7 +464,7 @@ def _assign(st: State, p: int, exp: int, use_heap: bool,
 # ── pending processing (chain mode) ──────────────────────────
 
 def _drain_and_process_pending(
-    st: ChainState, heap, primes, max_exp: int, _push,
+    st: ChainState, heap, primes, max_exp: int, _push, k_remain: int,
 ) -> bool:
     if not st.pending:
         return False
@@ -468,13 +491,33 @@ def _drain_and_process_pending(
         1,
     )
 
+    # capacity bound: q is the max if this is the last slot,
+    # q >= all assigned primes, and q >= all remaining pending
+    is_max_in_pending = (
+        k_remain == 1
+        and all(q >= p for p in st.assigned)
+        and all(q >= p for p in st.pending)
+    )
+
     if st.euler_prime is None and q % 4 == 1:
         for e in reversed(valid_euler_exponents(lb, max_exp)):
+            if is_max_in_pending and e > euler_max_exp_capacity(
+                max_prime_capacity(q)
+            ):
+                PRUNE_STATS["capacity_bound"] += 1
+                CLONE_STATS["saved"] += 1
+                continue
             ns = assign_prime_chain(st, q, e, propagate=True, max_exp=max_exp)
             if ns is not None:
                 _push(heap, ns)
 
     for e in reversed(valid_even_exponents(lb, max_exp)):
+        if is_max_in_pending and e > even_max_exp_capacity(
+            max_prime_capacity(q)
+        ):
+            PRUNE_STATS["capacity_bound"] += 1
+            CLONE_STATS["saved"] += 1
+            continue
         ns = assign_prime_chain(st, q, e, propagate=True, max_exp=max_exp)
         if ns is not None:
             _push(heap, ns)

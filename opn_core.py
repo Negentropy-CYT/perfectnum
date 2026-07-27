@@ -21,9 +21,9 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 10000       # largest odd prime considered
-MAX_FACTORS       = 10        # max distinct prime factors in N
-MAX_EXP           = 9         # max exponent (2 = a_i=1 restriction)
+MAX_PRIME         = 100000     # largest odd prime considered
+MAX_FACTORS       = 15         # max distinct prime factors in N
+MAX_EXP           = 10         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
@@ -81,6 +81,8 @@ POWER_CACHE:   Dict[Tuple[int, int], int] = {}
 FACTOR_CACHE:  Dict[int, List[Tuple[int, int]]] = {}
 _SIG_FACTORS:  Dict[Tuple[int, int], set[int]] = {}
 _SIG_VALUATIONS: Dict[Tuple[int, int], Dict[int, int]] = {}  # (p,a) → {q: v_q(σ(p^a))}
+_TOTIENT_CACHE: Dict[int, int] = {}
+_CAPACITY_CACHE: Dict[int, int] = {}
 
 # ── prune telemetry ──────────────────────────────────────────
 PRUNE_STATS:        "Counter[str]"           = Counter()
@@ -259,6 +261,85 @@ def sigma_valuation_from_order(p: int, a: int, q: int) -> int:
         _power_minus_one_valuation(p, order, q)
         + _valuation(n // order, q)
     )
+
+
+# ── totient & maximum-prime capacity bound ────────────────────
+
+def totient(n: int) -> int:
+    """Euler's totient φ(n), cached.  Uses ``factorize()`` which is cached."""
+    if n in _TOTIENT_CACHE:
+        return _TOTIENT_CACHE[n]
+    if n <= 1:
+        _TOTIENT_CACHE[n] = n
+        return n
+    result = n
+    for p, _ in factorize(n):
+        result -= result // p
+    _TOTIENT_CACHE[n] = result
+    return result
+
+
+def _divisors_gt_one(factors: List[Tuple[int, int]]) -> List[int]:
+    """All divisors > 1 from a prime factorisation (result of ``factorize``)."""
+    divisors = [1]
+    for p, e in factors:
+        pe_powers = [1]
+        for _ in range(e):
+            pe_powers.append(pe_powers[-1] * p)
+        new_divs = []
+        for d in divisors:
+            for pe in pe_powers[1:]:
+                new_divs.append(d * pe)
+        divisors.extend(new_divs)
+    divisors.remove(1)
+    divisors.sort()
+    return divisors
+
+
+def max_prime_capacity(p: int) -> int:
+    r"""B(u) = ½ Σ_{d|u, d>1} φ(d)²  where  u = oddpart(p-1).
+
+    Upper bound on the exponent of *p* when *p* is the largest prime
+    factor of an odd perfect number (proved in Lean as
+    ``all_odd_order_layers_cyclotomic_exponent_sum_le_budget``).
+    """
+    if p in _CAPACITY_CACHE:
+        return _CAPACITY_CACHE[p]
+    if p < 3:
+        _CAPACITY_CACHE[p] = 0
+        return 0
+    u = p - 1
+    while u % 2 == 0:
+        u //= 2
+    if u == 1:
+        _CAPACITY_CACHE[p] = 0
+        return 0
+    factors = factorize(u)
+    total = 0
+    for d in _divisors_gt_one(factors):
+        phi = totient(d)
+        total += phi * phi
+    result = total // 2
+    _CAPACITY_CACHE[p] = result
+    return result
+
+
+def euler_max_exp_capacity(capacity: int) -> int:
+    """Largest integer ≡ 1 (mod 4) not exceeding *capacity*.
+
+    0 when *capacity* < 1.  Matches ``euler_rounding`` in Lean."""
+    if capacity < 1:
+        return 0
+    return 1 + 4 * ((capacity - 1) // 4)
+
+
+def even_max_exp_capacity(capacity: int) -> int:
+    """Largest even integer not exceeding *capacity*.
+
+    0 when *capacity* < 2.  Matches ``nonEuler_rounding`` in Lean."""
+    if capacity < 2:
+        return 0
+    return 2 * (capacity // 2)
 
 
 def power_pa(p: int, a: int) -> int:

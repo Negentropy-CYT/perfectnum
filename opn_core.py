@@ -10,11 +10,13 @@ user-configurable constants.
 import math
 import random
 import time
+from array import array
 from collections import Counter
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import gmpy2
+import numpy as np
 from gmpy2 import mpz
 
 # ── configuration ─────────────────────────────────────────────
@@ -23,7 +25,7 @@ SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
 MAX_PRIME         = 1000000000     # largest odd prime considered
-MAX_FACTORS       = 50         # max distinct prime factors in N
+MAX_FACTORS       = 60         # max distinct prime factors in N
 MAX_EXP           = 18         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
@@ -268,26 +270,29 @@ class SigmaPoolAnalyzer:
     running full Pollard–Rho factorisation.
     """
 
-    def __init__(self, primes: List[int], *, block_size: int = 256,
+    def __init__(self, primes, *, block_size: int = 256,
                  superblock_fanout: int = 16,
                  gcd_mode: str = "flat",
                  stats=None) -> None:
         if not primes:
             raise ValueError("prime pool must not be empty")
-        if primes != sorted(primes):
-            raise ValueError("prime pool must be sorted")
-        if len(set(primes)) != len(primes):
-            raise ValueError("prime pool must not contain duplicates")
-        if any(q < 3 or q % 2 == 0 or not gmpy2.is_prime(q) for q in primes):
-            raise ValueError("prime pool must contain only odd primes")
+        if int(primes[0]) != 3:
+            raise ValueError("complete odd-prime pool must start at 3")
+        previous = 1
+        for raw_q in primes:
+            q = int(raw_q)
+            if q < 3 or q % 2 == 0:
+                raise ValueError("prime pool must contain only odd integers >= 3")
+            if q <= previous:
+                raise ValueError("prime pool must be strictly increasing")
+            previous = q
         if gcd_mode not in {"flat", "hierarchical"}:
             raise ValueError("gcd_mode must be 'flat' or 'hierarchical'")
         if superblock_fanout < 2:
             raise ValueError("superblock_fanout must be at least 2")
 
-        self.primes = tuple(primes)
-        self.prime_set = frozenset(primes)
-        self.prime_limit = primes[-1]
+        self.primes = primes
+        self.prime_limit = int(primes[-1])
         self.block_size = block_size
         self.superblock_fanout = superblock_fanout
         self.gcd_mode = gcd_mode
@@ -346,14 +351,14 @@ class SigmaPoolAnalyzer:
         # Fast path: a globally exact factorisation already exists
         exact_cached = _SIG_VALUATIONS.get(key)
         if exact_cached is not None:
-            outside = next((q for q in exact_cached if q not in self.prime_set), None)
+            outside = next((q for q in exact_cached if q > self.prime_limit), None)
             if outside is None:
                 result = SigmaPoolAnalysis(exact=True, valuations=exact_cached, residual=mpz(1))
                 self.stats["exact_from_global_cache"] += 1
             else:
                 result = SigmaPoolAnalysis(
                     exact=False,
-                    valuations={q: e for q, e in exact_cached.items() if q in self.prime_set},
+                    valuations={q: e for q, e in exact_cached.items() if q <= self.prime_limit},
                     residual=mpz(outside),
                     outside_witness=outside,
                 )
@@ -395,14 +400,50 @@ class SigmaPoolAnalyzer:
         return c is not None and not c.exact
 
 
-def generate_odd_primes(limit: int) -> List[int]:
-    """Return all odd primes ≤ *limit* (Eratosthenes sieve)."""
-    sieve = [True] * (limit + 1)
-    sieve[0] = sieve[1] = False
-    for i in range(2, int(limit ** 0.5) + 1):
-        if sieve[i]:
-            sieve[i * i: limit + 1: i] = [False] * (((limit - i * i) // i) + 1)
-    return [p for p in range(3, limit + 1, 2) if sieve[p]]
+def generate_odd_primes(limit: int, *, segment_odds: int = 2_000_000) -> array:
+    """Return all odd primes ≤ *limit* as a compact uint32 ``array('I')``.
+
+    The sieve is segmented: working memory is O(segment_odds) instead of
+    O(limit).  *limit* must fit in uint32.
+    """
+    if limit < 3:
+        return array("I")
+    if limit > 0xFFFFFFFF:
+        raise ValueError("MAX_PRIME exceeds uint32 range")
+    if segment_odds <= 0:
+        raise ValueError("segment_odds must be positive")
+
+    root = math.isqrt(limit)
+    base_sieve = np.ones(root + 1, dtype=np.bool_)
+    base_sieve[:2] = False
+    for p in range(2, math.isqrt(root) + 1):
+        if base_sieve[p]:
+            base_sieve[p * p: root + 1: p] = False
+    base_primes = np.flatnonzero(base_sieve)
+    odd_base = base_primes[base_primes >= 3]
+
+    result = array("I")
+    segment_span = 2 * segment_odds
+    for low in range(3, limit + 1, segment_span):
+        high = min(limit, low + segment_span - 2)
+        if high % 2 == 0:
+            high -= 1
+        count = ((high - low) // 2) + 1
+        segment = np.ones(count, dtype=np.bool_)
+        for p_val in odd_base:
+            p = int(p_val)
+            p_sq = p * p
+            if p_sq > high:
+                break
+            start = max(p_sq, ((low + p - 1) // p) * p)
+            if start % 2 == 0:
+                start += p
+            first = (start - low) // 2
+            segment[first::p] = False
+        indices = np.flatnonzero(segment)
+        values = (low + 2 * indices).astype(np.uint32, copy=False)
+        result.frombytes(values.tobytes())
+    return result
 
 
 # ── Brent Pollard-Rho factorisation ───────────────────────────

@@ -660,7 +660,7 @@ def validate_checkpoint(chk: dict) -> List[str]:
     primes = chk["primes"]
     if not primes:
         issues.append("prime list is empty")
-    elif primes != sorted(set(primes)):
+    elif list(primes) != sorted(set(primes)):
         issues.append("prime list is not strictly increasing and unique")
     elif any(p < 3 or p % 2 == 0 or not is_prime(p) for p in primes):
         issues.append("prime list contains a non-odd-prime candidate")

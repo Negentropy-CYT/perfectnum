@@ -21,6 +21,7 @@ import math
 import os
 import pickle
 import sys
+from array import array
 from fractions import Fraction
 from itertools import combinations
 
@@ -100,6 +101,20 @@ from opn_state import (
 # Helpers
 # ══════════════════════════════════════════════════════════════
 
+def reference_odd_primes(limit: int) -> list[int]:
+    """Small test-only reference sieve."""
+    if limit < 3:
+        return []
+    sieve = bytearray(b"\x01") * (limit + 1)
+    sieve[0:2] = b"\x00\x00"
+    for p in range(2, math.isqrt(limit) + 1):
+        if sieve[p]:
+            start = p * p
+            count = ((limit - start) // p) + 1
+            sieve[start:limit + 1:p] = b"\x00" * count
+    return [p for p in range(3, limit + 1, 2) if sieve[p]]
+
+
 def analyze_with_plan(p: int, exp: int, plan, scanner):
     """Run a pool analysis using a specific block plan and scanner."""
     from collections import Counter
@@ -142,16 +157,32 @@ def small_primes():
 class TestPrimes:
     def test_generate_up_to_50(self):
         p = generate_odd_primes(50)
-        assert p == [3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+        assert list(p) == [3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
 
     def test_generate_up_to_100_first_last(self):
         p = generate_odd_primes(100)
-        assert p[0] == 3
-        assert p[-1] == 97
+        assert int(p[0]) == 3
+        assert int(p[-1]) == 97
 
     def test_no_even_primes(self):
         p = generate_odd_primes(200)
-        assert all(q % 2 == 1 for q in p)
+        assert all(int(q) % 2 == 1 for q in p)
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2, 3, 4, 10, 31, 100, 999, 1_000, 10_000, 100_000])
+@pytest.mark.parametrize("segment_odds", [1, 2, 7, 64, 1_000])
+def test_segmented_sieve_matches_reference(limit, segment_odds):
+    actual = generate_odd_primes(limit, segment_odds=segment_odds)
+    expected = reference_odd_primes(limit)
+    assert isinstance(actual, array)
+    assert list(actual) == expected
+
+
+def test_segmented_sieve_known_million_count():
+    primes = generate_odd_primes(1_000_000)
+    assert len(primes) == 78_497
+    assert primes[0] == 3
+    assert primes[-1] == 999_983
 
 
 class TestSigma:

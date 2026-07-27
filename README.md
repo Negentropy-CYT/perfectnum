@@ -124,16 +124,16 @@ opn_io.py          Display, checkpoint, file I/O
                      · factor-chain trace
                      · atomic pickle checkpoint save/load + validation
                      · human-readable solutions file
-                     · display_prune_stats() — per-reason prune telemetry
-                     · display_depth_histogram() — search-tree shape
-                     · display_clone_effectiveness() — clone economics
+                     · write_telemetry_report() — structured Markdown report
+                     · display_telemetry_brief() — console summary
+                     · clone economics — pre-clone avoidance rate
                      · export_factor_graph() — DOT + JSON σ-dependency graph
 ```
 
 **Dependency graph** (no cycles):
 
 ```
-opn_core   ← gmpy2, math, random
+opn_core   ← gmpy2, numpy, math, random
 opn_state  ← opn_core
 opn_search ← opn_core + opn_state
 opn_io     ← opn_core + opn_state
@@ -178,8 +178,7 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 
 | | Legacy | Current (DFS mode) | Current (factor chain) |
 |---|---|---|---|
-| **Max rate** | ~1.5M states/s | ~350K states/s | ~140K states/s |
-| **Per-state cost** | $O(1)$ — stack push + mpz multiply | $O(1)$ — same core operations | $O(\log d)$ — Brent-Rho factorisation of $\sigma(p^{a})$ |
+| **Per-state cost** | $O(1)$ — stack push + mpz multiply | $O(1)$ — same core operations | $\sigma$-pool analysis + tiered GCD |
 | **Memory** | ~1 MB (stack only) | ~10 MB (stack + caches) | ~50 MB (heap + factor/sigma/power caches) |
 | **Time to first pseudo-solution** (PRIME=397) | ~7 min | ~7 min | N/A (not applicable) |
 
@@ -228,7 +227,7 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 
 ## Installation
 
-**Requirements:** Python 3.10+, [gmpy2](https://github.com/aleaxit/gmpy)
+**Requirements:** Python 3.10+, gmpy2, numpy
 
 ```bash
 python -m pip install -r requirements.txt
@@ -347,15 +346,17 @@ the resonance heuristic works.
 ### Search Telemetry
 
 On completion or `Ctrl+C`, the engine prints three telemetry reports.
-All counters are serialised into the checkpoint and accumulate across
-interrupt/resume cycles, giving reliable long-run statistics.
+Selected telemetry counters are serialised into the checkpoint and
+accumulate across interrupt/resume cycles.  Per-run pool timing,
+slowest-analysis records, and some diagnostic counters are not
+persisted.
 
 **Prune Statistics** — per-reason rejection rates, normalised against
 `attempted = actual_clones + avoided_pre_clone` (‰ = per 1000 clones):
 
 ```
 Prune statistics:
-  ratio             182,501  (98.0% of prunes,  51.5‰ of clones)
+  ratio             916,000+  (98.0% of prunes,  51.5‰ of clones)
   touchard            3,688  ( 2.0% of prunes,   1.0‰ of clones)
 ```
 
@@ -364,19 +365,7 @@ Each counter is incremented at the exact `return None` site inside
 heuristic dominates *per clone attempt*, enabling cross-configuration
 comparison.
 
-**Depth Histogram** — distribution of successful assign depth,
-normalised as % of all productive clones:
-
-```
-Depth histogram (successful assign):
-  depth  1:            1  ( 0.0%)  #
-  depth 14:        4,253  ( 0.2%)  #
-  depth 24:       62,408  ( 3.6%)  #######
-  depth 34:      123,405  ( 7.1%)  ##############  ← peak
-  depth 44:       15,264  ( 0.9%)  ##
-```
-
-Depth counts DFS traversal steps (include + skip branches), *not*
+**Depth Histogram** — productive clone depth (expansion steps). , *not*
 number of assigned prime factors.  The bell shape reveals where the
 search tree expands and where ratio pruning begins to dominate.
 
@@ -384,14 +373,14 @@ search tree expands and where ratio pruning begins to dominate.
 
 ```
 Clone effectiveness:
-  total clones     3,544,930
-  productive       1,750,000  ( 49.4%)
-  saved (pre-clone)  182,501  (  5.1%)  ratio/excluded/euler — clone avoided
-  wasted (post-cln)    3,688  (  0.1%)  touchard/valuation — clone paid, then rejected
-  overhead (other) 1,608,741  ( 45.4%)  skip branches, init
+  attempted branches    1,109,587
+  actual clones           144,575
+  avoided (pre-clone)     965,012
+  avoidance rate            87.0%
+    productive             144,570  (100.0% of actual)
 ```
 
-- **saved** = prunes that executed *before* `clone()` — these are the
+- **avoided** = prunes that executed *before* `clone()` — these are the
   highest-value heuristics.
 - **wasted** = prunes that executed *after* `clone()` — mathematically
   correct but computationally expensive.

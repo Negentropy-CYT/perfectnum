@@ -25,6 +25,8 @@ from opn_core import (
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
     PERF_STATS,
+    POOL_GCD_MODE,
+    POOL_SUPERBLOCK_FANOUT,
     SEARCH_MODE,
     PRUNE_STATS,
     SIGMA_POOL_STATS,
@@ -159,7 +161,13 @@ def search_opn(
     sigma_pool_analyzer = None
     if propagate and SEARCH_MODE.target_num == 2 and SEARCH_MODE.target_den == 1:
         SIGMA_POOL_STATS.clear()
-        sigma_pool_analyzer = SigmaPoolAnalyzer(primes, stats=SIGMA_POOL_STATS)
+        sigma_pool_analyzer = SigmaPoolAnalyzer(
+            primes,
+            block_size=256,
+            superblock_fanout=POOL_SUPERBLOCK_FANOUT,
+            gcd_mode=POOL_GCD_MODE,
+            stats=SIGMA_POOL_STATS,
+        )
 
     print("using exact factor-slot tail bounds", flush=True)
 

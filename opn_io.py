@@ -403,10 +403,18 @@ def write_telemetry_report(elapsed: float, solutions_found: int) -> None:
         w("\n## σ pool analysis")
         for k in ["hits", "misses", "exact", "outside_certificates",
                    "exact_from_global_cache", "outside_from_global_cache",
-                   "blocks_tested", "positive_blocks", "pool_factors_removed"]:
+                   "candidate_leaf_blocks", "superblocks_tested",
+                   "positive_superblocks", "leaf_blocks_tested",
+                   "leaf_blocks_skipped", "positive_blocks",
+                   "pool_factors_removed"]:
             v = SIGMA_POOL_STATS.get(k, 0)
             if v:
                 w(f"  {k:<28} {v:>12,}")
+        leaf = SIGMA_POOL_STATS.get("leaf_blocks_tested", 0)
+        cand = SIGMA_POOL_STATS.get("candidate_leaf_blocks", 0)
+        if cand:
+            skip_rate = 100.0 * (1 - leaf / cand)
+            w(f"  screening skip rate      {skip_rate:>12.1f}%")
         ns_val = SIGMA_POOL_STATS.get("analysis_ns", 0)
         if ns_val:
             w(f"  analysis_seconds        {ns_val*1e-9:>12.1f}")

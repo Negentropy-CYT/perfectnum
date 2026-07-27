@@ -45,6 +45,8 @@ from opn_core import (
     OPN_MODE,
     SEARCH_MODE,
     SigmaPoolAnalyzer,
+    build_prime_blocks,
+    build_prime_superblocks,
     brent_rho,
     check_touchard,
     euler_max_exp_capacity,
@@ -1145,3 +1147,82 @@ class TestPoolAnalyzer:
         assert stats["misses"] == 1
         assert stats["exact"] == 1
         assert stats["analysis_ns"] > 0
+
+    def test_blocks_for_exp_matches_full_blocks(self):
+        """Filtered blocks produce identical results to full-pool analysis."""
+        primes = generate_odd_primes(500)
+        for p in primes[:30]:
+            for exp in [2, 4, 6, 8, 10, 12, 14, 16, 18, 1, 5, 9, 13]:
+                if exp % 2 == 1 and p % 4 != 1:
+                    continue
+                a_full = SigmaPoolAnalyzer(primes)
+                a_full.blocks_for_exp = lambda e: a_full.blocks
+
+                r_full = a_full.analyze(p, exp)
+                r_filt = SigmaPoolAnalyzer(primes).analyze(p, exp)
+
+                assert r_full.exact == r_filt.exact
+                assert r_full.valuations == r_filt.valuations
+                assert r_full.residual == r_filt.residual
+
+
+# ══════════════════════════════════════════════════════════════
+# Superblock two-level GCD screening
+# ══════════════════════════════════════════════════════════════
+
+class TestSuperblockGCD:
+    def test_superblocks_cover_every_leaf_once(self):
+        primes = generate_odd_primes(1000)
+        blocks = build_prime_blocks(primes, block_size=7)
+        supers = build_prime_superblocks(blocks, fanout=4)
+        covered = []
+        for sb in supers:
+            covered.extend(range(sb.start, sb.stop))
+        assert covered == list(range(len(blocks)))
+
+    def test_superblock_product_matches_children(self):
+        primes = generate_odd_primes(1000)
+        blocks = build_prime_blocks(primes, block_size=7)
+        supers = build_prime_superblocks(blocks, fanout=4)
+        for sb in supers:
+            expected = mpz(1)
+            for idx in range(sb.start, sb.stop):
+                expected *= blocks[idx].product
+            assert sb.product == expected
+
+    def test_flat_and_hierarchical_match(self):
+        primes = generate_odd_primes(500)
+        flat = SigmaPoolAnalyzer(primes, block_size=16, superblock_fanout=4,
+                                 gcd_mode="flat")
+        hier = SigmaPoolAnalyzer(primes, block_size=16, superblock_fanout=4,
+                                 gcd_mode="hierarchical")
+        for p in generate_odd_primes(200):
+            for exp in [2, 4, 6, 8, 10, 12, 1, 5, 9]:
+                r1 = flat.analyze(p, exp)
+                _SIG_VALUATIONS.clear(); _SIG_FACTORS.clear()
+                r2 = hier.analyze(p, exp)
+                _SIG_VALUATIONS.clear(); _SIG_FACTORS.clear()
+                assert r1.exact == r2.exact
+                assert r1.valuations == r2.valuations
+                assert int(r1.residual) == int(r2.residual)
+
+    def test_repeated_valuation_preserved(self):
+        """σ(5⁵)=3906=2×3²×7×31"""
+        a = SigmaPoolAnalyzer(generate_odd_primes(100), block_size=4,
+                              superblock_fanout=2, gcd_mode="hierarchical")
+        r = a.analyze(5, 5)
+        assert r.exact
+        assert r.valuations == {3: 2, 7: 1, 31: 1}
+
+    def test_hierarchical_3511_10_stays_outside(self, monkeypatch):
+        import opn_core
+
+        def forbidden_factorize(_):
+            raise AssertionError("full factorize was called")
+
+        monkeypatch.setattr(opn_core, "factorize", forbidden_factorize)
+        a = SigmaPoolAnalyzer(generate_odd_primes(5000), block_size=32,
+                              superblock_fanout=8, gcd_mode="hierarchical")
+        r = a.analyze(3511, 10)
+        assert not r.exact
+        assert r.residual > 1

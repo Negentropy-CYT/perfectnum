@@ -29,6 +29,8 @@ PROPAGATE         = True     # False = pseudo-solution DFS; True = true OPN chai
 PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
 ENABLE_FERMAT_DEBT = False
+POOL_GCD_MODE = "flat"          # "flat" or "hierarchical"
+POOL_SUPERBLOCK_FANOUT = 16
 
 # ── search mode (target + Euler + forced/excluded primes) ─────
 # Single configuration point for OPN vs. friend-of-10 searches.
@@ -86,6 +88,21 @@ class PrimeBlock:
     """A contiguous block of odd primes with precomputed product for gcd."""
     primes: Tuple[int, ...]
     product: mpz
+
+
+@dataclass(slots=True, frozen=True)
+class PrimeSuperBlock:
+    """A consecutive range of leaf PrimeBlock objects."""
+    start: int          # inclusive leaf-block index
+    stop: int           # exclusive leaf-block index
+    product: mpz        # product of every child block product
+
+
+@dataclass(slots=True, frozen=True)
+class PrimeBlockPlan:
+    """Leaf blocks plus a two-level screening structure."""
+    blocks: Tuple[PrimeBlock, ...]
+    superblocks: Tuple[PrimeSuperBlock, ...]
 
 
 # ── friend-of-10 preset [INACTIVE] ──────────────────────────────
@@ -169,6 +186,77 @@ def build_prime_blocks(primes: List[int], block_size: int = 256):
     return tuple(blocks)
 
 
+def build_prime_superblocks(blocks: tuple, fanout: int):
+    """Group consecutive *blocks* into superblocks for two-level GCD."""
+    if fanout < 2:
+        raise ValueError("superblock fanout must be at least 2")
+    result = []
+    for start in range(0, len(blocks), fanout):
+        stop = min(start + fanout, len(blocks))
+        product = mpz(1)
+        for idx in range(start, stop):
+            product *= blocks[idx].product
+        result.append(PrimeSuperBlock(start=start, stop=stop, product=product))
+    return tuple(result)
+
+
+def build_prime_block_plan(primes, *, block_size: int, superblock_fanout: int,
+                           eligible_primes=None):
+    """Build a two-level block plan for *primes* (or *eligible_primes*)."""
+    pool = eligible_primes if eligible_primes is not None else primes
+    blocks = build_prime_blocks(pool, block_size)
+    superblocks = build_prime_superblocks(blocks, superblock_fanout)
+    return PrimeBlockPlan(blocks=blocks, superblocks=superblocks)
+
+
+def _strip_prime_block(residual: mpz, inside: dict, block, stats) -> mpz:
+    """Remove all prime factors from *block* that divide *residual*."""
+    for q in block.primes:
+        if residual == 1:
+            break
+        if residual % q != 0:
+            continue
+        residual, exponent = _remove_all(residual, q)
+        inside[q] = inside.get(q, 0) + exponent
+        stats["pool_factors_removed"] += 1
+    return residual
+
+
+def _scan_blocks_flat(residual: mpz, inside: dict, plan, stats) -> mpz:
+    """Flat scanner: iterate every leaf block (correctness oracle)."""
+    for block in plan.blocks:
+        if residual == 1:
+            break
+        stats["leaf_blocks_tested"] += 1
+        if gmpy2.gcd(residual, block.product) == 1:
+            continue
+        stats["positive_blocks"] += 1
+        residual = _strip_prime_block(residual, inside, block, stats)
+    return residual
+
+
+def _scan_blocks_hierarchical(residual: mpz, inside: dict, plan, stats) -> mpz:
+    """Two-level scanner: superblock gcd → leaf-block gcd."""
+    blocks = plan.blocks
+    for sb in plan.superblocks:
+        if residual == 1:
+            break
+        stats["superblocks_tested"] += 1
+        if gmpy2.gcd(residual, sb.product) == 1:
+            stats["leaf_blocks_skipped"] += sb.stop - sb.start
+            continue
+        stats["positive_superblocks"] += 1
+        for idx in range(sb.start, sb.stop):
+            if residual == 1:
+                break
+            stats["leaf_blocks_tested"] += 1
+            if gmpy2.gcd(residual, blocks[idx].product) == 1:
+                continue
+            stats["positive_blocks"] += 1
+            residual = _strip_prime_block(residual, inside, blocks[idx], stats)
+    return residual
+
+
 class SigmaPoolAnalyzer:
     """Analyse σ(p^a) against the configured odd-prime pool.
 
@@ -178,6 +266,8 @@ class SigmaPoolAnalyzer:
     """
 
     def __init__(self, primes: List[int], *, block_size: int = 256,
+                 superblock_fanout: int = 16,
+                 gcd_mode: str = "flat",
                  stats=None) -> None:
         if not primes:
             raise ValueError("prime pool must not be empty")
@@ -187,15 +277,46 @@ class SigmaPoolAnalyzer:
             raise ValueError("prime pool must not contain duplicates")
         if any(q < 3 or q % 2 == 0 or not gmpy2.is_prime(q) for q in primes):
             raise ValueError("prime pool must contain only odd primes")
+        if gcd_mode not in {"flat", "hierarchical"}:
+            raise ValueError("gcd_mode must be 'flat' or 'hierarchical'")
+        if superblock_fanout < 2:
+            raise ValueError("superblock_fanout must be at least 2")
 
         self.primes = tuple(primes)
         self.prime_set = frozenset(primes)
         self.prime_limit = primes[-1]
-        self.blocks = build_prime_blocks(primes, block_size)
+        self.block_size = block_size
+        self.superblock_fanout = superblock_fanout
+        self.gcd_mode = gcd_mode
+        self._scan = _scan_blocks_hierarchical if gcd_mode == "hierarchical" else _scan_blocks_flat
+
+        # Cached full-pool plans: prime blocks for each (a+1) value
+        self._plans_by_exp: Dict[int, PrimeBlockPlan] = {}
 
         self._cache: Dict[Tuple[int, int], SigmaPoolAnalysis] = {}
         self.stats: "Counter[str]" = stats if stats is not None else Counter()
         self.slowest: List[Tuple[float, int, int, int, bool]] = []
+
+    def plan_for_exp(self, exp: int) -> PrimeBlockPlan:
+        """Return the block plan for *exp*, filtered by necessary-order condition."""
+        n = exp + 1
+        cached = self._plans_by_exp.get(n)
+        if cached is not None:
+            return cached
+        if n % 2 == 0:
+            # For even n, gcd(q-1, n) ≥ 2 for all odd q → no filter benefit
+            eligible = None
+        else:
+            eligible = [q for q in self.primes
+                        if n % q == 0 or math.gcd(q - 1, n) > 1]
+        plan = build_prime_block_plan(
+            self.primes,
+            block_size=self.block_size,
+            superblock_fanout=self.superblock_fanout,
+            eligible_primes=eligible,
+        )
+        self._plans_by_exp[n] = plan
+        return plan
 
     def analyze(self, p: int, exp: int) -> SigmaPoolAnalysis:
         key = (p, exp)
@@ -229,21 +350,11 @@ class SigmaPoolAnalyzer:
         residual, _v2 = _remove_all(residual, 2)
         inside: Dict[int, int] = {}
 
-        for block in self.blocks:
-            if residual == 1:
-                break
-            self.stats["blocks_tested"] += 1
-            if gmpy2.gcd(residual, block.product) == 1:
-                continue
-            self.stats["positive_blocks"] += 1
-            for q in block.primes:
-                if residual == 1:
-                    break
-                if residual % q != 0:
-                    continue
-                residual, exponent = _remove_all(residual, q)
-                inside[q] = exponent
-                self.stats["pool_factors_removed"] += 1
+        plan = self.plan_for_exp(exp)
+        self.stats["candidate_leaf_blocks"] += len(plan.blocks)
+        residual = self._scan(residual, inside, plan, self.stats)
+        # backward-compat alias
+        self.stats["blocks_tested"] = self.stats["leaf_blocks_tested"]
 
         if residual == 1:
             result = SigmaPoolAnalysis(exact=True, valuations=inside, residual=mpz(1))

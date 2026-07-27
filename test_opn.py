@@ -1230,6 +1230,35 @@ class TestPoolAnalyzer:
         plan = a.plan_for_exp(2)  # even n → full plan
         assert plan.superblocks == ()
 
+    def test_prime_blocks_cover_compact_pool_exactly(self):
+        primes = generate_odd_primes(1_000, segment_odds=17)
+        blocks = build_prime_blocks(primes, block_size=7)
+        covered = []
+        for block in blocks:
+            assert 0 <= block.start < block.stop <= len(primes)
+            covered.extend(range(block.start, block.stop))
+            expected = mpz(1)
+            for idx in range(block.start, block.stop):
+                expected *= int(primes[idx])
+            assert block.product == expected
+        assert covered == list(range(len(primes)))
+
+    def test_filtered_plan_uses_compact_uint32_pool(self):
+        primes = generate_odd_primes(10_000)
+        a = SigmaPoolAnalyzer(primes, block_size=16, superblock_fanout=4,
+                              gcd_mode="hierarchical")
+        plan = a.plan_for_exp(2)  # n=3, odd → filtered
+        assert isinstance(plan.primes, array)
+        assert plan.primes.itemsize == 4
+
+    def test_full_plan_reuses_master_prime_array(self):
+        primes = generate_odd_primes(10_000)
+        a = SigmaPoolAnalyzer(primes, gcd_mode="hierarchical")
+        p1 = a.plan_for_exp(1)  # even n → full plan
+        p5 = a.plan_for_exp(5)  # even n → same full plan
+        assert p1 is p5
+        assert p1.primes is primes
+
 
 # ══════════════════════════════════════════════════════════════
 # Superblock two-level GCD screening

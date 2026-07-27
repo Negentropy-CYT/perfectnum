@@ -85,10 +85,11 @@ class SigmaPoolAnalysis:
     outside_witness: Optional[int] = None
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class PrimeBlock:
-    """A contiguous block of odd primes with precomputed product for gcd."""
-    primes: Tuple[int, ...]
+    """A range over a shared prime array with precomputed product for gcd."""
+    start: int
+    stop: int
     product: mpz
 
 
@@ -102,7 +103,8 @@ class PrimeSuperBlock:
 
 @dataclass(slots=True, frozen=True)
 class PrimeBlockPlan:
-    """Leaf blocks plus a two-level screening structure."""
+    """Compact prime data plus a two-level GCD screening structure."""
+    primes: Sequence[int]
     blocks: Tuple[PrimeBlock, ...]
     superblocks: Tuple[PrimeSuperBlock, ...] = ()
 
@@ -176,20 +178,22 @@ def _remove_all(value: mpz, q: int) -> Tuple[mpz, int]:
     return value, e
 
 
-def build_prime_blocks(primes: List[int], block_size: int = 256):
-    """Partition *primes* into blocks with precomputed product for gcd."""
+def build_prime_blocks(primes, block_size: int = 256):
+    """Partition a compact prime sequence into indexed blocks."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
     blocks = []
     for start in range(0, len(primes), block_size):
-        block_primes = tuple(primes[start:start + block_size])
+        stop = min(start + block_size, len(primes))
         product = mpz(1)
-        for q in block_primes:
-            product *= q
-        blocks.append(PrimeBlock(primes=block_primes, product=product))
+        for idx in range(start, stop):
+            product *= int(primes[idx])
+        blocks.append(PrimeBlock(start=start, stop=stop, product=product))
     return tuple(blocks)
 
 
 def build_prime_superblocks(blocks: tuple, fanout: int):
-    """Group consecutive *blocks* into superblocks for two-level GCD."""
+    """Group consecutive leaf blocks into superblocks."""
     if fanout < 2:
         raise ValueError("superblock fanout must be at least 2")
     result = []
@@ -204,21 +208,22 @@ def build_prime_superblocks(blocks: tuple, fanout: int):
 
 def build_prime_block_plan(primes, *, block_size: int, superblock_fanout: int,
                            eligible_primes=None, build_superblocks: bool = True):
-    """Build a two-level block plan for *primes* (or *eligible_primes*)."""
+    """Build a block plan over full or exponent-filtered primes."""
     pool = eligible_primes if eligible_primes is not None else primes
     blocks = build_prime_blocks(pool, block_size)
     superblocks = (
         build_prime_superblocks(blocks, superblock_fanout)
         if build_superblocks else ()
     )
-    return PrimeBlockPlan(blocks=blocks, superblocks=superblocks)
+    return PrimeBlockPlan(primes=pool, blocks=blocks, superblocks=superblocks)
 
 
-def _strip_prime_block(residual: mpz, inside: dict, block, stats) -> mpz:
-    """Remove all prime factors from *block* that divide *residual*."""
-    for q in block.primes:
+def _strip_prime_block(residual: mpz, inside: dict, plan, block, stats) -> mpz:
+    """Remove all factors represented by one positive leaf block."""
+    for idx in range(block.start, block.stop):
         if residual == 1:
             break
+        q = int(plan.primes[idx])
         if residual % q != 0:
             continue
         residual, exponent = _remove_all(residual, q)
@@ -228,7 +233,7 @@ def _strip_prime_block(residual: mpz, inside: dict, block, stats) -> mpz:
 
 
 def _scan_blocks_flat(residual: mpz, inside: dict, plan, stats) -> mpz:
-    """Flat scanner: iterate every leaf block (correctness oracle)."""
+    """Flat correctness-oracle scanner."""
     for block in plan.blocks:
         if residual == 1:
             break
@@ -236,7 +241,7 @@ def _scan_blocks_flat(residual: mpz, inside: dict, plan, stats) -> mpz:
         if gmpy2.gcd(residual, block.product) == 1:
             continue
         stats["positive_blocks"] += 1
-        residual = _strip_prime_block(residual, inside, block, stats)
+        residual = _strip_prime_block(residual, inside, plan, block, stats)
     return residual
 
 
@@ -258,7 +263,7 @@ def _scan_blocks_hierarchical(residual: mpz, inside: dict, plan, stats) -> mpz:
             if gmpy2.gcd(residual, blocks[idx].product) == 1:
                 continue
             stats["positive_blocks"] += 1
-            residual = _strip_prime_block(residual, inside, blocks[idx], stats)
+            residual = _strip_prime_block(residual, inside, plan, blocks[idx], stats)
     return residual
 
 
@@ -312,7 +317,6 @@ class SigmaPoolAnalyzer:
         """Return the block plan for *exp*, filtered by necessary-order condition."""
         n = exp + 1
         if n % 2 == 0:
-            # All even n share the same full-pool plan (no filter benefit).
             if self._full_plan is None:
                 self._full_plan = build_prime_block_plan(
                     self.primes,
@@ -326,8 +330,12 @@ class SigmaPoolAnalyzer:
         cached = self._plans_by_n.get(n)
         if cached is not None:
             return cached
-        eligible = [q for q in self.primes
-                    if n % q == 0 or math.gcd(q - 1, n) > 1]
+        eligible = array("I")
+        append = eligible.append
+        for raw_q in self.primes:
+            q = int(raw_q)
+            if n % q == 0 or math.gcd(q - 1, n) > 1:
+                append(q)
         plan = build_prime_block_plan(
             self.primes,
             block_size=self.block_size,

@@ -20,21 +20,17 @@ from gmpy2 import mpz
 
 from opn_core import (
     CHECKPOINT_INTERVAL_SECONDS,
-    CLONE_STATS,
     EAGER_POOL_PLAN_BUILD,
     ENABLE_FERMAT_DEBT,
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
-    PERF_STATS,
     POOL_GCD_MODE,
     POOL_PLAN_CHUNK_PRIMES,
     POOL_SUPERBLOCK_FANOUT,
     SEARCH_MODE,
-    PRUNE_STATS,
-    SIGMA_POOL_STATS,
     SigmaPoolAnalyzer,
     TOXIC_SKIP,
-    WINDOW_KNOWN_HITS,
+    _sigma_map_perf,
     check_touchard,
     euler_max_exp_capacity,
     even_max_exp_capacity,
@@ -48,6 +44,12 @@ from opn_core import (
     touchard_force_3,
     valid_euler_exponents,
     valid_even_exponents,
+)
+from opn_metrics import (
+    CloneEffect,
+    PruneMechanism,
+    PruneReason,
+    RunMetrics,
 )
 from opn_state import (
     ChainState,
@@ -138,10 +140,12 @@ def search_opn(
     primes: List[int],
     max_factors: int,
     max_exp: int,
+    *,
+    metrics: RunMetrics,
+    propagate: bool = True,
     state_holder: Optional[dict] = None,
     resume_state: Optional[dict] = None,
-    *,
-    propagate: bool = True,
+    observer = None,
     progress_callback=None,
     checkpoint_callback=None,
     checkpoint_interval_seconds: Optional[float] = CHECKPOINT_INTERVAL_SECONDS,
@@ -150,26 +154,28 @@ def search_opn(
 ):
     """Generator yielding State objects for each candidate found.
 
-    *propagate* selects DFSState (False) or ChainState (True).
-    *use_cache* enables sound exact-state deduplication.
-    *checkpoint_callback* runs synchronously at stable frontier boundaries.
-    *stop_requested* is polled between fully processed states.
+    *metrics* is the single RunMetrics sink for all observability data.
+    *observer* is an optional RuntimeSampler for periodic RSS/rate CSV.
     """
     n = len(primes)
     seen_states = set() if use_cache else None
     use_heap = propagate
 
+    # Wire sigma_map performance bridge
+    import opn_core
+    opn_core._sigma_map_perf = metrics.performance
+
     # ── pool-aware sigma analyser (OPN chain mode only) ──
     sigma_pool_analyzer = None
     if propagate and SEARCH_MODE.target_num == 2 and SEARCH_MODE.target_den == 1:
-        SIGMA_POOL_STATS.clear()
         sigma_pool_analyzer = SigmaPoolAnalyzer(
             primes,
             block_size=256,
             superblock_fanout=POOL_SUPERBLOCK_FANOUT,
             gcd_mode=POOL_GCD_MODE,
             plan_chunk_primes=POOL_PLAN_CHUNK_PRIMES,
-            stats=SIGMA_POOL_STATS,
+            pool_perf=metrics.performance.pool,
+            structure=metrics.structure,
         )
 
     print("using exact factor-slot tail bounds", flush=True)
@@ -197,6 +203,9 @@ def search_opn(
             flush=True,
         )
 
+        if observer is not None:
+            observer.set_phase("plan_prebuild")
+
         plan_started = time.perf_counter()
 
         sigma_pool_analyzer.prebuild_plans(
@@ -207,13 +216,23 @@ def search_opn(
             time.perf_counter() - plan_started
         )
 
+        if observer is not None:
+            observer.capture_memory_phase(
+                metrics.performance.memory_phases,
+                "after_plan_prebuild",
+            )
+            observer.set_phase("search")
+
         print(
             "[init] sigma-pool plans ready: "
-            f"filtered={SIGMA_POOL_STATS.get('filtered_plan_count', 0)}, "
-            f"full={SIGMA_POOL_STATS.get('full_plan_built', 0)}, "
+            f"filtered={metrics.performance.pool.filtered_plan_count}, "
+            f"full={int(metrics.performance.pool.full_plan_built)}, "
             f"time={plan_elapsed:.3f}s",
             flush=True,
         )
+
+    if observer is not None:
+        observer.set_phase("search")
 
     if resume_state is not None:
         heap = resume_state["heap"]
@@ -303,6 +322,8 @@ def search_opn(
     _last_progress = 0.0
 
     # ── main loop ──
+    states_started = 0
+    states_completed = 0
     while heap:
         if stop_requested is not None and stop_requested():
             _publish_frontier("stop")
@@ -316,235 +337,278 @@ def search_opn(
             _publish_frontier("periodic")
 
         st = _pop(heap)
+        states_started += 1
 
-        if seen_states is not None:
-            signature = _state_signature(st)
-            if signature in seen_states:
-                PRUNE_STATS["exact_duplicate"] += 1
-                continue
-            seen_states.add(signature)
+        try:
+            if seen_states is not None:
+                signature = _state_signature(st)
+                if signature in seen_states:
+                    metrics.record_prune(
+                        reason=PruneReason.DUPLICATE_STATE,
+                        mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                        clone_effect=CloneEffect.AVOIDED,
+                    )
+                    continue
+                seen_states.add(signature)
 
-        total_states += 1
-        if state_holder is not None:
-            state_holder["live_total_states"] = total_states
-            state_holder["live_elapsed"] = time.time() - t0
-            state_holder["frontier_size"] = len(heap)
-        if progress_callback is not None:
-            elapsed = time.time() - t0
-            if total_states == 1 or elapsed - _last_progress >= 1.0:
-                progress_callback(total_states, st, elapsed)
-                _last_progress = elapsed
+            total_states += 1
+            if state_holder is not None:
+                state_holder["live_total_states"] = total_states
+                state_holder["live_elapsed"] = time.time() - t0
+                state_holder["frontier_size"] = len(heap)
+            if progress_callback is not None:
+                elapsed = time.time() - t0
+                if total_states == 1 or elapsed - _last_progress >= 1.0:
+                    progress_callback(total_states, st, elapsed)
+                    _last_progress = elapsed
 
-        # ── true-OPN check ──
-        if (
-            st.ratio_num * SEARCH_MODE.target_den == SEARCH_MODE.target_num * st.ratio_den
-            and (not SEARCH_MODE.require_euler or st.euler_prime is not None)
-            and len(st.assigned) >= 2
-            and (not SEARCH_MODE.require_euler or check_touchard(st.euler_prime, st.assigned, st.excluded))
-            and _verify_solution(st)
-        ):
-            st.spoof = False
-            _publish_frontier("solution")
-            yield st
-            continue
-
-        # ── spoof check ──
-        if _check_spoof(st):
-            if use_heap:
-                # ponytail: chain-mode spoof is non-terminal;
-                # don't snapshot the frontier without st or its successors.
-                # Periodic checkpoint covers the live frontier.
-                pass
-            else:
-                _publish_frontier("solution")
-            yield st
-            if not use_heap:
-                continue  # DFS: spoof is the end goal; stop expansion
-            # chain mode: spoof state may still expand to a true OPN
-
-        # ── pruning ──
-        if st.ratio_num * SEARCH_MODE.target_den >= SEARCH_MODE.target_num * st.ratio_den:
-            continue
-        if len(st.assigned) >= max_factors:
-            continue
-
-        k_remain = max_factors - len(st.assigned)
-
-        # Touchard can force 3 even when it lies before next_idx. Enqueue it
-        # before both ratio bounds so the mandatory component is never omitted.
-        if use_heap and touchard_force_3(st.euler_prime, st.assigned,
-                                         st.excluded):
-            _enqueue_pending(st, 3)
-
-        live_pending = (
-            {q for q in st.pending if q not in st.assigned}
-            if use_heap else set()
-        )
-        if use_heap:
-            if any(q > primes[-1] for q in live_pending):
-                PRUNE_STATS["maxprime"] += 1
-                continue
-            if live_pending & st.excluded:
-                PRUNE_STATS["pending_excluded"] += 1
-                continue
-            if len(live_pending) > k_remain:
-                PRUNE_STATS["factor_slots"] += 1
-                continue
-
-        lb_num, lb_den = ratio_lower_bound(
-            st.ratio_num, st.ratio_den,
-            live_pending,
-        )
-        if lb_num * SEARCH_MODE.target_den > SEARCH_MODE.target_num * lb_den:
-            continue
-
-        _t0 = time.perf_counter_ns()
-        ub_num, ub_den = ratio_upper_bound(
-            st.ratio_num, st.ratio_den,
-            st.assigned, st.excluded, primes,
-            next_idx=st.next_idx,
-            remaining_slots=k_remain,
-            pending=live_pending,
-        )
-        PERF_STATS["ratio_upper_ns"] += time.perf_counter_ns() - _t0
-        PERF_STATS["ratio_upper_calls"] += 1
-        if ub_num * SEARCH_MODE.target_den < SEARCH_MODE.target_num * ub_den:
-            PRUNE_STATS["ratio_upper"] += 1
-            continue
-
-        if use_heap and ENABLE_FERMAT_DEBT:
-            _t1 = time.perf_counter_ns()
-            debt_ok, _debt_detail = fermat_debt_capacity(
-                st, primes, max_factors, max_exp,
-            )
-            PERF_STATS["fermat_debt_ns"] += time.perf_counter_ns() - _t1
-            PERF_STATS["fermat_debt_calls"] += 1
-            if not debt_ok:
-                PRUNE_STATS["fermat_debt"] += 1
-                continue
-
-        # ── pending (chain mode) ──
-        if use_heap:
-            if _drain_and_process_pending(
-                st, heap, primes, max_exp, _push, k_remain,
-                sigma_pool_analyzer=sigma_pool_analyzer,
+            # ── true-OPN check ──
+            if (
+                st.ratio_num * SEARCH_MODE.target_den == SEARCH_MODE.target_num * st.ratio_den
+                and (not SEARCH_MODE.require_euler or st.euler_prime is not None)
+                and len(st.assigned) >= 2
+                and (not SEARCH_MODE.require_euler or check_touchard(st.euler_prime, st.assigned, st.excluded))
+                and _verify_solution(st)
             ):
+                st.spoof = False
+                _publish_frontier("solution")
+                yield st
                 continue
 
-        # ── expansion ──
-        # Interval bounds skip candidates that necessarily overshoot or cannot
-        # reach the target even with the best remaining factor slots.
-        lo = 0
-        if use_heap:
-            lo = next_prime_lower_bound(st.ratio_num, st.ratio_den,
-                                        SEARCH_MODE.target_num, SEARCH_MODE.target_den)
-        idx = st.next_idx
-        while idx < n:
-            p = primes[idx]
-            if p in st.assigned or p in st.excluded:
-                idx += 1
+            # ── spoof check ──
+            if _check_spoof(st):
+                if use_heap:
+                    pass
+                else:
+                    _publish_frontier("solution")
+                yield st
+                if not use_heap:
+                    continue
+
+            # ── pruning ──
+            if st.ratio_num * SEARCH_MODE.target_den >= SEARCH_MODE.target_num * st.ratio_den:
                 continue
-            if lo > 0 and p < lo:
-                PRUNE_STATS["interval_lo"] += 1
-                idx += 1; continue   # too small to reach target
+            if len(st.assigned) >= max_factors:
+                continue
+
+            k_remain = max_factors - len(st.assigned)
+
+            if use_heap and touchard_force_3(st.euler_prime, st.assigned,
+                                             st.excluded):
+                _enqueue_pending(st, 3)
+
+            live_pending = (
+                {q for q in st.pending if q not in st.assigned}
+                if use_heap else set()
+            )
             if use_heap:
-                hi = next_prime_upper_bound(
-                    st.ratio_num,
-                    st.ratio_den,
-                    idx,
-                    k_remain,
-                    SEARCH_MODE.target_num,
-                    SEARCH_MODE.target_den,
-                    primes,
-                    st.assigned,
-                    st.excluded,
+                if any(q > primes[-1] for q in live_pending):
+                    metrics.record_prune(
+                        reason=PruneReason.OUTSIDE_WINDOW,
+                        mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                        clone_effect=CloneEffect.AVOIDED,
+                    )
+                    continue
+                if live_pending & st.excluded:
+                    metrics.record_prune(
+                        reason=PruneReason.EXCLUDED_PRIME,
+                        mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                        clone_effect=CloneEffect.AVOIDED,
+                    )
+                    continue
+                if len(live_pending) > k_remain:
+                    metrics.record_prune(
+                        reason=PruneReason.FACTOR_SLOTS,
+                        mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                        clone_effect=CloneEffect.AVOIDED,
+                    )
+                    continue
+
+            lb_num, lb_den = ratio_lower_bound(
+                st.ratio_num, st.ratio_den,
+                live_pending,
+            )
+            if lb_num * SEARCH_MODE.target_den > SEARCH_MODE.target_num * lb_den:
+                continue
+
+            _t0 = time.perf_counter_ns()
+            ub_num, ub_den = ratio_upper_bound(
+                st.ratio_num, st.ratio_den,
+                st.assigned, st.excluded, primes,
+                next_idx=st.next_idx,
+                remaining_slots=k_remain,
+                pending=live_pending,
+            )
+            perf = metrics.performance
+            perf.ratio_upper_ns += time.perf_counter_ns() - _t0
+            perf.ratio_upper_calls += 1
+            if ub_num * SEARCH_MODE.target_den < SEARCH_MODE.target_num * ub_den:
+                metrics.record_prune(
+                    reason=PruneReason.RATIO_UNREACHABLE,
+                    mechanism=PruneMechanism.TAIL_RATIO_BOUND,
+                    clone_effect=CloneEffect.AVOIDED,
                 )
-                if hi > 0 and p > hi:
-                    PRUNE_STATS["interval_hi"] += 1
-                    break
+                continue
 
-            # capacity bound: OPN target mode only (not friend-of-10);
-            # p must be >= all already-assigned primes to be the max
-            capacity_enabled = (
-                SEARCH_MODE.require_euler
-                and SEARCH_MODE.target_num == 2
-                and SEARCH_MODE.target_den == 1
-            )
-            is_max_candidate = (
-                capacity_enabled
-                and k_remain == 1
-                and (not use_heap or not st.pending)
-                and all(p >= q for q in st.assigned)
-            )
-            if is_max_candidate:
-                raw_cap = max_prime_capacity(p)
-                euler_cap = euler_max_exp_capacity(raw_cap)
-                even_cap = even_max_exp_capacity(raw_cap)
+            if use_heap and ENABLE_FERMAT_DEBT:
+                _t1 = time.perf_counter_ns()
+                debt_ok, _debt_detail = fermat_debt_capacity(
+                    st, primes, max_factors, max_exp,
+                )
+                perf.fermat_debt_ns += time.perf_counter_ns() - _t1
+                perf.fermat_debt_calls += 1
+                if not debt_ok:
+                    metrics.record_prune(
+                        reason=PruneReason.VALUATION_CONTRADICTION,
+                        mechanism=PruneMechanism.PRECLONE_VALUATION,
+                        clone_effect=CloneEffect.AVOIDED,
+                    )
+                    continue
 
-            # skip branch
-            skip_st = st.clone()
-            skip_st.excluded.add(p)
-            skip_st.next_idx = idx + 1
-            _push(heap, skip_st)
+            # ── pending (chain mode) ──
+            if use_heap:
+                if _drain_and_process_pending(
+                    st, heap, primes, max_exp, _push, k_remain,
+                    sigma_pool_analyzer=sigma_pool_analyzer,
+                    metrics=metrics,
+                ):
+                    continue
 
-            # Euler-include
-            if st.euler_prime is None and p % 4 == 1:
-                for e in reversed(valid_euler_exponents(1, max_exp)):
-                    if is_max_candidate and e > euler_cap:
-                        PRUNE_STATS["capacity_bound"] += 1
-                        CLONE_STATS["saved"] += 1
+            # ── expansion ──
+            lo = 0
+            if use_heap:
+                lo = next_prime_lower_bound(st.ratio_num, st.ratio_den,
+                                            SEARCH_MODE.target_num, SEARCH_MODE.target_den)
+            idx = st.next_idx
+            while idx < n:
+                p = primes[idx]
+                if p in st.assigned or p in st.excluded:
+                    idx += 1
+                    continue
+                if lo > 0 and p < lo:
+                    metrics.record_prune(
+                        reason=PruneReason.RATIO_OVERSHOOT,
+                        mechanism=PruneMechanism.INTERVAL_BOUND,
+                        clone_effect=CloneEffect.AVOIDED,
+                    )
+                    idx += 1; continue
+                if use_heap:
+                    hi = next_prime_upper_bound(
+                        st.ratio_num, st.ratio_den, idx, k_remain,
+                        SEARCH_MODE.target_num, SEARCH_MODE.target_den,
+                        primes, st.assigned, st.excluded,
+                    )
+                    if hi > 0 and p > hi:
+                        metrics.record_prune(
+                            reason=PruneReason.RATIO_UNREACHABLE,
+                            mechanism=PruneMechanism.INTERVAL_BOUND,
+                            clone_effect=CloneEffect.AVOIDED,
+                        )
+                        break
+
+                capacity_enabled = (
+                    SEARCH_MODE.require_euler
+                    and SEARCH_MODE.target_num == 2
+                    and SEARCH_MODE.target_den == 1
+                )
+                is_max_candidate = (
+                    capacity_enabled
+                    and k_remain == 1
+                    and (not use_heap or not st.pending)
+                    and all(p >= q for q in st.assigned)
+                )
+                if is_max_candidate:
+                    raw_cap = max_prime_capacity(p)
+                    euler_cap = euler_max_exp_capacity(raw_cap)
+                    even_cap = even_max_exp_capacity(raw_cap)
+
+                # skip branch
+                skip_st = st.clone()
+                metrics.record_clone(len(st.assigned))
+                skip_st.excluded.add(p)
+                skip_st.next_idx = idx + 1
+                _push(heap, skip_st)
+
+                # Euler-include
+                if st.euler_prime is None and p % 4 == 1:
+                    for e in reversed(valid_euler_exponents(1, max_exp)):
+                        if is_max_candidate and e > euler_cap:
+                            metrics.record_prune(
+                                reason=PruneReason.CAPACITY_BOUND,
+                                mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                                clone_effect=CloneEffect.AVOIDED,
+                            )
+                            continue
+                        if _terminal_prune(st, p, e, k_remain, metrics):
+                            continue
+                        new_num = mpz(st.ratio_num) * sigma_prime_power(p, e)
+                        new_den = mpz(st.ratio_den) * power_pa(p, e)
+                        if new_num * SEARCH_MODE.target_den > SEARCH_MODE.target_num * new_den:
+                            metrics.record_prune(
+                                reason=PruneReason.RATIO_OVERSHOOT,
+                                mechanism=PruneMechanism.PROSPECTIVE_RATIO,
+                                clone_effect=CloneEffect.AVOIDED,
+                            )
+                            continue
+                        if sigma_pool_analyzer is not None and sigma_pool_analyzer.is_known_outside(p, e):
+                            metrics.record_prune(
+                                reason=PruneReason.OUTSIDE_WINDOW,
+                                mechanism=PruneMechanism.KNOWN_OUTSIDE_CACHE,
+                                clone_effect=CloneEffect.AVOIDED,
+                            )
+                            continue
+                        ns = _assign(st, p, e, use_heap, propagate, max_exp,
+                                       prime_limit=primes[-1],
+                                       sigma_pool_analyzer=sigma_pool_analyzer,
+                                       metrics=metrics)
+                        if ns is not None:
+                            ns.next_idx = idx + 1
+                            _push(heap, ns)
+
+                # non-Euler include
+                for e in reversed(valid_even_exponents(2, max_exp)):
+                    if is_max_candidate and e > even_cap:
+                        metrics.record_prune(
+                            reason=PruneReason.CAPACITY_BOUND,
+                            mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                            clone_effect=CloneEffect.AVOIDED,
+                        )
                         continue
-                    if _terminal_prune(st, p, e, k_remain):
+                    if _terminal_prune(st, p, e, k_remain, metrics):
                         continue
-                    # Prospective ratio: attribute to mathematical cause
-                    # before the pool-analyser fast path.
                     new_num = mpz(st.ratio_num) * sigma_prime_power(p, e)
                     new_den = mpz(st.ratio_den) * power_pa(p, e)
                     if new_num * SEARCH_MODE.target_den > SEARCH_MODE.target_num * new_den:
-                        PRUNE_STATS["ratio"] += 1
-                        CLONE_STATS["saved"] += 1
+                        metrics.record_prune(
+                            reason=PruneReason.RATIO_OVERSHOOT,
+                            mechanism=PruneMechanism.PROSPECTIVE_RATIO,
+                            clone_effect=CloneEffect.AVOIDED,
+                        )
                         continue
                     if sigma_pool_analyzer is not None and sigma_pool_analyzer.is_known_outside(p, e):
-                        PRUNE_STATS["window_known"] += 1
-                        WINDOW_KNOWN_HITS[(p, e)] += 1
-                        CLONE_STATS["saved"] += 1
+                        metrics.record_prune(
+                            reason=PruneReason.OUTSIDE_WINDOW,
+                            mechanism=PruneMechanism.KNOWN_OUTSIDE_CACHE,
+                            clone_effect=CloneEffect.AVOIDED,
+                        )
                         continue
                     ns = _assign(st, p, e, use_heap, propagate, max_exp,
                                    prime_limit=primes[-1],
-                                   sigma_pool_analyzer=sigma_pool_analyzer)
+                                   sigma_pool_analyzer=sigma_pool_analyzer,
+                                   metrics=metrics)
                     if ns is not None:
                         ns.next_idx = idx + 1
                         _push(heap, ns)
 
-            # non-Euler include
-            for e in reversed(valid_even_exponents(2, max_exp)):
-                if is_max_candidate and e > even_cap:
-                    PRUNE_STATS["capacity_bound"] += 1
-                    CLONE_STATS["saved"] += 1
-                    continue
-                if _terminal_prune(st, p, e, k_remain):
-                    continue
-                # Prospective ratio before pool-analyser fast path
-                new_num = mpz(st.ratio_num) * sigma_prime_power(p, e)
-                new_den = mpz(st.ratio_den) * power_pa(p, e)
-                if new_num * SEARCH_MODE.target_den > SEARCH_MODE.target_num * new_den:
-                    PRUNE_STATS["ratio"] += 1
-                    CLONE_STATS["saved"] += 1
-                    continue
-                # known-outside fast path: skip assign_prime_chain entirely
-                if sigma_pool_analyzer is not None and sigma_pool_analyzer.is_known_outside(p, e):
-                    PRUNE_STATS["window_known"] += 1
-                    WINDOW_KNOWN_HITS[(p, e)] += 1
-                    CLONE_STATS["saved"] += 1
-                    continue
-                ns = _assign(st, p, e, use_heap, propagate, max_exp,
-                               prime_limit=primes[-1],
-                               sigma_pool_analyzer=sigma_pool_analyzer)
-                if ns is not None:
-                    ns.next_idx = idx + 1
-                    _push(heap, ns)
-
-            break
+                break
+        finally:
+            states_completed += 1
+            if observer is not None:
+                observer.update_progress(
+                    states_started=states_started,
+                    states_completed=states_completed,
+                    frontier_size=len(heap),
+                )
 
     # ── exhausted ──
     elapsed = time.time() - t0
@@ -555,21 +619,19 @@ def search_opn(
 
 # ── terminal-slot pruning ─────────────────────────────────────
 
-def _terminal_prune(st, p, exp, k_remain) -> bool:
-    """Pre-clone prune for the last factor slot.  Returns True if pruned.
-
-    When ``k_remain == 1`` this assignment exhausts all free slots.
-    The exact ratio must match the target; for OPN mode an Euler prime
-    must have been selected before the last even exponent is assigned.
-    """
+def _terminal_prune(st, p, exp, k_remain, metrics: RunMetrics) -> bool:
+    """Pre-clone prune for the last factor slot.  Returns True if pruned."""
     if k_remain != 1:
         return False
 
     new_num = st.ratio_num * sigma_prime_power(p, exp)
     new_den = st.ratio_den * power_pa(p, exp)
     if new_num * SEARCH_MODE.target_den != SEARCH_MODE.target_num * new_den:
-        PRUNE_STATS["terminal_ratio"] += 1
-        CLONE_STATS["saved"] += 1
+        metrics.record_prune(
+            reason=PruneReason.TERMINAL_RATIO,
+            mechanism=PruneMechanism.TERMINAL_CHECK,
+            clone_effect=CloneEffect.AVOIDED,
+        )
         return True
 
     if (
@@ -577,8 +639,11 @@ def _terminal_prune(st, p, exp, k_remain) -> bool:
         and st.euler_prime is None
         and exp % 2 == 0
     ):
-        PRUNE_STATS["terminal_no_euler"] += 1
-        CLONE_STATS["saved"] += 1
+        metrics.record_prune(
+            reason=PruneReason.TERMINAL_NO_EULER,
+            mechanism=PruneMechanism.TERMINAL_CHECK,
+            clone_effect=CloneEffect.AVOIDED,
+        )
         return True
 
     return False
@@ -586,24 +651,35 @@ def _terminal_prune(st, p, exp, k_remain) -> bool:
 
 # ── polymorphic assign dispatch ──────────────────────────────
 
-def _assign(st: State, p: int, exp: int, use_heap: bool,
-            propagate: bool, max_exp: int,
-            prime_limit: int | None = None,
-            sigma_pool_analyzer=None) -> Optional[State]:
+def _assign(
+    st: State, p: int, exp: int, use_heap: bool,
+    propagate: bool, max_exp: int,
+    *,
+    metrics: RunMetrics,
+    prime_limit: int | None = None,
+    sigma_pool_analyzer=None,
+) -> Optional[State]:
     """Dispatch to DFSState or ChainState assign function."""
     if use_heap:
-        return assign_prime_chain(st, p, exp, propagate=propagate,
-                                   max_exp=max_exp, prime_limit=prime_limit,
-                                   sigma_pool_analyzer=sigma_pool_analyzer)
+        return assign_prime_chain(
+            st, p, exp,
+            metrics=metrics,
+            propagate=propagate,
+            max_exp=max_exp,
+            prime_limit=prime_limit,
+            sigma_pool_analyzer=sigma_pool_analyzer,
+        )
     else:
-        return assign_prime_dfs(st, p, exp, max_exp=max_exp)
+        return assign_prime_dfs(st, p, exp, metrics=metrics, max_exp=max_exp)
 
 
 # ── pending processing (chain mode) ──────────────────────────
 
 def _drain_and_process_pending(
     st: ChainState, heap, primes, max_exp: int, _push, k_remain: int,
+    *,
     sigma_pool_analyzer=None,
+    metrics: RunMetrics,
 ) -> bool:
     if not st.pending:
         return False
@@ -615,8 +691,12 @@ def _drain_and_process_pending(
         q = st.pending.popleft()
         st.pending_set.discard(q)
         if q > primes[-1]:
-            PRUNE_STATS["maxprime"] += 1
-            return True   # forced prime beyond window → prune state
+            metrics.record_prune(
+                reason=PruneReason.OUTSIDE_WINDOW,
+                mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                clone_effect=CloneEffect.AVOIDED,
+            )
+            return True
 
     if not st.pending:
         return False
@@ -630,9 +710,6 @@ def _drain_and_process_pending(
         1,
     )
 
-    # capacity bound: q is the max if this is the last slot,
-    # q >= all assigned primes, and q >= all remaining pending.
-    # Only active in OPN target mode (not friend-of-10).
     capacity_enabled = (
         SEARCH_MODE.require_euler
         and SEARCH_MODE.target_num == 2
@@ -650,19 +727,29 @@ def _drain_and_process_pending(
             if is_max_in_pending and e > euler_max_exp_capacity(
                 max_prime_capacity(q)
             ):
-                PRUNE_STATS["capacity_bound"] += 1
-                CLONE_STATS["saved"] += 1
+                metrics.record_prune(
+                    reason=PruneReason.CAPACITY_BOUND,
+                    mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                    clone_effect=CloneEffect.AVOIDED,
+                )
                 continue
-            if _terminal_prune(st, q, e, k_remain):
+            if _terminal_prune(st, q, e, k_remain, metrics):
                 continue
             if sigma_pool_analyzer is not None and sigma_pool_analyzer.is_known_outside(q, e):
-                PRUNE_STATS["window_known"] += 1
-                WINDOW_KNOWN_HITS[(q, e)] += 1
-                CLONE_STATS["saved"] += 1
+                metrics.record_prune(
+                    reason=PruneReason.OUTSIDE_WINDOW,
+                    mechanism=PruneMechanism.KNOWN_OUTSIDE_CACHE,
+                    clone_effect=CloneEffect.AVOIDED,
+                )
                 continue
-            ns = assign_prime_chain(st, q, e, propagate=True, max_exp=max_exp,
-                                       prime_limit=primes[-1],
-                                       sigma_pool_analyzer=sigma_pool_analyzer)
+            ns = assign_prime_chain(
+                st, q, e,
+                metrics=metrics,
+                propagate=True,
+                max_exp=max_exp,
+                prime_limit=primes[-1],
+                sigma_pool_analyzer=sigma_pool_analyzer,
+            )
             if ns is not None:
                 _push(heap, ns)
 
@@ -670,19 +757,29 @@ def _drain_and_process_pending(
         if is_max_in_pending and e > even_max_exp_capacity(
             max_prime_capacity(q)
         ):
-            PRUNE_STATS["capacity_bound"] += 1
-            CLONE_STATS["saved"] += 1
+            metrics.record_prune(
+                reason=PruneReason.CAPACITY_BOUND,
+                mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                clone_effect=CloneEffect.AVOIDED,
+            )
             continue
-        if _terminal_prune(st, q, e, k_remain):
+        if _terminal_prune(st, q, e, k_remain, metrics):
             continue
         if sigma_pool_analyzer is not None and sigma_pool_analyzer.is_known_outside(q, e):
-            PRUNE_STATS["window_known"] += 1
-            WINDOW_KNOWN_HITS[(q, e)] += 1
-            CLONE_STATS["saved"] += 1
+            metrics.record_prune(
+                reason=PruneReason.OUTSIDE_WINDOW,
+                mechanism=PruneMechanism.KNOWN_OUTSIDE_CACHE,
+                clone_effect=CloneEffect.AVOIDED,
+            )
             continue
-        ns = assign_prime_chain(st, q, e, propagate=True, max_exp=max_exp,
-                                   prime_limit=primes[-1],
-                                   sigma_pool_analyzer=sigma_pool_analyzer)
+        ns = assign_prime_chain(
+            st, q, e,
+            metrics=metrics,
+            propagate=True,
+            max_exp=max_exp,
+            prime_limit=primes[-1],
+            sigma_pool_analyzer=sigma_pool_analyzer,
+        )
         if ns is not None:
             _push(heap, ns)
 

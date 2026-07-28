@@ -87,6 +87,8 @@ from opn_search import (
     _verify_solution,
     search_opn,
 )
+from opn_metrics import RunMetrics, PoolPerformance
+
 from opn_state import (
     ChainState,
     DFSState,
@@ -123,12 +125,12 @@ def reference_odd_primes(limit: int) -> list[int]:
 
 def analyze_with_plan(p: int, exp: int, plan, scanner):
     """Run a pool analysis using a specific block plan and scanner."""
-    from collections import Counter
+    from opn_metrics import PoolPerformance
     residual = mpz(sigma_prime_power(p, exp))
     residual, _ = _remove_all(residual, 2)
     inside = {}
-    stats = Counter()
-    residual = scanner(residual, inside, plan, stats)
+    perf = PoolPerformance()
+    residual = scanner(residual, inside, plan, perf)
     return residual, inside
 
 
@@ -516,7 +518,7 @@ class TestDFSState:
 
     def test_assign_prime_dfs(self):
         st = DFSState()
-        ns = assign_prime_dfs(st, 3, 2)
+        ns = assign_prime_dfs(st, 3, 2, metrics=RunMetrics())
         assert ns is not None
         assert ns.assigned == {3: 2}
         assert ns.ratio_num == 13
@@ -535,7 +537,7 @@ class TestChainState:
     def test_assign_prime_chain(self, small_primes):
         precompute_sig_factors(small_primes, 4)
         st = ChainState()
-        ns = assign_prime_chain(st, 3, 2, propagate=True, max_exp=4)
+        ns = assign_prime_chain(st, 3, 2, metrics=RunMetrics(), propagate=True, max_exp=4)
         assert ns is not None
         assert ns.assigned == {3: 2}
 
@@ -580,6 +582,7 @@ class TestMaxprimePrune:
 
         result = _drain_and_process_pending(
             st, heap, small_primes, max_exp=2, _push=fake_push, k_remain=5,
+            metrics=RunMetrics(),
         )
         assert result is True, "P0-1: must return True to signal prune"
         assert len(called) == 0, "no branches should be pushed"
@@ -620,7 +623,7 @@ class TestDescartesSpoof:
         """Known spoof must be found in DFS mode."""
         found = None
         for st in search_opn(small_primes, max_factors=5, max_exp=2,
-                             propagate=False):
+                             metrics=RunMetrics(), propagate=False):
             found = st
             break
         assert found is not None, "Descartes spoof not found"
@@ -630,7 +633,7 @@ class TestDescartesSpoof:
     def test_descartes_spoof_verified(self, small_primes):
         """The r-value for the Descartes spoof should be 22021."""
         for st in search_opn(small_primes, max_factors=5, max_exp=2,
-                             propagate=False):
+                             metrics=RunMetrics(), propagate=False):
             assert _verify_solution(st) is False  # spoof, not true OPN
             denom = 2 * st.ratio_den - st.ratio_num
             r = st.ratio_num // denom
@@ -646,14 +649,14 @@ class TestSearchEngine:
     def test_chain_mode_runs(self, small_primes):
         """Chain mode should not crash on small primes."""
         count = sum(1 for _ in search_opn(small_primes, max_factors=5,
-                                          max_exp=4, propagate=True))
+                                          max_exp=4, metrics=RunMetrics(), propagate=True))
         # Just verify it runs to completion
         assert isinstance(count, int)
 
     def test_dfs_mode_runs(self, small_primes):
         """DFS mode should not crash."""
         count = sum(1 for _ in search_opn(small_primes, max_factors=5,
-                                          max_exp=2, propagate=False))
+                                          max_exp=2, metrics=RunMetrics(), propagate=False))
         assert count >= 1  # at least the Descartes spoof
 
     def test_priority_computed(self):
@@ -668,7 +671,7 @@ class TestSearchEngine:
                     small_primes,
                     max_factors=5,
                     max_exp=2,
-                    propagate=False,
+                    metrics=RunMetrics(), propagate=False,
                     use_cache=use_cache,
                 )
             ]
@@ -706,7 +709,7 @@ class TestSearchEngine:
             max_factors=5,
             max_exp=4,
             state_holder=holder,
-            propagate=True,
+            metrics=RunMetrics(), propagate=True,
             checkpoint_interval_seconds=None,
         ))
 
@@ -739,7 +742,7 @@ class TestSearchEngine:
             max_factors=5,
             max_exp=2,
             state_holder={},
-            propagate=True,
+            metrics=RunMetrics(), propagate=True,
             checkpoint_callback=checkpoint_callback,
             checkpoint_interval_seconds=0.5,
         ))
@@ -765,6 +768,7 @@ class TestSearchEngine:
                 small_primes,
                 max_factors=5,
                 max_exp=2,
+                metrics=RunMetrics(),
                 state_holder=baseline_holder,
                 propagate=False,
                 checkpoint_interval_seconds=None,
@@ -787,6 +791,7 @@ class TestSearchEngine:
                     small_primes,
                     max_factors=5,
                     max_exp=2,
+                    metrics=RunMetrics(),
                     state_holder=stopped_holder,
                     propagate=False,
                     checkpoint_interval_seconds=None,
@@ -815,6 +820,7 @@ class TestSearchEngine:
                 small_primes,
                 max_factors=5,
                 max_exp=2,
+                metrics=RunMetrics(),
                 state_holder=resumed_holder,
                 resume_state=resume_state,
                 propagate=False,
@@ -833,6 +839,7 @@ class TestSearchEngine:
             small_primes,
             max_factors=5,
             max_exp=2,
+            metrics=RunMetrics(),
             state_holder=holder,
             propagate=False,
             checkpoint_interval_seconds=None,
@@ -867,6 +874,7 @@ class TestSearchEngine:
                 small_primes,
                 max_factors=5,
                 max_exp=2,
+                metrics=RunMetrics(),
                 resume_state=resume_state,
                 propagate=False,
                 checkpoint_interval_seconds=None,
@@ -940,7 +948,7 @@ class TestCapacityBound:
         """Capacity bound must not break existing DFS results."""
         found = None
         for st in search_opn(small_primes, max_factors=5, max_exp=2,
-                             propagate=False):
+                             metrics=RunMetrics(), propagate=False):
             found = st
             break
         assert found is not None
@@ -950,7 +958,7 @@ class TestCapacityBound:
     def test_chain_mode_finds_results(self, small_primes):
         """Chain mode with capacity bound should run without error."""
         count = sum(1 for _ in search_opn(small_primes, max_factors=5,
-                                          max_exp=4, propagate=True))
+                                          max_exp=4, metrics=RunMetrics(), propagate=True))
         assert isinstance(count, int)
 
 
@@ -1104,19 +1112,19 @@ class TestFriendMode:
         monkeypatch.setattr("opn_state.SEARCH_MODE", FRIEND_10_MODE)
         st = ChainState(excluded={3})
 
-        first = assign_prime_chain(st, 7, 2, propagate=True, max_exp=4)
+        first = assign_prime_chain(st, 7, 2, metrics=RunMetrics(), propagate=True, max_exp=4)
         assert first is not None
         assert first.required_v[3] == 1
         assert 3 not in first.pending_set
 
-        second = assign_prime_chain(first, 13, 2, propagate=True, max_exp=4)
+        second = assign_prime_chain(first, 13, 2, metrics=RunMetrics(), propagate=True, max_exp=4)
         assert second is not None
         assert second.required_v[3] == 2
         assert 3 not in second.pending_set
 
         # sigma(19^2) contributes a third factor of 3, exceeding v_3(9)=2.
         assert assign_prime_chain(
-            second, 19, 2, propagate=True, max_exp=4,
+            second, 19, 2, metrics=RunMetrics(), propagate=True, max_exp=4,
         ) is None
 
     def test_target_denominator_reduces_5_debt(self, monkeypatch):
@@ -1177,7 +1185,7 @@ class TestPoolAnalyzer:
         r = a.analyze(3, 2)
         assert r.exact
         assert r.valuations == {13: 1}
-        assert a.stats.get("exact_from_global_cache", 0) == 1
+        assert a._perf.exact_from_global_cache == 1
 
     def test_3511_10_never_calls_full_factorize(self, monkeypatch):
         """Regression lock: SigmaPoolAnalyzer must not call factorize()."""
@@ -1193,14 +1201,12 @@ class TestPoolAnalyzer:
         assert r.residual > 1
 
     def test_analyzer_updates_external_stats(self):
-        """External Counter receives stats from analyzer."""
-        from collections import Counter
-        stats = Counter()
-        a = SigmaPoolAnalyzer([3, 5, 7, 11, 13], stats=stats)
+        """PoolPerformance object receives stats from analyzer."""
+        pool_perf = PoolPerformance()
+        a = SigmaPoolAnalyzer([3, 5, 7, 11, 13], pool_perf=pool_perf)
         a.analyze(3, 2)
-        assert stats["misses"] == 1
-        assert stats["exact"] == 1
-        assert stats["analysis_ns"] > 0
+        assert pool_perf.misses == 1
+        assert pool_perf.analysis_ns > 0
 
     def test_blocks_for_exp_matches_full_blocks(self):
         """Filtered blocks produce identical results to full-pool analysis."""

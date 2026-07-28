@@ -11,22 +11,26 @@ import math
 import random
 import time
 from array import array
-from collections import Counter
-from functools import lru_cache
-from typing import Dict, List, Optional, Sequence, Tuple
-
 import gmpy2
 import numpy as np
 from gmpy2 import mpz
+
+from collections import Counter
+from functools import lru_cache
+from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+
+from opn_metrics import PoolPerformance
+if TYPE_CHECKING:
+    from opn_metrics import PerformanceMetrics, StructureMetrics
 
 # ── configuration ─────────────────────────────────────────────
 CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 8000000000     # largest odd prime considered
+MAX_PRIME         = 4000000000     # largest odd prime considered
 MAX_FACTORS       = 60         # max distinct prime factors in N
-MAX_EXP           = 20         # max exponent (2 = a_i=1 restriction)
+MAX_EXP           = 18         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = Descartes-spoof DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
@@ -140,39 +144,17 @@ POWER_CACHE:   Dict[Tuple[int, int], int] = {}
 FACTOR_CACHE:  Dict[int, List[Tuple[int, int]]] = {}
 _SIG_FACTORS:  Dict[Tuple[int, int], set[int]] = {}
 _SIG_VALUATIONS: Dict[Tuple[int, int], Dict[int, int]] = {}  # (p,a) → {q: v_q(σ(p^a))}
-SIGMA_MAP_STATS: "Counter[str]" = Counter()  # hits, misses, factor_seconds
-SIGMA_MISS_TIMES: "List[Tuple[int,int,int,float,int]]" = []  # (p, a, sigma_bits, seconds, max_odd_factor)
 _TOTIENT_CACHE: Dict[int, int] = {}
 _CAPACITY_CACHE: Dict[int, int] = {}
-
-# ── prune telemetry ──────────────────────────────────────────
-PRUNE_STATS:        "Counter[str]"           = Counter()
-DEPTH_STATS:        "Counter[int]"           = Counter()
-CLONE_STATS:        "Counter[str]"           = Counter()
-CONTRADICTION_ATTR: "Counter[Tuple[int,str]]" = Counter()  # (prime, reason)
-
-# ── structural telemetry ─────────────────────────────────────
-PENDING_SIZE_HIST:  "Counter[int]"           = Counter()  # pending queue size
-CASCADE_DEPTH_HIST: "Counter[int]"           = Counter()  # propagation chain length
-PROPAGATION_EDGES:  "Counter[Tuple[int,int]]"= Counter()  # (source, introduced)
-PROPAGATION_EXP_EDGES: "Counter[Tuple[int,int,int]]" = Counter()  # (source, exp, introduced)
-CLONE_PAYLOAD:      "Counter[int]"           = Counter()  # len(assigned) at clone
-RATIO_HEADROOM:     "Counter[str]"           = Counter()  # 2-ratio bucketed
-DEPTH_FACTOR_MAP:   "Counter[Tuple[int,int]]"= Counter()  # (depth, |f|) 2D histogram
-HEADROOM_BY_FACTOR: "Counter[Tuple[int,str]]"= Counter()  # (|f|, headroom_bucket)
-OBLIGATION_SIGS: "Counter[Tuple]"     = Counter()  # (frozen-pending, |f|, coarse-headroom)
-PENDING_PRIME_FREQ: "Counter[int]"    = Counter()  # global pending-prime histogram
-OUTSIDE_WINDOW_SOURCE: "Counter[Tuple[int,int,int]]" = Counter()  # (p,exp,q) that forced q>window
-SIGMA_POOL_STATS:   "Counter[str]"           = Counter()  # pool analysis telemetry
-OUTSIDE_POOL_SOURCES: "Counter[Tuple[int,int,int]]" = Counter()  # (p,exp,residual_bits)
-WINDOW_KNOWN_HITS: "Counter[Tuple[int,int]]" = Counter()  # (p,exp) → times reused via is_known_outside
-PERF_STATS: "Counter[str]" = Counter()
-ANALYZER_SLOWEST: "List[Tuple[float,int,int,int,bool]]" = []  # top-15 slowest pool analyses
 
 # ── search-policy data (derived from telemetry) ───────────────
 TOXIC_SKIP: set[int] = set()
 EXCLUDE_EXP_4: set[int] = set()        # primes whose sigma(p^4) has a factor > window
 EXP4_FILTER_HITS: "Counter[int]" = Counter()  # per-prime filter verification
+
+# ── optional performance-metrics bridge (set by search engine) ─
+_sigma_map_perf: "PerformanceMetrics | None" = None
+"""Set by the search engine before sigma_valuation_map is called in hot paths."""
 
 
 # ── prime generation ──────────────────────────────────────────
@@ -327,7 +309,7 @@ def build_filtered_prime_pools_vectorized(
     radicals: Sequence[int],
     *,
     chunk_primes: int = POOL_PLAN_CHUNK_PRIMES,
-    stats: Optional[Counter] = None,
+    pool_perf: "PoolPerformance | None" = None,
 ) -> Dict[int, np.ndarray]:
     """Build every requested radical-filtered pool in two chunked passes.
 
@@ -449,19 +431,18 @@ def build_filtered_prime_pools_vectorized(
                 f"{positions[radical]} != {counts[radical]}"
             )
 
-    if stats is not None:
-        stats["plan_filter_count_ns"] += count_ns
-        stats["plan_filter_fill_ns"] += fill_ns
-        stats["plan_filter_ns"] += count_ns + fill_ns
+    if pool_perf is not None:
+        pool_perf.plan_filter_count_ns += count_ns
+        pool_perf.plan_filter_fill_ns += fill_ns
+        pool_perf.plan_filter_ns += count_ns + fill_ns
 
-        # Two complete vectorized passes.
-        stats["plan_filter_source_values"] += (
+        pool_perf.plan_filter_source_values += (
             2 * source_count
         )
-        stats["filtered_prime_values"] = sum(
+        pool_perf.filtered_prime_values = sum(
             counts.values()
         )
-        stats["filtered_prime_bytes"] = sum(
+        pool_perf.filtered_prime_bytes = sum(
             output.nbytes
             for output in outputs.values()
         )
@@ -504,7 +485,7 @@ def build_prime_block_plan(
     superblock_fanout: int,
     eligible_primes=None,
     build_superblocks: bool = True,
-    stats: Optional[Counter] = None,
+    pool_perf: "PoolPerformance | None" = None,
 ):
     """Build a block plan over full or exponent-filtered primes."""
     pool = (
@@ -538,12 +519,12 @@ def build_prime_block_plan(
     else:
         superblocks = ()
 
-    if stats is not None:
-        stats["leaf_product_ns"] += leaf_ns
-        stats["superblock_product_ns"] += superblock_ns
-        stats["plans_built"] += 1
-        stats["plan_leaf_blocks"] += len(blocks)
-        stats["plan_superblocks"] += len(superblocks)
+    if pool_perf is not None:
+        pool_perf.leaf_product_ns += leaf_ns
+        pool_perf.superblock_product_ns += superblock_ns
+        pool_perf.plans_built += 1
+        pool_perf.plan_leaf_blocks += len(blocks)
+        pool_perf.plan_superblocks += len(superblocks)
 
     return PrimeBlockPlan(
         primes=pool,
@@ -552,7 +533,7 @@ def build_prime_block_plan(
     )
 
 
-def _strip_prime_block(residual: mpz, inside: dict, plan, block, stats) -> mpz:
+def _strip_prime_block(residual: mpz, inside: dict, plan, block, perf: "PoolPerformance") -> mpz:
     """Remove all factors represented by one positive leaf block."""
     for idx in range(block.start, block.stop):
         if residual == 1:
@@ -562,42 +543,42 @@ def _strip_prime_block(residual: mpz, inside: dict, plan, block, stats) -> mpz:
             continue
         residual, exponent = _remove_all(residual, q)
         inside[q] = inside.get(q, 0) + exponent
-        stats["pool_factors_removed"] += 1
+        perf.factors_removed += 1
     return residual
 
 
-def _scan_blocks_flat(residual: mpz, inside: dict, plan, stats) -> mpz:
+def _scan_blocks_flat(residual: mpz, inside: dict, plan, perf: "PoolPerformance") -> mpz:
     """Flat correctness-oracle scanner."""
     for block in plan.blocks:
         if residual == 1:
             break
-        stats["leaf_blocks_tested"] += 1
+        perf.leaf_blocks_tested += 1
         if gmpy2.gcd(residual, block.product) == 1:
             continue
-        stats["positive_blocks"] += 1
-        residual = _strip_prime_block(residual, inside, plan, block, stats)
+        perf.positive_blocks += 1
+        residual = _strip_prime_block(residual, inside, plan, block, perf)
     return residual
 
 
-def _scan_blocks_hierarchical(residual: mpz, inside: dict, plan, stats) -> mpz:
+def _scan_blocks_hierarchical(residual: mpz, inside: dict, plan, perf: "PoolPerformance") -> mpz:
     """Two-level scanner: superblock gcd → leaf-block gcd."""
     blocks = plan.blocks
     for sb in plan.superblocks:
         if residual == 1:
             break
-        stats["superblocks_tested"] += 1
+        perf.superblocks_tested += 1
         if gmpy2.gcd(residual, sb.product) == 1:
-            stats["leaf_blocks_skipped"] += sb.stop - sb.start
+            perf.leaf_blocks_skipped += sb.stop - sb.start
             continue
-        stats["positive_superblocks"] += 1
+        perf.positive_superblocks += 1
         for idx in range(sb.start, sb.stop):
             if residual == 1:
                 break
-            stats["leaf_blocks_tested"] += 1
+            perf.leaf_blocks_tested += 1
             if gmpy2.gcd(residual, blocks[idx].product) == 1:
                 continue
-            stats["positive_blocks"] += 1
-            residual = _strip_prime_block(residual, inside, plan, blocks[idx], stats)
+            perf.positive_blocks += 1
+            residual = _strip_prime_block(residual, inside, plan, blocks[idx], perf)
     return residual
 
 
@@ -613,7 +594,8 @@ class SigmaPoolAnalyzer:
                  superblock_fanout: int = 16,
                  gcd_mode: str = "flat",
                  plan_chunk_primes: int = POOL_PLAN_CHUNK_PRIMES,
-                 stats=None) -> None:
+                 pool_perf: "PoolPerformance | None" = None,
+                 structure: "StructureMetrics | None" = None) -> None:
         if not primes:
             raise ValueError("prime pool must not be empty")
         if int(primes[0]) != 3:
@@ -643,12 +625,11 @@ class SigmaPoolAnalyzer:
         # Single shared full-pool plan for even n (no filter benefit)
         self._full_plan: PrimeBlockPlan | None = None
         # Plans are keyed by rad(exp + 1), not exp + 1 itself.
-        # Example: exp=2 (n=3) and exp=8 (n=9) share one plan.
         self._plans_by_radical: Dict[int, PrimeBlockPlan] = {}
 
         self._cache: Dict[Tuple[int, int], SigmaPoolAnalysis] = {}
-        self.stats: "Counter[str]" = stats if stats is not None else Counter()
-        self.slowest: List[Tuple[float, int, int, int, bool]] = []
+        self._perf: "PoolPerformance" = pool_perf if pool_perf is not None else PoolPerformance()
+        self._structure: "StructureMetrics | None" = structure
 
     def prebuild_plans(
         self,
@@ -686,7 +667,7 @@ class SigmaPoolAnalyzer:
                     self.primes,
                     missing_radicals,
                     chunk_primes=self.plan_chunk_primes,
-                    stats=self.stats,
+                    pool_perf=self._perf,
                 )
             )
 
@@ -698,7 +679,7 @@ class SigmaPoolAnalyzer:
                         superblock_fanout=self.superblock_fanout,
                         eligible_primes=filtered_pools[radical],
                         build_superblocks=self._use_superblocks,
-                        stats=self.stats,
+                        pool_perf=self._perf,
                     )
                 )
 
@@ -709,26 +690,17 @@ class SigmaPoolAnalyzer:
                 superblock_fanout=self.superblock_fanout,
                 eligible_primes=None,
                 build_superblocks=self._use_superblocks,
-                stats=self.stats,
+                pool_perf=self._perf,
             )
 
-        self.stats["filtered_plan_count"] = len(
-            self._plans_by_radical
-        )
-        self.stats["full_plan_built"] = int(
-            self._full_plan is not None
-        )
-
-        self.stats["plan_prebuild_ns"] += (
-            time.perf_counter_ns() - started
-        )
+        self._perf.filtered_plan_count = len(self._plans_by_radical)
+        self._perf.full_plan_built = self._full_plan is not None
+        self._perf.plan_prebuild_ns += (time.perf_counter_ns() - started)
 
     def plan_for_exp(self, exp: int) -> PrimeBlockPlan:
         """Return the necessary-order block plan for one exponent."""
         n = exp + 1
 
-        # When n is even, every odd q has gcd(q-1, n) >= 2.
-        # Therefore the complete prime pool is required.
         if n % 2 == 0:
             if self._full_plan is None:
                 self._full_plan = build_prime_block_plan(
@@ -737,25 +709,20 @@ class SigmaPoolAnalyzer:
                     superblock_fanout=self.superblock_fanout,
                     eligible_primes=None,
                     build_superblocks=self._use_superblocks,
-                    stats=self.stats,
+                    pool_perf=self._perf,
                 )
-
             return self._full_plan
 
         radical = squarefree_kernel(n)
-
         cached = self._plans_by_radical.get(radical)
-
         if cached is not None:
             return cached
 
-        # Correct fallback when eager prebuild is disabled or a new exponent
-        # is requested dynamically.
         filtered = build_filtered_prime_pools_vectorized(
             self.primes,
             [radical],
             chunk_primes=self.plan_chunk_primes,
-            stats=self.stats,
+            pool_perf=self._perf,
         )[radical]
 
         plan = build_prime_block_plan(
@@ -764,24 +731,21 @@ class SigmaPoolAnalyzer:
             superblock_fanout=self.superblock_fanout,
             eligible_primes=filtered,
             build_superblocks=self._use_superblocks,
-            stats=self.stats,
+            pool_perf=self._perf,
         )
 
         self._plans_by_radical[radical] = plan
-        self.stats["filtered_plan_count"] = len(
-            self._plans_by_radical
-        )
-
+        self._perf.filtered_plan_count = len(self._plans_by_radical)
         return plan
 
     def analyze(self, p: int, exp: int) -> SigmaPoolAnalysis:
         key = (p, exp)
         cached = self._cache.get(key)
         if cached is not None:
-            self.stats["hits"] += 1
+            self._perf.hits += 1
             return cached
 
-        self.stats["misses"] += 1
+        self._perf.misses += 1
         started = time.perf_counter()
 
         # Fast path: a globally exact factorisation already exists
@@ -790,7 +754,7 @@ class SigmaPoolAnalyzer:
             outside = next((q for q in exact_cached if q > self.prime_limit), None)
             if outside is None:
                 result = SigmaPoolAnalysis(exact=True, valuations=exact_cached, residual=mpz(1))
-                self.stats["exact_from_global_cache"] += 1
+                self._perf.exact_from_global_cache += 1
             else:
                 result = SigmaPoolAnalysis(
                     exact=False,
@@ -798,7 +762,7 @@ class SigmaPoolAnalyzer:
                     residual=mpz(outside),
                     outside_witness=outside,
                 )
-                self.stats["outside_from_global_cache"] += 1
+                self._perf.outside_from_global_cache += 1
             self._cache[key] = result
             return result
 
@@ -807,38 +771,28 @@ class SigmaPoolAnalyzer:
         inside: Dict[int, int] = {}
 
         plan = self.plan_for_exp(exp)
-        self.stats["candidate_leaf_blocks"] += len(plan.blocks)
+        self._perf.candidate_leaf_blocks += len(plan.blocks)
 
         scan_started = time.perf_counter_ns()
-
-        residual = self._scan(
-            residual,
-            inside,
-            plan,
-            self.stats,
-        )
-
-        self.stats["cold_scan_ns"] += (
-            time.perf_counter_ns() - scan_started
-        )
-        # backward-compat alias
-        self.stats["blocks_tested"] = self.stats["leaf_blocks_tested"]
+        residual = self._scan(residual, inside, plan, self._perf)
+        self._perf.cold_scan_ns += (time.perf_counter_ns() - scan_started)
 
         if residual == 1:
             result = SigmaPoolAnalysis(exact=True, valuations=inside, residual=mpz(1))
             _SIG_VALUATIONS[key] = inside
             _SIG_FACTORS[key] = set(inside)
-            self.stats["exact"] += 1
+            if self._structure is not None:
+                self._structure.sigma_exact += 1
         else:
             result = SigmaPoolAnalysis(exact=False, valuations=inside, residual=residual)
-            self.stats["outside_certificates"] += 1
+            if self._structure is not None:
+                self._structure.sigma_outside += 1
 
         elapsed = time.perf_counter() - started
-        self.stats["analysis_ns"] += int(elapsed * 1_000_000_000)
-        self.slowest.append((elapsed, p, exp, int(residual).bit_length(), result.exact))
-        self.slowest.sort(reverse=True)
-        del self.slowest[15:]
-        ANALYZER_SLOWEST[:] = self.slowest
+        self._perf.analysis_ns += int(elapsed * 1_000_000_000)
+        self._perf.record_slow_analysis(
+            elapsed, p, exp, int(residual).bit_length(), result.exact,
+        )
 
         self._cache[key] = result
         return result
@@ -1156,17 +1110,18 @@ def sigma_valuation_map(p: int, a: int) -> Dict[int, int]:
     key = (p, a)
     cached = _SIG_VALUATIONS.get(key)
     if cached is not None:
-        SIGMA_MAP_STATS["hits"] += 1
+        if _sigma_map_perf is not None:
+            _sigma_map_perf.sigma_map_hits += 1
         return cached
 
-    SIGMA_MAP_STATS["misses"] += 1
+    if _sigma_map_perf is not None:
+        _sigma_map_perf.sigma_map_misses += 1
     t0 = time.perf_counter()
     sig = int(sigma_prime_power(p, a))
     valuations = {q: e for q, e in factorize(sig) if q != 2}
     elapsed = time.perf_counter() - t0
-    SIGMA_MAP_STATS["factor_seconds"] += elapsed
-    max_q = max(valuations) if valuations else 0
-    SIGMA_MISS_TIMES.append((p, a, sig.bit_length(), elapsed, max_q))
+    if _sigma_map_perf is not None:
+        _sigma_map_perf.sigma_map_factor_seconds += elapsed
     _SIG_VALUATIONS[key] = valuations
     _SIG_FACTORS[key] = set(valuations)
     return valuations
@@ -1384,11 +1339,11 @@ def exp4_forced_outside_window(p: int, max_prime: int) -> bool:
     return outside
 
 
-def compute_toxic_skip_list() -> None:
+def compute_toxic_skip_list(structure: "StructureMetrics") -> None:
     """Seed TOXIC_SKIP from contradiction attribution data."""
     from collections import Counter as _Counter
     excluded_counts: 'Counter[int]' = _Counter()
-    for (q, reason), count in CONTRADICTION_ATTR.items():
+    for (q, reason), count in structure.contradiction_attribution.items():
         if reason == "excluded_pre":
             excluded_counts[q] += count
     TOXIC_SKIP.clear()

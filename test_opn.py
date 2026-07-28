@@ -20,6 +20,7 @@ Usage:
 import math
 import os
 import pickle
+import json
 import sys
 from array import array
 from fractions import Fraction
@@ -87,7 +88,7 @@ from opn_search import (
     _verify_solution,
     search_opn,
 )
-from opn_metrics import RunMetrics, PoolPerformance
+from opn_metrics import RunMetrics, PoolPerformance, StructureMetrics
 
 from opn_state import (
     ChainState,
@@ -965,6 +966,72 @@ class TestCapacityBound:
 # ══════════════════════════════════════════════════════════════
 # Checkpoint round-trip
 # ══════════════════════════════════════════════════════════════
+
+class TestBoundedStructureMetrics:
+    def test_productive_state_does_not_retain_obligation_signature(self):
+        metrics = RunMetrics()
+
+        metrics.structure.record_productive(
+            depth=3,
+            assigned_count=2,
+            pending=[7, 13],
+            ratio_num=3,
+            ratio_den=2,
+            target_num=2,
+            target_den=1,
+        )
+
+        assert metrics.structure.productive_states == 1
+        assert metrics.structure.pending_prime_frequency == {7: 1, 13: 1}
+        assert not hasattr(metrics.structure, "obligation_signatures")
+        assert b"obligation_signatures" not in pickle.dumps(metrics)
+        restored = pickle.loads(pickle.dumps(metrics))
+        assert restored.structure.pending_prime_frequency == {7: 1, 13: 1}
+
+    def test_legacy_pickle_state_discards_obligation_signatures(self):
+        legacy_state = StructureMetrics().__getstate__()[1]
+        legacy_state["productive_states"] = 12
+        legacy_state["obligation_signatures"] = {
+            (frozenset({7, 13}), 2, 1): 12,
+        }
+
+        restored = StructureMetrics.__new__(StructureMetrics)
+        restored.__setstate__((None, legacy_state))
+
+        assert restored.productive_states == 12
+        assert not hasattr(restored, "obligation_signatures")
+
+    def test_structure_report_uses_pending_frequency(self, tmp_path):
+        from opn_reports import _pending_source_lines, write_structure_json
+
+        metrics = RunMetrics()
+        metrics.structure.pending_prime_frequency.update({7: 10, 13: 5})
+        lines = _pending_source_lines(
+            metrics.structure,
+            {(3, 2): {13}, (13, 2): {3, 61}},
+            100,
+        )
+
+        assert any("Frequent pending-prime" in line for line in lines)
+        assert any("             7" in line and "10" in line for line in lines)
+
+        write_structure_json(tmp_path, metrics)
+        report = json.loads(
+            (tmp_path / "structure.json").read_text(encoding="utf-8")
+        )
+        assert "obligation_signatures" not in report
+        assert report["pending_prime_frequency"] == {"7": 10, "13": 5}
+
+    def test_metrics_schema_one_payload_migrates_to_two(self):
+        original = RunMetrics()
+        payload = original.checkpoint_payload()
+        payload["schema_version"] = 1
+
+        restored = RunMetrics.from_checkpoint_payload(payload)
+
+        assert restored.schema_version == 2
+        assert not hasattr(restored.structure, "obligation_signatures")
+
 
 class TestCheckpoint:
     def test_round_trip(self, small_primes, tmp_path, monkeypatch):

@@ -28,9 +28,9 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 4000000000     # largest odd prime considered
+MAX_PRIME         = 9000000000     # largest odd prime considered
 MAX_FACTORS       = 60         # max distinct prime factors in N
-MAX_EXP           = 18         # max exponent (2 = a_i=1 restriction)
+MAX_EXP           = 25         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = Descartes-spoof DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary

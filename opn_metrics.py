@@ -9,9 +9,8 @@ opn_core / opn_state / opn_search / opn_io with a single explicit
 from __future__ import annotations
 
 import heapq
-import math
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from enum import Enum
 from typing import Iterable
 
@@ -109,7 +108,6 @@ class StructureMetrics:
         default_factory=Counter
     )
 
-    obligation_signatures: Counter[tuple] = field(default_factory=Counter)
     pending_prime_frequency: Counter[int] = field(default_factory=Counter)
 
     contradiction_attribution: Counter[tuple[int, str]] = field(
@@ -131,6 +129,40 @@ class StructureMetrics:
 
     sigma_exact: int = 0
     sigma_outside: int = 0
+
+    def __setstate__(self, state) -> None:
+        """Restore metrics while discarding the removed signature telemetry.
+
+        Python's default pickle representation for a slotted dataclass is a
+        ``(dict_state, slot_state)`` pair.  Checkpoint-v4 files created before
+        metrics schema 2 may therefore contain the obsolete, potentially huge
+        ``obligation_signatures`` slot.  Ignore it during unpickling instead of
+        retaining the data or making an otherwise valid search checkpoint
+        unreadable.
+        """
+        restored = {}
+        if isinstance(state, tuple):
+            for part in state:
+                if isinstance(part, dict):
+                    restored.update(part)
+        elif isinstance(state, dict):
+            restored.update(state)
+        else:
+            raise TypeError("unsupported StructureMetrics pickle state")
+
+        restored.pop("obligation_signatures", None)
+        for metric_field in fields(type(self)):
+            if metric_field.name in restored:
+                value = restored[metric_field.name]
+            elif metric_field.default is not MISSING:
+                value = metric_field.default
+            elif metric_field.default_factory is not MISSING:
+                value = metric_field.default_factory()
+            else:
+                raise ValueError(
+                    f"missing StructureMetrics field: {metric_field.name}"
+                )
+            object.__setattr__(self, metric_field.name, value)
 
     def record_productive(
         self,
@@ -156,16 +188,6 @@ class StructureMetrics:
 
         for q in pending:
             self.pending_prime_frequency[q] += 1
-
-        coarse = (
-            int(math.floor(-math.log10(headroom)))
-            if headroom > 0
-            else 99
-        )
-
-        self.obligation_signatures[
-            (frozenset(pending), assigned_count, coarse)
-        ] += 1
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -277,7 +299,7 @@ class PerformanceMetrics:
 class RunMetrics:
     """Single source of truth for all search observability data."""
 
-    schema_version: int = 1
+    schema_version: int = 2
     structure: StructureMetrics = field(default_factory=StructureMetrics)
     performance: PerformanceMetrics = field(default_factory=PerformanceMetrics)
 
@@ -315,11 +337,11 @@ class RunMetrics:
     @classmethod
     def from_checkpoint_payload(cls, payload: dict) -> "RunMetrics":
         """Restore RunMetrics from a checkpoint dict."""
-        if payload.get("schema_version") != 1:
+        if payload.get("schema_version") not in {1, 2}:
             raise ValueError("unsupported metrics schema version")
 
         return cls(
-            schema_version=1,
+            schema_version=2,
             structure=payload["structure"],
             performance=payload["performance"],
         )

@@ -2,7 +2,7 @@
 
 High-performance constraint-propagation search engine for odd perfect
 numbers and Descartes-type spoof candidates.  Factor-chain propagation,
-finite-window proof pruning, Nielsen-interval bounds, obligation-attractor
+finite-window proof pruning, Nielsen-interval bounds, and bounded structural
 telemetry.
 
 $$N = q^{4k+1} \prod p_i^{2a_i} \qquad\text{(Euler form)}$$
@@ -86,7 +86,7 @@ has at least one mandatory odd prime factor beyond the window.  A **maximum-prim
 $B(\mathrm{oddpart}(R-1)) = \frac12\sum_{d\mid u,\,d>1}\varphi(d)^2$.
 A comprehensive telemetry system
 (`telemetry.txt`) records prune reasons, clone economics, depth histograms,
-and obligation-signature recurrence patterns across parameter configurations.
+and high-frequency pending-prime patterns across parameter configurations.
 
 ---
 

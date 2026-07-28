@@ -13,7 +13,7 @@ $$\sigma(N) = 2N \qquad\text{(perfect number condition)}$$
 ## Quick Start
 
 > **Note:** The checked-in configuration is **experimental**
-> (`MAX_PRIME=5e9`).  For a first run, set `MAX_PRIME = 100_000`
+> (`MAX_PRIME=9e9`).  For a first run, set `MAX_PRIME = 100_000`
 > and `MAX_FACTORS = 12` at the top of `opn_core.py`.  See
 > [Configuration](#configuration-1) for safe defaults.
 
@@ -22,7 +22,7 @@ python -m pip install -r requirements.txt
 python opn_main.py
 ```
 
-**Requirements:** Python 3.10+, gmpy2, numpy.
+**Requirements:** Python 3.10+, gmpy2, numpy, psutil.
 
 The finite search box is configured at the top of `opn_core.py`.
 See [MATHEMATICAL_CORRECTNESS.md](MATHEMATICAL_CORRECTNESS.md) before
@@ -84,16 +84,16 @@ finite-window logical pruning of exponent-4 branches where $\sigma(p^4)$
 has at least one mandatory odd prime factor beyond the window.  A **maximum-prime capacity bound**
 (proved in Lean) constrains the exponent of the largest prime factor via
 $B(\mathrm{oddpart}(R-1)) = \frac12\sum_{d\mid u,\,d>1}\varphi(d)^2$.
-A comprehensive telemetry system
-(`telemetry.txt`) records prune reasons, clone economics, depth histograms,
-and high-frequency pending-prime patterns across parameter configurations.
+A typed observability system records prune reasons and execution mechanisms
+as orthogonal dimensions, with per-run output written to a timestamped
+`runs/` directory (structure, performance, CSV samples, and JSON reports).
 
 ---
 
 ## Project Structure
 
 ```
-opn_main.py        Entry point (configuration + main loop)
+opn_main.py        Entry point (main loop, SIGINT, checkpoint/resume)
 opn_core.py        Arithmetic engine
                      · segmented odd-prime sieve → compact uint32/64 array
                      · exponent-specific necessary-order filtering
@@ -102,42 +102,44 @@ opn_core.py        Arithmetic engine
                      · general-purpose Brent Pollard-Rho factorisation
                      · factor-slot-aware ratio bounds
                      · max-prime capacity bound + LTE valuation helpers
-                     · telemetry counters + all user-configurable constants
+                     · all user-configurable constants
+opn_metrics.py     Typed observability data models
+                     · PruneReason / PruneMechanism / CloneEffect enums
+                     · StructureMetrics, PoolPerformance, PerformanceMetrics
+                     · RunMetrics — single stats sink, checkpoint serialization
 opn_state.py       Search state & constraint propagation
-                     · DFSState (8 fields, 2 collections cloned) — lightweight
-                       Descartes-spoof DFS
-                     · ChainState (14 fields, 6 collections cloned) — full
-                       factor-chain search
-                     · assign_prime_dfs / assign_prime_chain — separate
-                       constraint propagation per mode
+                     · DFSState (8 fields, 2 collections cloned)
+                     · ChainState (14 fields, 6 collections cloned)
+                     · assign_prime_dfs / assign_prime_chain
                      · pending-queue dedup helpers
 opn_search.py      Search engine
-                     · search_opn() — generator with polymorphic dispatch
-                     · DFS (stack) for Descartes-spoof mode (DFSState)
-                     · best-first (heap) for factor-chain mode (ChainState)
+                     · search_opn() — generator, polymorphic dispatch
+                     · DFS (stack) for spoof mode; best-first (heap) for OPN
                      · Touchard congruence pruning + exact-state deduplication
-                     · capacity-bound prune on last-slot expansions + pending drain
-                     · true-OPN & Descartes-spoof checks
-                     · Descartes-spoofs continue expanding in chain mode
+                     · capacity-bound prune + pending drain
 opn_io.py          Display, checkpoint, file I/O
-                     · display_solution()
-                     · factor-chain trace
-                     · atomic pickle checkpoint save/load + validation
-                     · human-readable solutions file
-                     · write_telemetry_report() — structured Markdown report
-                     · display_telemetry_brief() — console summary
-                     · clone economics — pre-clone avoidance rate
-                     · export_factor_graph() — DOT + JSON σ-dependency graph
+                     · display_solution() + factor-chain trace
+                     · atomic pickle checkpoint save/load + validation (v4)
+                     · save_solutions_txt, export_factor_graph (DOT + JSON)
+opn_reports.py     Report writers
+                     · structure.txt / structure.json (mathematical results)
+                     · performance.txt / performance.json (engineering metrics)
+                     · summary.txt, manifest.json
+opn_runtime.py     Background performance sampler
+                     · RuntimeSampler — daemon thread, psutil RSS/CPU/rate CSV
 ```
 
 **Dependency graph** (no cycles):
 
 ```
-opn_core   ← gmpy2, numpy, math, random
-opn_state  ← opn_core
-opn_search ← opn_core + opn_state
-opn_io     ← opn_core + opn_state
-opn_main   ← opn_core + opn_search + opn_io
+opn_metrics  (standalone)
+opn_core     ← gmpy2, numpy, opn_metrics
+opn_state    ← opn_core, opn_metrics
+opn_search   ← opn_core, opn_state, opn_metrics
+opn_io       ← opn_core, opn_state
+opn_reports  ← opn_metrics
+opn_runtime  ← psutil
+opn_main     ← opn_core, opn_search, opn_io, opn_metrics, opn_reports, opn_runtime
 ```
 
 ### Legacy Reference Implementation
@@ -227,7 +229,7 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 
 ## Installation
 
-**Requirements:** Python 3.10+, gmpy2, numpy
+**Requirements:** Python 3.10+, gmpy2, numpy, psutil
 
 ```bash
 python -m pip install -r requirements.txt
@@ -236,13 +238,7 @@ python -m pip install -r requirements.txt
 Or:
 
 ```bash
-python -m pip install "gmpy2>=2.0.0" numpy
-```
-
-Via conda:
-
-```bash
-conda install -c conda-forge gmpy2 numpy
+python -m pip install "gmpy2>=2.0.0" numpy psutil
 ```
 
 ---
@@ -272,7 +268,7 @@ MAX_PRIME  = 1_000_000_000; MAX_FACTORS = 60; MAX_EXP = 18
 
 **Experimental** (large-pool feasibility only):
 ```python
-MAX_PRIME  = 5_000_000_000  # requires ~2 GiB prime storage
+MAX_PRIME  = 9_000_000_000  # requires ~4 GiB prime storage
 ```
 
 `PROPAGATE=True` enables factor-chain (true-OPN) search;
@@ -345,47 +341,24 @@ the resonance heuristic works.
 
 ### Search Telemetry
 
-On completion or `Ctrl+C`, the engine prints three telemetry reports.
-Selected telemetry counters are serialised into the checkpoint and
-accumulate across interrupt/resume cycles.  Per-run pool timing,
-slowest-analysis records, and some diagnostic counters are not
-persisted.
+Output is written to a timestamped `runs/<run_id>/` directory:
 
-**Prune Statistics** — per-reason rejection rates, normalised against
-`attempted = actual_clones + avoided_pre_clone` (‰ = per 1000 clones):
+| File | Content |
+|---|---|
+| `summary.txt` | Run identity, configuration, result, report index |
+| `manifest.json` | Machine-readable config + version |
+| `structure.txt` / `.json` | Mathematical results: prune reasons, depth histogram, clone payload, ratio headroom, propagation edges, sigma classifications, contradiction attribution, pending-prime frequency |
+| `performance.txt` / `.json` | Engineering metrics: phase timings, pool cache, GCD workload, plan build timing, prune mechanisms, core timings, slowest analyses, memory snapshots |
+| `performance_samples.csv` | Time-series: RSS, CPU, rate, frontier size (2 s interval) |
 
-```
-Prune statistics:
-  ratio             916,000+  (98.0% of prunes,  51.5‰ of clones)
-  touchard            3,688  ( 2.0% of prunes,   1.0‰ of clones)
-```
+Prune counters are recorded in two orthogonal dimensions:
 
-Each counter is incremented at the exact `return None` site inside
-`assign_prime_dfs` / `assign_prime_chain`.  The ‰ rate isolates which
-heuristic dominates *per clone attempt*, enabling cross-configuration
-comparison.
+- **PruneReason** (structure) — mathematical cause: `outside_window`, `valuation_contradiction`, `ratio_overshoot`, `ratio_unreachable`, `factor_slots`, `touchard`, etc.
+- **PruneMechanism** (performance) — execution path: `known_outside_cache`, `cold_pool_certificate`, `preclone_valuation`, `tail_ratio_bound`, `prospective_ratio`, etc.
 
-**Depth Histogram** — productive clone depth (expansion steps). , *not*
-number of assigned prime factors.  The bell shape reveals where the
-search tree expands and where ratio pruning begins to dominate.
-
-**Clone Effectiveness** — classifies every `clone()` call by outcome:
-
-```
-Clone effectiveness:
-  attempted branches    1,109,587
-  actual clones           144,575
-  avoided (pre-clone)     965,012
-  avoidance rate            87.0%
-    productive             144,570  (100.0% of actual)
-```
-
-- **avoided** = prunes that executed *before* `clone()` — these are the
-  highest-value heuristics.
-- **wasted** = prunes that executed *after* `clone()` — mathematically
-  correct but computationally expensive.
-- **overhead** = skip branches and initial states — inherent DFS
-  enumeration cost.
+This separation keeps the mathematical report deterministic across
+hardware while surfacing cache and implementation bottlenecks in the
+performance report.
 
 ### Checkpoint / Resume
 
@@ -413,20 +386,24 @@ On resume the checkpoint is validated for internal consistency
 coherence, mode fingerprint, format version).  Issues cause the
 checkpoint to be rejected (not silently continued).
 
-Selected search-state and telemetry counters are persisted.  Per-run
-pool timing, slowest-analysis records, and some diagnostic counters
-are not guaranteed to survive resume.  The checkpoint also stores the
-generated prime pool — for very large `MAX_PRIME` this can produce
-large checkpoint files.
+Selected search-state and telemetry counters are persisted via
+`RunMetrics.checkpoint_payload()`.  The checkpoint stores a prime
+*fingerprint* (limit, count, typecode, first, last) rather than the
+full array; on resume the prime pool is regenerated from the sieve
+and validated against all five fingerprint fields.  A mismatch raises
+`RuntimeError` — the search will not silently continue with an
+incompatible prime pool.
 
 Delete `checkpoint_merged.pkl` to force a fresh start.
 
-### Telemetry Report
+### Comparing Runs
 
-On completion (or Ctrl+C), a structured Markdown report is written to
-`telemetry.txt` covering prune statistics, clone economics, pool
-analysis, core timings, depth histograms, and propagation edges.
-Counters marked as checkpointed persist across resume cycles.
+The `structure.json` and `performance.json` files are machine-readable,
+enabling direct comparison across configurations:
+
+```powershell
+python compare_runs.py runs/run1 runs/run2
+```
 
 ---
 

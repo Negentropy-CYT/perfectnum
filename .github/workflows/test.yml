@@ -23,7 +23,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install gmpy2
+          pip install gmpy2 numpy psutil
           pip install pytest
 
       - name: Run tests

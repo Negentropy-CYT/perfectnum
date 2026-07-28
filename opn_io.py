@@ -61,7 +61,7 @@ from opn_core import (
 from opn_state import ChainState, DFSState, validate_chain_state
 
 
-CHECKPOINT_FORMAT_VERSION = 3  # bumped: pseudo-completeness fix + capacity bound
+CHECKPOINT_FORMAT_VERSION = 3  # bumped: spoof-completeness fix + capacity bound
 
 
 def _search_mode_fingerprint() -> dict:
@@ -76,9 +76,9 @@ def _search_mode_fingerprint() -> dict:
 
 # ── display ───────────────────────────────────────────────────
 def display_solution(st, sol_num: int, elapsed: float) -> None:
-    """Print a single candidate (true OPN or pseudo) to stdout."""
-    if st.pseudo:
-        _display_pseudo(st, sol_num, elapsed)
+    """Print a single candidate (true OPN or Descartes spoof) to stdout."""
+    if st.spoof:
+        _display_spoof(st, sol_num, elapsed)
     else:
         _display_true_opn(st, sol_num, elapsed)
 
@@ -94,12 +94,12 @@ def display_solution(st, sol_num: int, elapsed: float) -> None:
         print(f"    {p}^{a}{tag}{bal}")
 
     # factor-chain trace (true OPN only)
-    if not st.pseudo and st.euler_prime:
+    if not st.spoof and st.euler_prime:
         _print_factor_chain(st)
 
 
-def _display_pseudo(st, sol_num: int, elapsed: float) -> None:
-    """Print a pseudo-OPN candidate with its composite r-factor."""
+def _display_spoof(st, sol_num: int, elapsed: float) -> None:
+    """Print a Descartes spoof with its composite r-factor."""
     denom = 2 * st.ratio_den - st.ratio_num
     r = st.ratio_num // denom
     n_val = mpz(r)
@@ -109,7 +109,7 @@ def _display_pseudo(st, sol_num: int, elapsed: float) -> None:
     r_str = " × ".join(f"{q}^{e}" for q, e in r_facs)
 
     print(f"\n{'=' * 60}")
-    print(f"*** Pseudo-OPN Candidate  #{sol_num} ***")
+    print(f"*** Descartes Spoof  #{sol_num} ***")
     print(f"  N              = {n_val}")
     print(f"  log10(N)       = {math.log10(int(n_val)):.1f}")
     print(f"  digits         = {len(str(n_val))}")
@@ -760,11 +760,11 @@ def save_solutions_txt(solutions: list) -> None:
         return
     with open(SOLUTIONS_FILE, "w", encoding="utf-8") as f:
         f.write("# Odd Perfect Number Search Results\n")
-        true_count   = sum(1 for s in solutions if not s[2])
-        pseudo_count = sum(1 for s in solutions if s[2])
-        f.write(f"# True OPN: {true_count}  |  Pseudo: {pseudo_count}\n\n")
-        for i, (factors, euler, pseudo) in enumerate(solutions, 1):
-            tag = "PSEUDO" if pseudo else "OPN"
+        true_count  = sum(1 for s in solutions if not s[2])
+        spoof_count = sum(1 for s in solutions if s[2])
+        f.write(f"# True OPN: {true_count}  |  Spoof: {spoof_count}\n\n")
+        for i, (factors, euler, spoof) in enumerate(solutions, 1):
+            tag = "SPOOF" if spoof else "OPN"
             f.write(f"[{tag}] #{i}:\n")
             f.write(f"  Euler prime: {euler}\n")
             f.write(f"  Factors: {factors}\n\n")

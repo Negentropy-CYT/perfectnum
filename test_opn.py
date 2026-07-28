@@ -4,7 +4,7 @@ Covers:
   - Core arithmetic: prime generation, sigma, factorisation, ratio bounds
   - Interval bounds: lower/upper bound correctness (regression vs known values)
   - Touchard: congruence pruning correctness
-  - Pseudo-solution: known Descartes spoof must be found (regression)
+  - Descartes spoof: known spoof must be found (regression)
   - Early ratio prune: exact-ratio guard (>= → > fix verification)
   - Reverse valuations and Fermat-prime debt capacity
   - Infinite-power: threshold function
@@ -82,7 +82,7 @@ from opn_core import (
 )
 from opn_search import (
     SearchStopped,
-    _check_pseudo,
+    _check_spoof,
     _heap_snapshot,
     _verify_solution,
     search_opn,
@@ -612,10 +612,10 @@ class TestEarlyRatioPrune:
 
 
 # ══════════════════════════════════════════════════════════════
-# Pseudo-Solution (Descartes spoof regression)
+# Descartes Spoof (regression)
 # ══════════════════════════════════════════════════════════════
 
-class TestPseudoSolution:
+class TestDescartesSpoof:
     def test_descartes_spoof_found_dfs(self, small_primes):
         """Known spoof must be found in DFS mode."""
         found = None
@@ -625,13 +625,13 @@ class TestPseudoSolution:
             break
         assert found is not None, "Descartes spoof not found"
         assert found.assigned == {3: 2, 7: 2, 11: 2, 13: 2}
-        assert found.pseudo is True
+        assert found.spoof is True
 
     def test_descartes_spoof_verified(self, small_primes):
         """The r-value for the Descartes spoof should be 22021."""
         for st in search_opn(small_primes, max_factors=5, max_exp=2,
                              propagate=False):
-            assert _verify_solution(st) is False  # pseudo, not true OPN
+            assert _verify_solution(st) is False  # spoof, not true OPN
             denom = 2 * st.ratio_den - st.ratio_num
             r = st.ratio_num // denom
             assert r == 22021
@@ -663,7 +663,7 @@ class TestSearchEngine:
     def test_exact_dedup_preserves_solution_set(self, small_primes):
         def signatures(use_cache):
             return [
-                (tuple(sorted(st.assigned.items())), st.euler_prime, st.pseudo)
+                (tuple(sorted(st.assigned.items())), st.euler_prime, st.spoof)
                 for st in search_opn(
                     small_primes,
                     max_factors=5,
@@ -755,7 +755,7 @@ class TestSearchEngine:
             return (
                 tuple(sorted(st.assigned.items())),
                 st.euler_prime,
-                st.pseudo,
+                st.spoof,
             )
 
         baseline_holder = {}
@@ -841,7 +841,7 @@ class TestSearchEngine:
         solution_signature = (
             tuple(sorted(solution.assigned.items())),
             solution.euler_prime,
-            solution.pseudo,
+            solution.spoof,
         )
         assert holder["snapshot_reason"] == "solution"
 
@@ -861,7 +861,7 @@ class TestSearchEngine:
             (
                 tuple(sorted(st.assigned.items())),
                 st.euler_prime,
-                st.pseudo,
+                st.spoof,
             )
             for st in search_opn(
                 small_primes,
@@ -945,7 +945,7 @@ class TestCapacityBound:
             break
         assert found is not None
         assert found.assigned == {3: 2, 7: 2, 11: 2, 13: 2}
-        assert found.pseudo is True
+        assert found.spoof is True
 
     def test_chain_mode_finds_results(self, small_primes):
         """Chain mode with capacity bound should run without error."""

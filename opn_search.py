@@ -2,10 +2,10 @@
 opn_search — constraint-propagation factor-chain search engine.
 
 Exposes ``search_opn()``, a generator that yields State objects for
-each valid OPN or pseudo-OPN candidate discovered.
+each valid OPN or Descartes-spoof candidate discovered.
 
 Supports two search strategies:
-  - DFS (stack)   — for pseudo-solution (DFSState)
+  - DFS (stack)   — for Descartes-spoof search (DFSState)
   - best-first    — for factor-chain true-OPN (ChainState)
 
 Polymorphic dispatch on state type; Touchard congruence pruning;
@@ -96,7 +96,7 @@ def _heap_snapshot(entries) -> list:
 
 
 # ══════════════════════════════════════════════════════════════
-# Verification & pseudo check
+# Verification & spoof check
 # ══════════════════════════════════════════════════════════════
 
 def _verify_solution(st: State) -> bool:
@@ -108,9 +108,9 @@ def _verify_solution(st: State) -> bool:
     return lhs * SEARCH_MODE.target_den == SEARCH_MODE.target_num * rhs
 
 
-def _check_pseudo(st: State) -> bool:
+def _check_spoof(st: State) -> bool:
     if SEARCH_MODE.target_num != 2 or SEARCH_MODE.target_den != 1:
-        return False  # pseudo-solutions formula assumes target = 2/1
+        return False  # spoof formula assumes target = 2/1
     if len(st.assigned) < 1 or st.ratio_num * SEARCH_MODE.target_den >= SEARCH_MODE.target_num * st.ratio_den:
         return False
     if 10 * st.ratio_num < 19 * st.ratio_den:
@@ -126,7 +126,7 @@ def _check_pseudo(st: State) -> bool:
     for p in st.assigned:
         if r % p == 0:
             return False
-    st.pseudo = True
+    st.spoof = True
     return True
 
 
@@ -343,15 +343,15 @@ def search_opn(
             and (not SEARCH_MODE.require_euler or check_touchard(st.euler_prime, st.assigned, st.excluded))
             and _verify_solution(st)
         ):
-            st.pseudo = False
+            st.spoof = False
             _publish_frontier("solution")
             yield st
             continue
 
-        # ── pseudo-solution check ──
-        if _check_pseudo(st):
+        # ── spoof check ──
+        if _check_spoof(st):
             if use_heap:
-                # ponytail: chain-mode pseudo is non-terminal;
+                # ponytail: chain-mode spoof is non-terminal;
                 # don't snapshot the frontier without st or its successors.
                 # Periodic checkpoint covers the live frontier.
                 pass
@@ -360,7 +360,7 @@ def search_opn(
             yield st
             if not use_heap:
                 continue  # DFS: spoof is the end goal; stop expansion
-            # chain mode: pseudo-solution may still expand to a true OPN
+            # chain mode: spoof state may still expand to a true OPN
 
         # ── pruning ──
         if st.ratio_num * SEARCH_MODE.target_den >= SEARCH_MODE.target_num * st.ratio_den:

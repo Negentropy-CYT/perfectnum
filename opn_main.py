@@ -27,8 +27,11 @@ from opn_core import (
     MAX_EXP,
     PROPAGATE,
     POOL_GCD_MODE,
+    POOL_PLAN_BUILD_POLICY,
     POOL_SUPERBLOCK_FANOUT,
     SEARCH_MODE,
+    SIGMA_DATABASE_ENABLED,
+    SIGMA_DATABASE_FILE,
     generate_odd_primes,
     valid_euler_exponents,
     valid_even_exponents,
@@ -225,6 +228,12 @@ def main() -> None:
             checkpoint_callback=_save_stable_boundary,
             checkpoint_interval_seconds=CHECKPOINT_INTERVAL_SECONDS,
             stop_requested=lambda: stop_requested,
+            sigma_database_path=(
+                SIGMA_DATABASE_FILE
+                if SIGMA_DATABASE_ENABLED
+                else None
+            ),
+            pool_plan_build_policy=POOL_PLAN_BUILD_POLICY,
         ):
             if st.spoof:
                 found_spoof += 1
@@ -282,6 +291,8 @@ def main() -> None:
             "propagate": PROPAGATE,
             "pool_gcd_mode": POOL_GCD_MODE,
             "pool_fanout": POOL_SUPERBLOCK_FANOUT,
+            "pool_plan_build_policy": POOL_PLAN_BUILD_POLICY,
+            "sigma_database_enabled": SIGMA_DATABASE_ENABLED,
         }
         environment = {
             "git_commit": git_commit,

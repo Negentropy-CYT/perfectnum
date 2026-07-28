@@ -22,12 +22,14 @@ import os
 import pickle
 import json
 import random
+import sqlite3
 import sys
 from array import array
 from fractions import Fraction
 from itertools import combinations
 
 import pytest
+import numpy as np
 from gmpy2 import mpz
 
 # Run from the improvements/ directory
@@ -45,6 +47,7 @@ from opn_core import (
     _TOTIENT_CACHE,
     _CAPACITY_CACHE,
     _build_dynamic_leaf_product,
+    _typed_searchsorted_right,
     FRIEND_10_MODE,
     OPN_MODE,
     SEARCH_MODE,
@@ -73,6 +76,7 @@ from opn_core import (
     next_prime_upper_bound,
     power_pa,
     precompute_sig_factors,
+    prime_pool_prefix_digest,
     ratio_lower_bound,
     ratio_upper_bound,
     residue_class_count,
@@ -83,6 +87,7 @@ from opn_core import (
     touchard_force_3,
     valid_euler_exponents,
     valid_even_exponents,
+    validate_prime_pool_vectorized,
 )
 from opn_search import (
     SearchStopped,
@@ -92,6 +97,7 @@ from opn_search import (
     search_opn,
 )
 from opn_metrics import RunMetrics, PoolPerformance, StructureMetrics
+from opn_sigma_db import SigmaAnalysisDatabase
 
 from opn_state import (
     ChainState,
@@ -195,6 +201,178 @@ def test_segmented_sieve_known_million_count():
     assert len(primes) == 78_497
     assert primes[0] == 3
     assert primes[-1] == 999_983
+
+
+class TestPrimePoolValidation:
+    @pytest.mark.parametrize(
+        "primes",
+        [
+            array("I", [3, 5, 7, 11, 13]),
+            array("Q", [3, 5, 7, 11, 13]),
+            np.array([3, 5, 7, 11, 13], dtype=np.uint32),
+            np.array([3, 5, 7, 11, 13], dtype=np.uint64),
+            np.array([3, 5, 7, 11, 13], dtype=np.int64),
+            [3, 5, 7, 11, 13],
+            (3, 5, 7, 11, 13),
+        ],
+    )
+    def test_valid_storage_types(self, primes):
+        validate_prime_pool_vectorized(primes, chunk_size=2)
+
+    @pytest.mark.parametrize(
+        ("primes", "message"),
+        [
+            ([], "must not be empty"),
+            ([5, 7, 11], "must start at 3"),
+            ([3, 5, 8, 11], "only odd integers"),
+            ([3, 5, 1, 7], "only odd integers"),
+            ([3, 7, 5, 11], "strictly increasing"),
+            ([3, 5, 5, 7], "strictly increasing"),
+            ([3, 0x1_0000_0001, 5], "strictly increasing"),
+        ],
+    )
+    def test_invalid_python_sequences(self, primes, message):
+        with pytest.raises(ValueError, match=message):
+            validate_prime_pool_vectorized(primes, chunk_size=2)
+
+    @pytest.mark.parametrize(
+        ("primes", "message"),
+        [
+            (array("I"), "must not be empty"),
+            (array("I", [5, 7, 11]), "must start at 3"),
+            (array("I", [3, 5, 8, 11]), "only odd integers"),
+            (
+                np.array([3, 5, 1, 7], dtype=np.uint64),
+                "only odd integers",
+            ),
+        ],
+    )
+    def test_invalid_vectorized_storage(self, primes, message):
+        with pytest.raises(ValueError, match=message):
+            validate_prime_pool_vectorized(primes, chunk_size=2)
+
+    @pytest.mark.parametrize(
+        "primes",
+        [
+            array("I", [3, 5, 7, 7, 11]),
+            np.array([3, 5, 7, 7, 11], dtype=np.uint64),
+            np.array([3, 5, 9, 7, 11], dtype=np.int64),
+        ],
+    )
+    def test_chunk_boundary_order_violation(self, primes):
+        with pytest.raises(ValueError, match="strictly increasing"):
+            validate_prime_pool_vectorized(primes, chunk_size=3)
+
+    def test_signed_numpy_negative_is_not_unsigned_coerced(self):
+        primes = np.array([3, 5, -7, 11], dtype=np.int64)
+        with pytest.raises(ValueError, match="only odd integers"):
+            validate_prime_pool_vectorized(primes, chunk_size=2)
+
+    def test_numpy_array_must_be_one_dimensional_integer(self):
+        with pytest.raises(ValueError, match="one-dimensional"):
+            validate_prime_pool_vectorized(
+                np.array([[3, 5], [7, 11]], dtype=np.uint32)
+            )
+        with pytest.raises(TypeError, match="integer dtype"):
+            validate_prime_pool_vectorized(
+                np.array([3.0, 5.0, 7.0])
+            )
+
+    def test_chunk_size_must_be_positive(self):
+        with pytest.raises(ValueError, match="chunk_size must be positive"):
+            validate_prime_pool_vectorized([3, 5, 7], chunk_size=0)
+
+    def test_compact_array_uses_vectorized_path(self, monkeypatch):
+        import opn_core
+
+        def forbidden_scalar(_primes):
+            raise AssertionError("compact array used scalar validation")
+
+        monkeypatch.setattr(
+            opn_core,
+            "_validate_prime_pool_scalar",
+            forbidden_scalar,
+        )
+        validate_prime_pool_vectorized(
+            array("Q", [3, 5, 7, 11]),
+            chunk_size=2,
+        )
+
+    def test_analyzer_accepts_numpy_pool(self):
+        analyzer = SigmaPoolAnalyzer(
+            np.array([3, 5, 7, 11, 13], dtype=np.uint32)
+        )
+        result = analyzer.analyze(3, 2)
+        assert result.exact
+        assert result.valuations == {13: 1}
+
+    def test_structural_validation_does_not_claim_primality_proof(self):
+        validate_prime_pool_vectorized([3, 9, 15])
+
+    def test_pool_digest_is_storage_independent_and_prefix_sensitive(self):
+        values32 = array("I", [3, 5, 7, 11, 13])
+        values64 = array("Q", values32)
+
+        assert prime_pool_prefix_digest(values32) == (
+            prime_pool_prefix_digest(values64)
+        )
+        assert prime_pool_prefix_digest(values32, 4) != (
+            prime_pool_prefix_digest(values32)
+        )
+
+    @pytest.mark.parametrize("dtype", [np.uint32, np.uint64])
+    def test_searchsorted_uses_exact_numpy_scalar_dtype(
+        self,
+        dtype,
+        monkeypatch,
+    ):
+        import opn_core
+
+        values = np.array([3, 5, 7, 11, 13], dtype=dtype)
+        original = np.searchsorted
+        observed = []
+
+        def checked(array_value, scalar, *, side):
+            observed.append(scalar)
+            assert isinstance(scalar, np.generic)
+            assert scalar.dtype == values.dtype
+            return original(array_value, scalar, side=side)
+
+        monkeypatch.setattr(opn_core.np, "searchsorted", checked)
+
+        assert _typed_searchsorted_right(values, 7) == 3
+        assert _typed_searchsorted_right(values, -1) == 0
+        assert (
+            _typed_searchsorted_right(
+                values,
+                int(np.iinfo(dtype).max) + 1,
+            )
+            == len(values)
+        )
+        assert len(observed) == 1
+
+    def test_analyzer_caches_prime_prefix_positions(self, monkeypatch):
+        import opn_core
+
+        analyzer = SigmaPoolAnalyzer(
+            array("Q", [3, 5, 7, 11, 13])
+        )
+        original = opn_core._typed_searchsorted_right
+        calls = []
+
+        def counted(values, limit):
+            calls.append(limit)
+            return original(values, limit)
+
+        monkeypatch.setattr(
+            opn_core,
+            "_typed_searchsorted_right",
+            counted,
+        )
+
+        assert analyzer._prime_prefix_stop(7) == 3
+        assert analyzer._prime_prefix_stop(7) == 3
+        assert calls == [7]
 
 
 class TestSigma:
@@ -835,6 +1013,109 @@ class TestSearchEngine:
         assert partial + resumed == baseline
         assert resumed_holder["total_states"] == baseline_holder["total_states"]
 
+    def test_chain_stop_resume_with_database_preserves_search(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(100)
+        baseline_metrics = RunMetrics()
+        baseline_holder = {}
+        baseline = list(
+            search_opn(
+                primes,
+                max_factors=6,
+                max_exp=4,
+                metrics=baseline_metrics,
+                state_holder=baseline_holder,
+                propagate=True,
+                checkpoint_interval_seconds=None,
+                sigma_database_path=str(
+                    tmp_path / "baseline.sqlite3"
+                ),
+                pool_plan_build_policy="adaptive",
+            )
+        )
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        stopped_metrics = RunMetrics()
+        stopped_holder = {}
+        stop_checks = 0
+
+        def should_stop():
+            nonlocal stop_checks
+            stop_checks += 1
+            return stop_checks > 5
+
+        partial = []
+        with pytest.raises(SearchStopped):
+            for result in search_opn(
+                    primes,
+                    max_factors=6,
+                    max_exp=4,
+                    metrics=stopped_metrics,
+                    state_holder=stopped_holder,
+                    propagate=True,
+                    checkpoint_interval_seconds=None,
+                    stop_requested=should_stop,
+                    sigma_database_path=str(
+                        tmp_path / "resumed.sqlite3"
+                    ),
+                    pool_plan_build_policy="adaptive",
+                ):
+                partial.append(result)
+
+        assert stopped_holder["snapshot_reason"] == "stop"
+        assert stopped_holder["heap"]
+
+        checkpoint_payload = pickle.loads(
+            pickle.dumps(
+                stopped_metrics.checkpoint_payload(),
+                pickle.HIGHEST_PROTOCOL,
+            )
+        )
+        resumed_metrics = RunMetrics.from_checkpoint_payload(
+            checkpoint_payload
+        )
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        resume_state = {
+            key: stopped_holder[key]
+            for key in (
+                "heap",
+                "heap_counter",
+                "states_started",
+                "states_completed",
+                "total_states",
+                "elapsed",
+                "use_heap",
+                "snapshot_id",
+            )
+        }
+        resumed_holder = {}
+        resumed = list(
+            search_opn(
+                generate_odd_primes(100),
+                max_factors=6,
+                max_exp=4,
+                metrics=resumed_metrics,
+                state_holder=resumed_holder,
+                resume_state=resume_state,
+                propagate=True,
+                checkpoint_interval_seconds=None,
+                sigma_database_path=str(
+                    tmp_path / "resumed.sqlite3"
+                ),
+                pool_plan_build_policy="adaptive",
+            )
+        )
+
+        assert partial + resumed == baseline
+        assert resumed_holder["total_states"] == (
+            baseline_holder["total_states"]
+        )
+        assert resumed_metrics.structure == baseline_metrics.structure
+
     def test_solution_boundary_does_not_requeue_reported_solution(
         self, small_primes,
     ):
@@ -994,6 +1275,7 @@ class TestBoundedStructureMetrics:
     def test_legacy_pickle_state_discards_obligation_signatures(self):
         legacy_state = StructureMetrics().__getstate__()[1]
         legacy_state["productive_states"] = 12
+        legacy_state.pop("sigma_classified_keys")
         legacy_state["obligation_signatures"] = {
             (frozenset({7, 13}), 2, 1): 12,
         }
@@ -1002,6 +1284,7 @@ class TestBoundedStructureMetrics:
         restored.__setstate__((None, legacy_state))
 
         assert restored.productive_states == 12
+        assert restored.sigma_classified_keys == set()
         assert not hasattr(restored, "obligation_signatures")
 
     def test_structure_report_uses_pending_frequency(self, tmp_path):
@@ -1023,20 +1306,21 @@ class TestBoundedStructureMetrics:
             (tmp_path / "structure.json").read_text(encoding="utf-8")
         )
         assert "obligation_signatures" not in report
+        assert "sigma_classified_keys" not in report
         assert report["pending_prime_frequency"] == {"7": 10, "13": 5}
 
-    def test_metrics_schema_one_payload_migrates_to_three(self):
+    def test_metrics_schema_one_payload_migrates_to_current(self):
         original = RunMetrics()
         payload = original.checkpoint_payload()
         payload["schema_version"] = 1
 
         restored = RunMetrics.from_checkpoint_payload(payload)
 
-        assert restored.schema_version == 3
+        assert restored.schema_version == 5
         assert not hasattr(restored.structure, "obligation_signatures")
 
-    @pytest.mark.parametrize("schema_version", [1, 2])
-    def test_legacy_pool_metrics_gain_dynamic_leaf_defaults(
+    @pytest.mark.parametrize("schema_version", [1, 2, 3, 4])
+    def test_legacy_pool_metrics_gain_current_defaults(
         self,
         schema_version,
     ):
@@ -1048,8 +1332,13 @@ class TestBoundedStructureMetrics:
             "dynamic_leaf_products_built",
             "dynamic_leaf_prime_values",
             "dynamic_leaf_product_ns",
+            "persistent_hits",
+            "persistent_misses",
+            "persistent_invalid",
         ):
             pool_state.pop(name)
+        pool_state["leaf_blocks_avoided_after_hit_exhaustion"] = 17
+        pool_state["super_hit_bit_length_total"] = 99
 
         restored_pool = PoolPerformance.__new__(PoolPerformance)
         restored_pool.__setstate__((None, pool_state))
@@ -1059,12 +1348,23 @@ class TestBoundedStructureMetrics:
 
         restored = RunMetrics.from_checkpoint_payload(payload)
 
-        assert restored.schema_version == 3
+        assert restored.schema_version == 5
         assert restored.performance.pool.logical_leaf_blocks == 0
         assert restored.performance.pool.resident_leaf_blocks == 0
         assert restored.performance.pool.dynamic_leaf_products_built == 0
         assert restored.performance.pool.dynamic_leaf_prime_values == 0
         assert restored.performance.pool.dynamic_leaf_product_ns == 0
+        assert restored.performance.pool.persistent_hits == 0
+        assert restored.performance.pool.persistent_misses == 0
+        assert restored.performance.pool.persistent_invalid == 0
+        assert not hasattr(
+            restored.performance.pool,
+            "leaf_blocks_avoided_after_hit_exhaustion",
+        )
+        assert not hasattr(
+            restored.performance.pool,
+            "super_hit_bit_length_total",
+        )
 
     def test_performance_reports_include_dynamic_leaf_metrics(
         self,
@@ -1103,7 +1403,7 @@ class TestBoundedStructureMetrics:
             tmp_path / "performance.txt"
         ).read_text(encoding="utf-8")
 
-        assert report["schema_version"] == 3
+        assert report["schema_version"] == 5
         assert report["pool"]["logical_leaf_blocks"] == 123
         assert report["pool"]["resident_leaf_blocks"] == 0
         assert report["pool"]["dynamic_leaf_products_built"] == 7
@@ -1135,6 +1435,43 @@ class TestCheckpoint:
         assert chk is not None
         assert chk["total_states"] == 100
         assert len(chk["solutions"]) == 1
+
+    def test_round_trip_preserves_sigma_classification_deduplication(
+        self,
+        small_primes,
+        tmp_path,
+        monkeypatch,
+    ):
+        """The real checkpoint file retains restart-stable structure keys."""
+        import opn_io
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        holder = {
+            "primes": small_primes,
+            "max_factors": 5,
+            "max_exp": 2,
+            "heap": [],
+            "heap_counter": 0,
+            "total_states": 1,
+            "elapsed": 0.1,
+            "use_heap": opn_io.PROPAGATE,
+        }
+        metrics = RunMetrics()
+        metrics.structure.sigma_classified_keys.add((3, 2))
+
+        opn_io.save_checkpoint(
+            holder,
+            [],
+            metrics=metrics,
+        )
+        checkpoint_data = opn_io.load_checkpoint()
+        assert checkpoint_data is not None
+
+        restored = RunMetrics.from_checkpoint_payload(
+            checkpoint_data["metrics"]
+        )
+        assert restored.structure.sigma_classified_keys == {(3, 2)}
 
     def test_checkpoint_flushes_before_atomic_replace(
         self, small_primes, tmp_path, monkeypatch,
@@ -1332,6 +1669,58 @@ class TestPoolAnalyzer:
         assert r.exact
         assert r.valuations == {13: 1}
         assert a._perf.exact_from_global_cache == 1
+
+    def test_global_cache_preserves_all_outside_factors(self):
+        """The fast path residual is the complete outside-pool cofactor."""
+        _SIG_VALUATIONS[(5, 9)] = {
+            3: 1,
+            11: 1,
+            71: 1,
+            521: 1,
+        }
+        analyzer = SigmaPoolAnalyzer(generate_odd_primes(50))
+
+        result = analyzer.analyze(5, 9)
+
+        assert not result.exact
+        assert result.valuations == {3: 1, 11: 1}
+        assert result.residual == mpz(71) * 521
+        assert result.outside_witness == 71
+        assert analyzer._perf.outside_from_global_cache == 1
+
+    def test_global_cache_outside_residual_preserves_valuations(self):
+        """Outside factors retain multiplicity and witness is deterministic."""
+        _SIG_VALUATIONS[(7, 2)] = {
+            1009: 2,
+            3: 2,
+            101: 3,
+        }
+        analyzer = SigmaPoolAnalyzer(generate_odd_primes(50))
+
+        result = analyzer.analyze(7, 2)
+
+        assert not result.exact
+        assert result.valuations == {3: 2}
+        assert result.residual == mpz(1009) ** 2 * mpz(101) ** 3
+        assert result.outside_witness == 101
+
+    def test_global_cache_and_cold_scan_residuals_match(self):
+        """Fast and cold paths agree for an actual multi-outside sigma."""
+        primes = generate_odd_primes(50)
+        cold = SigmaPoolAnalyzer(primes).analyze(5, 9)
+        assert not cold.exact
+
+        _SIG_VALUATIONS[(5, 9)] = {
+            3: 1,
+            11: 1,
+            71: 1,
+            521: 1,
+        }
+        fast = SigmaPoolAnalyzer(primes).analyze(5, 9)
+
+        assert fast.exact == cold.exact
+        assert fast.valuations == cold.valuations
+        assert fast.residual == cold.residual == mpz(71) * 521
 
     def test_3511_10_never_calls_full_factorize(self, monkeypatch):
         """Regression lock: SigmaPoolAnalyzer must not call factorize()."""
@@ -1555,6 +1944,97 @@ class TestSuperblockGCD:
         assert perf.dynamic_leaf_products_built == perf.leaf_blocks_tested
         assert perf.dynamic_leaf_prime_values == 9
         assert perf.dynamic_leaf_product_ns > 0
+
+    @pytest.mark.parametrize("hierarchical", [False, True])
+    def test_certified_prefix_scan_matches_full_scan(self, hierarchical):
+        primes = generate_odd_primes(500)
+        plan = build_prime_block_plan(
+            primes,
+            block_size=3,
+            superblock_fanout=4,
+            build_superblocks=hierarchical,
+        )
+        scan = (
+            _scan_blocks_hierarchical
+            if hierarchical
+            else _scan_blocks_flat
+        )
+        first_new_index = 17
+        start_leaf = first_new_index // plan.block_size
+        q1 = int(primes[first_new_index])
+        q2 = int(primes[first_new_index + 19])
+        residual = mpz(q1) ** 2 * q2
+
+        full_inside = {}
+        full_residual = scan(
+            mpz(residual),
+            full_inside,
+            plan,
+            PoolPerformance(),
+        )
+        suffix_inside = {}
+        suffix_residual = scan(
+            mpz(residual),
+            suffix_inside,
+            plan,
+            PoolPerformance(),
+            start_leaf=start_leaf,
+        )
+
+        assert suffix_residual == full_residual == 1
+        assert suffix_inside == full_inside == {q1: 2, q2: 1}
+
+    @pytest.mark.parametrize(
+        "scan,build_superblocks",
+        [
+            (_scan_blocks_flat, False),
+            (_scan_blocks_hierarchical, True),
+        ],
+    )
+    def test_scan_rejects_invalid_prefix_boundary(
+        self,
+        scan,
+        build_superblocks,
+    ):
+        plan = build_prime_block_plan(
+            generate_odd_primes(100),
+            block_size=3,
+            superblock_fanout=2,
+            build_superblocks=build_superblocks,
+        )
+        with pytest.raises(ValueError, match="start leaf"):
+            scan(
+                mpz(1),
+                {},
+                plan,
+                PoolPerformance(),
+                start_leaf=plan.leaf_block_count + 1,
+            )
+
+    def test_super_hit_exhaustion_avoids_remaining_leaf_rebuilds(self):
+        primes = generate_odd_primes(100)
+        plan = build_prime_block_plan(
+            primes,
+            block_size=2,
+            superblock_fanout=4,
+            build_superblocks=True,
+        )
+        q = int(primes[0])
+        inside = {}
+        perf = PoolPerformance()
+
+        residual = _scan_blocks_hierarchical(
+            mpz(q) ** 4 * 101,
+            inside,
+            plan,
+            perf,
+        )
+
+        assert residual == 101
+        assert inside == {q: 4}
+        assert perf.positive_superblocks == 1
+        assert perf.leaf_blocks_tested == 1
+        assert perf.dynamic_leaf_products_built == 1
 
     @pytest.mark.parametrize(
         ("block_size", "fanout"),
@@ -1811,3 +2291,426 @@ class TestVectorizedPrimePlans:
 
                 assert actual_residual == expected_residual
                 assert actual_values == expected_values
+
+
+class TestPersistentSigmaDatabase:
+    @staticmethod
+    def _database_path(tmp_path):
+        return tmp_path / "sigma-test.sqlite3"
+
+    def test_same_window_partial_hit_never_builds_plan(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        path = self._database_path(tmp_path)
+        primes = generate_odd_primes(50)
+
+        cold_structure = StructureMetrics()
+        cold = SigmaPoolAnalyzer(
+            primes,
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+            structure=cold_structure,
+        )
+        expected = cold.analyze(5, 9)
+        cold.close()
+        assert not expected.exact
+
+        warm_structure = StructureMetrics()
+        warm = SigmaPoolAnalyzer(
+            primes,
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+            structure=warm_structure,
+        )
+
+        def forbidden_plan(*_args, **_kwargs):
+            raise AssertionError("persistent hit attempted to build a plan")
+
+        monkeypatch.setattr(warm, "plan_for_exp", forbidden_plan)
+        actual = warm.analyze(5, 9)
+        warm.close()
+
+        assert actual.exact == expected.exact
+        assert actual.valuations == expected.valuations
+        assert actual.residual == expected.residual
+        assert warm._perf.persistent_hits == 1
+        assert warm._perf.persistent_misses == 0
+        assert warm._perf.plans_built == 0
+        assert warm_structure.sigma_outside == 1
+        assert warm_structure.sigma_exact == 0
+
+    def test_exact_record_is_window_independent(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        path = self._database_path(tmp_path)
+        large = SigmaPoolAnalyzer(
+            generate_odd_primes(50),
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        assert large.analyze(3, 2).exact
+        large.close()
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        small = SigmaPoolAnalyzer(
+            generate_odd_primes(11),
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+
+        def forbidden_plan(*_args, **_kwargs):
+            raise AssertionError("exact persistent hit built a plan")
+
+        monkeypatch.setattr(small, "plan_for_exp", forbidden_plan)
+        result = small.analyze(3, 2)
+        small.close()
+
+        assert not result.exact
+        assert result.valuations == {}
+        assert result.residual == 13
+        assert result.outside_witness == 13
+        assert _SIG_VALUATIONS[(3, 2)] == {13: 1}
+        assert small._perf.persistent_hits == 1
+
+    def test_larger_window_scans_only_new_interval(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        old = SigmaPoolAnalyzer(
+            generate_odd_primes(50),
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        old_result = old.analyze(5, 9)
+        old.close()
+        assert old_result.residual == mpz(71) * 521
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        expanded = SigmaPoolAnalyzer(
+            generate_odd_primes(100),
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        incremental = expanded.analyze(5, 9)
+        expanded.close()
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        fresh = SigmaPoolAnalyzer(
+            generate_odd_primes(100),
+            gcd_mode="hierarchical",
+        ).analyze(5, 9)
+
+        assert incremental.exact == fresh.exact
+        assert incremental.valuations == fresh.valuations
+        assert incremental.residual == fresh.residual == 521
+        assert incremental.valuations == {3: 1, 11: 1, 71: 1}
+        assert expanded._perf.persistent_hits == 1
+        assert expanded._perf.plans_built == 1
+        interval_plan = next(iter(expanded._interval_plans.values()))
+        assert int(interval_plan.primes[0]) > 47
+
+    def test_full_plan_supersedes_resident_interval_plan(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        old = SigmaPoolAnalyzer(
+            generate_odd_primes(50),
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        old.analyze(5, 9)
+        old.close()
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        expanded = SigmaPoolAnalyzer(
+            generate_odd_primes(100),
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        expanded.analyze(5, 9)
+        assert expanded._interval_plans
+
+        # This key is absent from the database and needs the same full plan.
+        expanded.analyze(7, 9)
+        expanded.close()
+
+        assert expanded._full_plan is not None
+        assert not expanded._interval_plans
+
+    def test_persisted_residual_uses_suffix_of_cached_full_plan(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        old = SigmaPoolAnalyzer(
+            generate_odd_primes(50),
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        old_result = old.analyze(5, 9)
+        old.close()
+        assert old_result.residual == mpz(71) * 521
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        expanded = SigmaPoolAnalyzer(
+            generate_odd_primes(1_000),
+            block_size=2,
+            superblock_fanout=2,
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        full_plan = expanded.plan_for_exp(9)
+        assert full_plan is expanded._full_plan
+
+        actual = expanded.analyze(5, 9)
+        old_limit = 47
+        start_leaf = expanded._scan_start_leaf(
+            full_plan,
+            9,
+            old_limit,
+        )
+        expanded.close()
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        expected = SigmaPoolAnalyzer(
+            generate_odd_primes(1_000),
+            gcd_mode="hierarchical",
+        ).analyze(5, 9)
+
+        assert start_leaf > 0
+        assert not expanded._interval_plans
+        assert (
+            expanded._perf.candidate_leaf_blocks
+            < full_plan.leaf_block_count
+        )
+        assert actual.exact == expected.exact
+        assert actual.valuations == expected.valuations
+        assert actual.residual == expected.residual == 1
+
+    def test_large_window_jump_uses_shared_full_plan(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        old = SigmaPoolAnalyzer(
+            generate_odd_primes(50),
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        old.analyze(5, 9)
+        old.close()
+
+        expanded = SigmaPoolAnalyzer(
+            generate_odd_primes(2_000),
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        expanded.analyze(5, 9)
+        expanded.close()
+
+        assert expanded._full_plan is not None
+        assert not expanded._interval_plans
+
+    @pytest.mark.parametrize(
+        ("p", "exp"),
+        [
+            (3, 2),
+            (5, 4),
+            (5, 9),
+            (7, 6),
+            (11, 10),
+            (13, 8),
+        ],
+    )
+    def test_incremental_result_matches_fresh_scan(
+        self,
+        tmp_path,
+        p,
+        exp,
+    ):
+        path = tmp_path / f"sigma-{p}-{exp}.sqlite3"
+        old = SigmaPoolAnalyzer(
+            generate_odd_primes(50),
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        old.analyze(p, exp)
+        old.close()
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        expanded_analyzer = SigmaPoolAnalyzer(
+            generate_odd_primes(2_000),
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        incremental = expanded_analyzer.analyze(p, exp)
+        expanded_analyzer.close()
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        fresh = SigmaPoolAnalyzer(
+            generate_odd_primes(2_000),
+            gcd_mode="hierarchical",
+        ).analyze(p, exp)
+
+        assert incremental.exact == fresh.exact
+        assert incremental.valuations == fresh.valuations
+        assert incremental.residual == fresh.residual
+
+    def test_corrupt_record_falls_back_to_cold_scan(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        primes = generate_odd_primes(50)
+        cold = SigmaPoolAnalyzer(
+            primes,
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        expected = cold.analyze(5, 9)
+        cold.close()
+
+        connection = sqlite3.connect(str(path))
+        connection.execute(
+            """
+            UPDATE sigma_records
+            SET checksum=zeroblob(32)
+            WHERE p=5 AND exp=9
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        warm = SigmaPoolAnalyzer(
+            primes,
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        actual = warm.analyze(5, 9)
+        warm.close()
+
+        assert actual.exact == expected.exact
+        assert actual.valuations == expected.valuations
+        assert actual.residual == expected.residual
+        assert warm._perf.persistent_invalid == 1
+        assert warm._perf.persistent_misses == 1
+        assert warm._perf.plans_built == 1
+
+    def test_pool_digest_mismatch_is_a_normal_miss(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        canonical = generate_odd_primes(50)
+        cold = SigmaPoolAnalyzer(
+            canonical,
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        cold.analyze(5, 9)
+        cold.close()
+
+        altered = array(
+            "I",
+            [q for q in canonical if q != 41],
+        )
+        incompatible = SigmaPoolAnalyzer(
+            altered,
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        incompatible.analyze(5, 9)
+        incompatible.close()
+
+        assert incompatible._perf.persistent_hits == 0
+        assert incompatible._perf.persistent_misses == 1
+        assert incompatible._perf.persistent_invalid == 0
+        assert incompatible._perf.plans_built == 1
+
+    def test_database_store_rejects_wrong_arithmetic(
+        self,
+        tmp_path,
+    ):
+        database = SigmaAnalysisDatabase(
+            self._database_path(tmp_path)
+        )
+        with pytest.raises(ValueError, match="arithmetic identity"):
+            database.store(
+                p=3,
+                exp=2,
+                exact=True,
+                scanned_limit=0,
+                pool_digest=b"",
+                valuations={11: 1},
+                residual=mpz(1),
+                sigma_odd=mpz(13),
+            )
+        database.close()
+
+    def test_adaptive_policy_bulk_builds_after_threshold(self):
+        analyzer = SigmaPoolAnalyzer(
+            generate_odd_primes(1_000),
+            gcd_mode="hierarchical",
+            plan_build_policy="adaptive",
+            adaptive_build_threshold=2,
+        )
+        analyzer.configure_plan_build([1, 2, 4, 5])
+
+        analyzer.plan_for_exp(1)
+        assert analyzer._full_plan is not None
+        assert len(analyzer._plans_by_radical) == 0
+
+        analyzer.plan_for_exp(2)
+        required_radicals = {
+            squarefree_kernel(exp + 1)
+            for exp in [2, 4]
+        }
+        assert set(analyzer._plans_by_radical) == required_radicals
+
+    def test_search_stable_boundary_flushes_database(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        list(
+            search_opn(
+                generate_odd_primes(50),
+                max_factors=5,
+                max_exp=2,
+                metrics=RunMetrics(),
+                propagate=True,
+                state_holder={},
+                checkpoint_interval_seconds=None,
+                sigma_database_path=str(path),
+                pool_plan_build_policy="after_db_miss",
+            )
+        )
+
+        connection = sqlite3.connect(str(path))
+        count = connection.execute(
+            "SELECT COUNT(*) FROM sigma_records"
+        ).fetchone()[0]
+        connection.close()
+        assert count > 0

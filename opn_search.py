@@ -20,7 +20,6 @@ from gmpy2 import mpz
 
 from opn_core import (
     CHECKPOINT_INTERVAL_SECONDS,
-    EAGER_POOL_PLAN_BUILD,
     ENABLE_FERMAT_DEBT,
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
@@ -151,6 +150,8 @@ def search_opn(
     checkpoint_interval_seconds: Optional[float] = CHECKPOINT_INTERVAL_SECONDS,
     stop_requested=None,
     use_cache: bool = False,
+    sigma_database_path: str | None = None,
+    pool_plan_build_policy: str = "eager",
 ):
     """Generator yielding State objects for each candidate found.
 
@@ -176,7 +177,16 @@ def search_opn(
             plan_chunk_primes=POOL_PLAN_CHUNK_PRIMES,
             pool_perf=metrics.performance.pool,
             structure=metrics.structure,
+            database_path=sigma_database_path,
+            plan_build_policy=pool_plan_build_policy,
         )
+        if sigma_pool_analyzer.database_error is not None:
+            print(
+                "[init] sigma database unavailable; "
+                "falling back to pool scans: "
+                f"{sigma_pool_analyzer.database_error}",
+                flush=True,
+            )
 
     print("using exact factor-slot tail bounds", flush=True)
 
@@ -184,10 +194,7 @@ def search_opn(
         EXCLUDE_EXP_4.clear()
         print("sigma-factor maps will be populated lazily")
 
-    if (
-        sigma_pool_analyzer is not None
-        and EAGER_POOL_PLAN_BUILD
-    ):
+    if sigma_pool_analyzer is not None:
         required_exponents = list(
             valid_even_exponents(2, max_exp)
         )
@@ -197,39 +204,45 @@ def search_opn(
                 valid_euler_exponents(1, max_exp)
             )
 
-        print(
-            "[init] prebuilding sigma-pool plans "
-            f"for exponents={sorted(set(required_exponents))} ...",
-            flush=True,
-        )
-
-        if observer is not None:
-            observer.set_phase("plan_prebuild")
-
-        plan_started = time.perf_counter()
-
-        sigma_pool_analyzer.prebuild_plans(
-            required_exponents
-        )
-
-        plan_elapsed = (
-            time.perf_counter() - plan_started
-        )
-
-        if observer is not None:
-            observer.capture_memory_phase(
-                metrics.performance.memory_phases,
-                "after_plan_prebuild",
+        if pool_plan_build_policy == "eager":
+            print(
+                "[init] prebuilding sigma-pool plans "
+                f"for exponents={sorted(set(required_exponents))} ...",
+                flush=True,
             )
-            observer.set_phase("search")
 
-        print(
-            "[init] sigma-pool plans ready: "
-            f"filtered={metrics.performance.pool.filtered_plan_count}, "
-            f"full={int(metrics.performance.pool.full_plan_built)}, "
-            f"time={plan_elapsed:.3f}s",
-            flush=True,
-        )
+            if observer is not None:
+                observer.set_phase("plan_prebuild")
+
+            plan_started = time.perf_counter()
+            sigma_pool_analyzer.configure_plan_build(
+                required_exponents
+            )
+            plan_elapsed = time.perf_counter() - plan_started
+
+            if observer is not None:
+                observer.capture_memory_phase(
+                    metrics.performance.memory_phases,
+                    "after_plan_prebuild",
+                )
+                observer.set_phase("search")
+
+            print(
+                "[init] sigma-pool plans ready: "
+                f"filtered={metrics.performance.pool.filtered_plan_count}, "
+                f"full={int(metrics.performance.pool.full_plan_built)}, "
+                f"time={plan_elapsed:.3f}s",
+                flush=True,
+            )
+        else:
+            sigma_pool_analyzer.configure_plan_build(
+                required_exponents
+            )
+            print(
+                "[init] sigma-pool plans deferred "
+                f"(policy={pool_plan_build_policy})",
+                flush=True,
+            )
 
     if observer is not None:
         observer.set_phase("search")
@@ -298,6 +311,8 @@ def search_opn(
         """Expose a coherent frontier while the search loop is paused."""
         nonlocal snapshot_id, last_checkpoint
         if state_holder is None:
+            if sigma_pool_analyzer is not None:
+                sigma_pool_analyzer.flush()
             last_checkpoint = time.monotonic()
             return
         snapshot_id += 1
@@ -317,6 +332,8 @@ def search_opn(
             "live_total_states": total_states,
             "live_elapsed": snapshot_elapsed,
         })
+        if sigma_pool_analyzer is not None:
+            sigma_pool_analyzer.flush()
         if checkpoint_callback is not None:
             checkpoint_callback(state_holder, reason)
         last_checkpoint = time.monotonic()

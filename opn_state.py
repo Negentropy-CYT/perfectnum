@@ -442,10 +442,6 @@ def assign_prime_chain(
         if sigma_pool_analyzer is not None:
             analysis = sigma_pool_analyzer.analyze(p, exp)
             if not analysis.exact:
-                residual_bits = int(analysis.residual).bit_length()
-                metrics.structure.outside_pool_sources[
-                    (p, exp, residual_bits)
-                ] += 1
                 return _reject(
                     metrics,
                     reason=PruneReason.OUTSIDE_WINDOW,

@@ -13,9 +13,10 @@ $$\sigma(N) = 2N \qquad\text{(perfect number condition)}$$
 ## Quick Start
 
 > **Note:** The checked-in configuration is **experimental**
-> (`MAX_PRIME=9e9`).  For a first run, set `MAX_PRIME = 100_000`
-> and `MAX_FACTORS = 12` at the top of `opn_core.py`.  See
-> [Configuration](#configuration-1) for safe defaults.
+> (`MAX_PRIME=4e9`, `MAX_FACTORS=60`, `MAX_EXP=25`).  For a first run,
+> set `MAX_PRIME = 100_000`, `MAX_FACTORS = 12`, and `MAX_EXP = 6`
+> at the top of `opn_core.py`.  See
+> [Configuration](#configuration) for safe defaults.
 
 ```bash
 python -m pip install -r requirements.txt
@@ -80,9 +81,10 @@ additively, tracking q-adic valuations.
 The engine incorporates **Touchard's theorem** ($N \equiv 1 \pmod{12}$ or
 $N \equiv 9 \pmod{36}$) as an O(1) congruence check, pre-clone valuation
 contradiction detection using lazily cached $\sigma(p^a)$ factor maps, and
-finite-window logical pruning of exponent-4 branches where $\sigma(p^4)$
-has at least one mandatory odd prime factor beyond the window.  A **maximum-prime capacity bound**
-(proved in Lean) constrains the exponent of the largest prime factor via
+finite-window logical pruning whenever the σ-pool analyser certifies a
+mandatory odd factor beyond the configured prime window.  A
+**maximum-prime capacity bound**, with a Lean formalisation in the author's
+local development tree, constrains the exponent of the largest prime factor via
 $B(\mathrm{oddpart}(R-1)) = \frac12\sum_{d\mid u,\,d>1}\varphi(d)^2$.
 A typed observability system records prune reasons and execution mechanisms
 as orthogonal dimensions, with per-run output written to a timestamped
@@ -96,6 +98,7 @@ as orthogonal dimensions, with per-run output written to a timestamped
 opn_main.py        Entry point (main loop, SIGINT, checkpoint/resume)
 opn_core.py        Arithmetic engine
                      · segmented odd-prime sieve → compact uint32/64 array
+                     · chunked NumPy validation for compact prime pools
                      · exponent-specific necessary-order filtering
                      · compact persistent superblocks + on-demand leaf GCD
                      · exact / outside-window σ-pool analysis
@@ -103,6 +106,9 @@ opn_core.py        Arithmetic engine
                      · factor-slot-aware ratio bounds
                      · max-prime capacity bound + LTE valuation helpers
                      · all user-configurable constants
+opn_sigma_db.py    Validated persistent σ-analysis cache
+                     · exact and window-partial SQLite records
+                     · payload checksums + prime-prefix certificates
 opn_metrics.py     Typed observability data models
                      · PruneReason / PruneMechanism / CloneEffect enums
                      · StructureMetrics, PoolPerformance, PerformanceMetrics
@@ -133,7 +139,8 @@ opn_runtime.py     Background performance sampler
 
 ```
 opn_metrics  (standalone)
-opn_core     ← gmpy2, numpy, opn_metrics
+opn_sigma_db ← sqlite3, gmpy2
+opn_core     ← gmpy2, numpy, opn_metrics, opn_sigma_db
 opn_state    ← opn_core, opn_metrics
 opn_search   ← opn_core, opn_state, opn_metrics
 opn_io       ← opn_core, opn_state
@@ -181,15 +188,17 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 | | Legacy | Current (DFS mode) | Current (factor chain) |
 |---|---|---|---|
 | **Per-state cost** | $O(1)$ — stack push + mpz multiply | $O(1)$ — same core operations | $\sigma$-pool analysis + tiered GCD |
-| **Memory** | ~1 MB (stack only) | ~10 MB (stack + caches) | ~50 MB (heap + factor/sigma/power caches) |
+| **Memory** | small stack footprint | stack + shared arithmetic caches | scales with prime pool, live heap, σ cache, and built plans |
 | **Time to first Descartes-spoof** (PRIME=397) | ~7 min | ~7 min | N/A (not applicable) |
 
 ### Why the Current Engine Is Slower Per State
 
-1. **Brent Pollard-Rho factorisation** — each reached $\sigma(p^{a})$ must be
-   fully factorised to propagate factor chains.  Maps are cached lazily after
-   cheaper bounds pass; the legacy engine never factorises $\sigma$ values.
-2. **State cloning** — `ChainState` carries 14 fields (7 collections); `clone()`
+1. **σ-pool analysis** — each reached $\sigma(p^{a})$ must have all mandatory
+   odd factors resolved before factor-chain propagation.  The primary path uses
+   memory and persistent caches followed by exponent-filtered hierarchical GCD
+   scans; general-purpose Pollard-Rho remains available outside this cold-scan
+   path.  The legacy engine does not resolve σ factor chains.
+2. **State cloning** — `ChainState` carries 14 fields (6 collections); `clone()`
    deep-copies all of them.  In DFS mode the lightweight `DFSState` (8 fields,
    2 collections) avoids this overhead.  The legacy engine reuses 5-element tuples.
 3. **Resonance computation** — computing σ-factor overlap via set intersections on
@@ -203,8 +212,9 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 ### Why the Current Engine Matters Despite the Slowdown
 
 - **The legacy engine cannot search beyond $a_i = 1$.**  Adding variable exponents
-  requires the factor-chain framework — factorising $\sigma(p^{a})$ is mandatory
-  to determine which new primes are forced into $N$.
+  requires the factor-chain framework — resolving the odd prime factors and
+  valuations of $\sigma(p^{a})$ is mandatory to determine which new primes are
+  forced into $N$.
 - **Resonance telemetry** is computed but its priority weight is currently
   zero — it does not affect search order.
 - **The additive q-adic valuation** provides a correctness guarantee that the
@@ -271,6 +281,14 @@ MAX_PRIME  = 1_000_000_000; MAX_FACTORS = 60; MAX_EXP = 18
 MAX_PRIME  = 9_000_000_000  # requires ~4 GiB prime storage
 ```
 
+The checked-in local configuration is currently:
+
+```python
+MAX_PRIME = 5_000_000_000
+MAX_FACTORS = 60
+MAX_EXP = 25
+```
+
 `PROPAGATE=True` enables factor-chain (true-OPN) search;
 `PROPAGATE=False` runs Descartes-spoof DFS.
 
@@ -278,6 +296,9 @@ Additional controls:
 ```python
 POOL_GCD_MODE = "hierarchical"  # "flat" or "hierarchical"
 POOL_SUPERBLOCK_FANOUT = 16
+SIGMA_DATABASE_ENABLED = True
+SIGMA_DATABASE_FILE = "sigma_pool.sqlite3"
+POOL_PLAN_BUILD_POLICY = "adaptive"  # eager / after_db_miss / adaptive
 ENABLE_FERMAT_DEBT = False      # conservative debt-capacity bound (off)
 CHECKPOINT_INTERVAL_SECONDS = 300.0
 ```
@@ -286,8 +307,30 @@ In `hierarchical` mode, plans retain only exact superblock products.  Leaf
 products are rebuilt from the immutable eligible-prime array after a positive
 superblock GCD and released immediately after the leaf check.  The `flat` mode
 continues to retain leaf products as a correctness oracle.  Performance schema
-3 reports logical/resident leaf counts and dynamic rebuild work separately;
-schema-1/2 checkpoints remain readable.
+5 reports logical/resident leaf counts, dynamic rebuild work, and persistent
+cache health; schema-1/2/3/4 checkpoints remain readable.
+
+The sigma database stores validated exact and window-partial analyses.  Lookup
+occurs before any pool plan is built.  Exact records are window-independent;
+when the prime window grows, a compatible partial record continues from its
+complete residual.  Before a shared full plan exists, a substantial certified
+prefix uses a new-interval plan.  Once a shared plan exists, its scan starts at
+the leaf containing the first prime above the certified limit, so the old
+prefix is not traversed again (at most that one boundary leaf is conservatively
+rechecked).  Prefix positions are cached and searched with a scalar of the
+array's exact NumPy dtype, preserving logarithmic lookup for both 32-bit and
+64-bit prime arrays.  Every row carries a checksum and arithmetic identity
+check, while partial rows also require a SHA-256 certificate for the
+corresponding prime-pool prefix.  Invalid or incompatible rows are treated as
+ordinary cache misses.
+
+`adaptive` is the recommended plan policy.  A warm repeated search can avoid
+all plans, while a cold search initially builds plans on demand and switches to
+batched prebuilding after several distinct plan misses.  Database commits are
+batched and flushed at stable checkpoint boundaries.  Deleting
+`sigma_pool.sqlite3` and its `-wal`/`-shm` companions discards only reusable
+derived data; it does not affect checkpoints or mathematical results.  Stop
+the program before deleting any of these three files.
 
 ### Search Modes
 
@@ -298,7 +341,7 @@ schema-1/2 checkpoints remain readable.
 
 ### Interpreting Output
 
-**Progress line** (update interval set by `PROGRESS_INTERVAL` in `opn_core.py`):
+**Progress line** (time-based, approximately once per second):
 ```
 [Progress] States:  884,300,000 | Time:  582.1s | Rate: 1519000/s | |f|=8 ratio=1.8486 reson=-3.42
 ```
@@ -354,8 +397,8 @@ Output is written to a timestamped `runs/<run_id>/` directory:
 |---|---|
 | `summary.txt` | Run identity, configuration, result, report index |
 | `manifest.json` | Machine-readable config + version |
-| `structure.txt` / `.json` | Mathematical results: prune reasons, depth histogram, clone payload, ratio headroom, propagation edges, sigma classifications, contradiction attribution, pending-prime frequency |
-| `performance.txt` / `.json` | Engineering metrics: phase timings, pool cache, GCD workload, plan build timing, prune mechanisms, core timings, slowest analyses, memory snapshots |
+| `structure.txt` / `.json` | Mathematical results: prune reasons, depth histogram, ratio headroom, propagation edges, sigma classifications, contradiction attribution, pending-prime frequency. The text report also includes a concise clone summary; the JSON remains structural. |
+| `performance.txt` / `.json` | Engineering metrics: phase timings, clone payload, pool cache, GCD workload, plan build timing, prune mechanisms, core timings, slowest analyses, memory snapshots |
 | `performance_samples.csv` | Time-series: RSS, CPU, rate, frontier size (2 s interval) |
 
 Prune counters are recorded in two orthogonal dimensions:
@@ -401,16 +444,19 @@ and validated against all five fingerprint fields.  A mismatch raises
 `RuntimeError` — the search will not silently continue with an
 incompatible prime pool.
 
+The checkpoint also retains the set of `(p, exponent)` sigma analyses already
+counted in structural telemetry.  This set is not part of the mathematical
+state and is not emitted in reports; it only prevents a database-loaded result
+from being counted twice after a restart.  Search decisions depend on the
+validated sigma result itself, never on this telemetry set.
+
 Delete `checkpoint_merged.pkl` to force a fresh start.
 
 ### Comparing Runs
 
-The `structure.json` and `performance.json` files are machine-readable,
-enabling direct comparison across configurations:
-
-```powershell
-python compare_runs.py runs/run1 runs/run2
-```
+The `structure.json` and `performance.json` files are machine-readable and can
+be compared with ordinary JSON tooling.  The repository does not currently
+ship a dedicated run-comparison command.
 
 ---
 
@@ -462,12 +508,17 @@ This eliminates wasted clones — the dominant structural overhead in
 factor-chain search where 49% of clones were previously discarded after
 post-clone factorisation.
 
-### EXCLUDE_EXP_4 Pruning
+### σ-Pool Outside-Window Pruning
 
-If $\sigma(p^{4})$ has any odd prime factor exceeding `MAX_PRIME`, the
-$a=4$ include branch is skipped.  This is **window-complete** logical
-pruning: every such factor is mandatory and would become an unresolvable
-pending obligation.  $a=2$ is never filtered by this specialised check.
+Before a chain assignment is cloned, the σ-pool analyser strips every eligible
+prime in the configured complete odd-prime pool.  If the complete residual is
+greater than one, at least one mandatory odd factor lies beyond `MAX_PRIME`,
+and the branch is rejected.  This applies to every reached exponent rather
+than relying on a separately precomputed exponent-4 table.
+
+`EXCLUDE_EXP_4` and its helper functions remain in `opn_core.py` for
+compatibility and focused tests, but the current production search does not
+populate or consult that specialised table.
 
 ### Precise Next-Prime Interval Bounds (Nielsen Prop. 3)
 

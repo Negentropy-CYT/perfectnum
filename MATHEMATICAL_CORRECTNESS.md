@@ -31,7 +31,7 @@ resource budget is added, reaching that budget must produce an explicit
 ## Sigma-Pool Analysis Contract
 
 The pool analyser (`SigmaPoolAnalyzer`) classifies each σ(p^a) against the
-configured odd-prime pool.  Four correctness invariants hold:
+configured odd-prime pool.  Five correctness invariants hold:
 
 1. The prime pool **must** be the complete ordered set of odd primes from 3
    through `prime_limit`.  The analyser validates "starts at 3, odd, strictly
@@ -43,11 +43,9 @@ configured odd-prime pool.  Four correctness invariants hold:
    is a complete map that can be written to `_SIG_VALUATIONS`.
 
 3. `exact=False` means the cofactor after removing all in-pool primes
-   exceeds 1.  For a **cold** (first-time) analysis, this cofactor is the
-   complete residual after exhausting the pool.  For an
-   **exact-global-cache** fast path, the residual may be a single
-   certified outside-window witness rather than the full cofactor.
-   In both cases `residual > 1` is sufficient for the finite-window
+   exceeds 1.  Both cold scans and exact-global-cache partitioning return
+   the **complete** outside-window cofactor with multiplicity, not merely
+   one witness.  `residual > 1` is sufficient for the finite-window
    rejection.  The returned `valuations` is **partial** and must **not**
    be used for factor-chain propagation or written to the global exact
    cache.
@@ -57,16 +55,36 @@ configured odd-prime pool.  Four correctness invariants hold:
    is ever missed.  The exponent-order filter is also a necessary
    condition (see below).
 
+5. Persistent records are derived cache entries, not unchecked facts.  Before
+   reuse, their factor keys are prime-tested, their payload checksum is
+   verified, and the exact identity
+
+   ```
+   oddpart(sigma(p^a)) = residual * product(q^valuations[q])
+   ```
+
+   is recomputed.  A partial record additionally carries a SHA-256 digest of
+   the complete prime-pool prefix it scanned.  On a larger compatible window,
+   its complete residual is scanned against either the new interval or the
+   suffix of an already-useful shared full plan; old and new valuations are
+   then merged.  For the shared plan, scanning begins at the leaf containing
+   the first eligible prime above the certified limit.  Rounding down to that
+   leaf boundary can only recheck certified primes; it cannot skip a new prime.
+   This is valid because the stored residual is coprime to every prime in the
+   certified prefix, and the exponent filter used to form the plan is a
+   necessary condition.  Any invalid or incompatible record is ignored and
+   the ordinary full-window analysis is used.
+
 ## Exponent Filter Correctness
 
-For an odd prime q ≠ p dividing σ(p^a), let n = a+1.  From
+For an odd prime q ≠ p dividing σ(p^a), let n = a+1.  We have
 
 ```
 σ(p^a) = (p^n - 1) / (p - 1)
 ```
 
-and q ∤ (p - 1) (since q is odd and 0 < p - 1 < q for all
-non-trivial cases), we have q | (p^n - 1).
+Multiplying the divisibility q | σ(p^a) by p - 1 gives
+q | (p^n - 1).  No ordering assumption between p and q is needed.
 
 **Case 1:** p ≡ 1 (mod q).  Then σ(p^a) ≡ n (mod q), so q | n.
 

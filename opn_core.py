@@ -9,6 +9,9 @@ user-configurable constants.
 
 import math
 import random
+import hashlib
+import sqlite3
+import struct
 import time
 from array import array
 import gmpy2
@@ -20,6 +23,7 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from opn_metrics import PoolPerformance
+from opn_sigma_db import PersistedSigmaRecord, SigmaAnalysisDatabase
 if TYPE_CHECKING:
     from opn_metrics import PerformanceMetrics, StructureMetrics
 
@@ -28,7 +32,7 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 12500000000     # largest odd prime considered
+MAX_PRIME         = 9000000000     # largest odd prime considered
 MAX_FACTORS       = 60         # max distinct prime factors in N
 MAX_EXP           = 25         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = Descartes-spoof DFS; True = true OPN chain
@@ -38,14 +42,21 @@ ENABLE_FERMAT_DEBT = False
 POOL_GCD_MODE = "hierarchical"          # "flat" or "hierarchical"
 POOL_SUPERBLOCK_FANOUT = 16
 
-# Build exponent-specific prime plans before active search.
-EAGER_POOL_PLAN_BUILD = True
+# Persistent sigma analysis and plan-build policy.
+SIGMA_DATABASE_ENABLED = True
+SIGMA_DATABASE_FILE = "sigma_pool.sqlite3"
+POOL_PLAN_BUILD_POLICY = "adaptive"  # "eager", "after_db_miss", "adaptive"
+POOL_ADAPTIVE_BUILD_THRESHOLD = 3
+# Incremental plans are worthwhile only when the persisted prefix represents
+# a substantial part of the current pool.  Otherwise one reusable full plan
+# avoids building almost-full interval plans before new database misses.
+POOL_INCREMENTAL_MIN_PREFIX_FRACTION = 0.5
 
 # Number of master-pool primes processed by one NumPy chunk.
 # At 2,000,000:
 #   uint32 temporary working memory is roughly 30–40 MiB;
 #   uint64 temporary working memory is roughly 45–60 MiB.
-POOL_PLAN_CHUNK_PRIMES = 2_000_000
+POOL_PLAN_CHUNK_PRIMES = 4_000_000
 
 # ── search mode (target + Euler + forced/excluded primes) ─────
 # Single configuration point for OPN vs. friend-of-10 searches.
@@ -88,9 +99,13 @@ class SigmaPoolAnalysis:
     exact=True: *valuations* is the complete odd-prime valuation map
     and *residual* is 1.
 
-    exact=False: *residual* > 1 and has no prime factor in the pool.
-    *valuations* is only the pool-internal partial map and must not
-    be used for factor-chain propagation.
+    exact=False: *residual* is the complete odd cofactor left after every
+    pool prime (with multiplicity) has been removed, so it is > 1 and has
+    no prime factor in the pool.  *valuations* is only the pool-internal
+    partial map and must not be used for factor-chain propagation.
+
+    *outside_witness* is the smallest outside-pool prime when an exact global
+    factorisation supplied that information; a cold scan may leave it unset.
     """
     exact: bool
     valuations: Dict[int, int]
@@ -238,6 +253,164 @@ def _numpy_prime_view(
     )
 
     return np.asarray(primes, dtype=dtype), dtype
+
+
+def _typed_searchsorted_right(
+    sorted_values: np.ndarray,
+    value: int,
+) -> int:
+    """Return a right insertion point without whole-array dtype promotion.
+
+    On very large unsigned arrays, passing a Python ``int`` directly to
+    NumPy's ``searchsorted`` can make dtype resolution traverse the complete
+    input.  Converting the scalar to the array's exact dtype preserves the
+    intended O(log n) binary search.
+    """
+    if sorted_values.ndim != 1:
+        raise ValueError("searchsorted input must be one-dimensional")
+    if not np.issubdtype(sorted_values.dtype, np.integer):
+        raise TypeError("searchsorted input must have an integer dtype")
+
+    raw_value = int(value)
+    bounds = np.iinfo(sorted_values.dtype)
+    if raw_value < int(bounds.min):
+        return 0
+    if raw_value > int(bounds.max):
+        return len(sorted_values)
+
+    typed_value = sorted_values.dtype.type(raw_value)
+    return int(
+        np.searchsorted(
+            sorted_values,
+            typed_value,
+            side="right",
+        )
+    )
+
+
+def _validate_prime_pool_scalar(
+    primes: Sequence[int],
+) -> None:
+    """Validate an external Python sequence without unsigned coercion."""
+    if len(primes) == 0:
+        raise ValueError("prime pool must not be empty")
+    if int(primes[0]) != 3:
+        raise ValueError("complete odd-prime pool must start at 3")
+
+    previous = 1
+    for raw_q in primes:
+        q = int(raw_q)
+        if q < 3 or q % 2 == 0:
+            raise ValueError(
+                "prime pool must contain only odd integers >= 3"
+            )
+        if q <= previous:
+            raise ValueError("prime pool must be strictly increasing")
+        previous = q
+
+
+def validate_prime_pool_vectorized(
+    primes: Sequence[int],
+    *,
+    chunk_size: int = 4_000_000,
+) -> None:
+    """Validate odd-pool structure, vectorizing compact integer storage.
+
+    ``array('I'/'Q')`` and one-dimensional NumPy integer arrays are checked
+    in bounded chunks.  Other Python sequences use the scalar path so invalid
+    negative or oversized values cannot be hidden by unsigned conversion.
+    This validates the same structural contract as the former constructor
+    loop; it does not independently prove primality.
+    """
+    if chunk_size <= 0:
+        raise ValueError("prime validation chunk_size must be positive")
+    if len(primes) == 0:
+        raise ValueError("prime pool must not be empty")
+
+    if isinstance(primes, array):
+        compact_unsigned = (
+            primes.typecode == "I"
+            and primes.itemsize == 4
+        ) or (
+            primes.typecode == "Q"
+            and primes.itemsize == 8
+        )
+        if not compact_unsigned:
+            _validate_prime_pool_scalar(primes)
+            return
+        view, _dtype = _numpy_prime_view(primes)
+    elif isinstance(primes, np.ndarray):
+        if primes.ndim != 1:
+            raise ValueError("prime pool NumPy array must be one-dimensional")
+        if not np.issubdtype(primes.dtype, np.integer):
+            raise TypeError("prime pool NumPy array must have an integer dtype")
+        view = primes
+    else:
+        _validate_prime_pool_scalar(primes)
+        return
+
+    if int(view[0]) != 3:
+        raise ValueError("complete odd-prime pool must start at 3")
+
+    previous_last: Optional[int] = None
+    for start in range(0, len(view), chunk_size):
+        stop = min(start + chunk_size, len(view))
+        chunk = view[start:stop]
+
+        if np.any(chunk < 3) or (
+            np.count_nonzero(np.bitwise_and(chunk, 1))
+            != len(chunk)
+        ):
+            raise ValueError(
+                "prime pool must contain only odd integers >= 3"
+            )
+        if (
+            previous_last is not None
+            and int(chunk[0]) <= previous_last
+        ):
+            raise ValueError("prime pool must be strictly increasing")
+        if (
+            len(chunk) > 1
+            and np.any(chunk[1:] <= chunk[:-1])
+        ):
+            raise ValueError("prime pool must be strictly increasing")
+
+        previous_last = int(chunk[-1])
+
+
+def prime_pool_prefix_digest(
+    primes: Sequence[int],
+    stop: int | None = None,
+    *,
+    chunk_size: int = 1_000_000,
+) -> bytes:
+    """Return a storage-independent SHA-256 digest of a prime-pool prefix.
+
+    Values are hashed as canonical little-endian uint64 integers, so an
+    ``array('I')`` prefix and the same values in ``array('Q')`` have the same
+    identity.  The bounded conversion chunks avoid a second full-size copy.
+    """
+    if chunk_size <= 0:
+        raise ValueError("prime digest chunk_size must be positive")
+
+    view, _dtype = _numpy_prime_view(primes)
+    prefix_stop = len(view) if stop is None else int(stop)
+    if prefix_stop <= 0 or prefix_stop > len(view):
+        raise ValueError("prime digest prefix is out of range")
+
+    digest = hashlib.sha256()
+    digest.update(b"opn-prime-pool-v1\0")
+    digest.update(struct.pack(">Q", prefix_stop))
+
+    for start in range(0, prefix_stop, chunk_size):
+        chunk_stop = min(start + chunk_size, prefix_stop)
+        canonical = np.asarray(
+            view[start:chunk_stop],
+            dtype=np.dtype("<u8"),
+        )
+        digest.update(memoryview(canonical).cast("B"))
+
+    return digest.digest()
 
 
 def _factor_masks_for_chunk(
@@ -443,10 +616,10 @@ def build_filtered_prime_pools_vectorized(
         pool_perf.plan_filter_source_values += (
             2 * source_count
         )
-        pool_perf.filtered_prime_values = sum(
+        pool_perf.filtered_prime_values += sum(
             counts.values()
         )
-        pool_perf.filtered_prime_bytes = sum(
+        pool_perf.filtered_prime_bytes += sum(
             output.nbytes
             for output in outputs.values()
         )
@@ -683,11 +856,21 @@ def _build_dynamic_leaf_product(
     )
 
 
-def _scan_blocks_flat(residual: mpz, inside: dict, plan, perf: "PoolPerformance") -> mpz:
+def _scan_blocks_flat(
+    residual: mpz,
+    inside: dict,
+    plan,
+    perf: "PoolPerformance",
+    *,
+    start_leaf: int = 0,
+) -> mpz:
     """Flat correctness-oracle scanner."""
-    for block in plan.blocks:
+    if start_leaf < 0 or start_leaf > plan.leaf_block_count:
+        raise ValueError("flat scan start leaf is out of range")
+    for block_idx in range(start_leaf, len(plan.blocks)):
         if residual == 1:
             break
+        block = plan.blocks[block_idx]
         perf.leaf_blocks_tested += 1
         if gmpy2.gcd(residual, block.product) == 1:
             continue
@@ -696,13 +879,33 @@ def _scan_blocks_flat(residual: mpz, inside: dict, plan, perf: "PoolPerformance"
     return residual
 
 
-def _scan_blocks_hierarchical(residual: mpz, inside: dict, plan, perf: "PoolPerformance") -> mpz:
-    """Two-level scanner: superblock gcd → leaf-block gcd."""
-    for sb in plan.superblocks:
+def _scan_blocks_hierarchical(
+    residual: mpz,
+    inside: dict,
+    plan,
+    perf: "PoolPerformance",
+    *,
+    start_leaf: int = 0,
+) -> mpz:
+    """Two-level scanner: superblock gcd → leaf-block gcd.
+
+    ``start_leaf`` may skip a prefix already certified coprime to ``residual``.
+    The boundary is rounded down to its containing superblock, so no possible
+    factor after the boundary can be missed.
+    """
+    if start_leaf < 0 or start_leaf > plan.leaf_block_count:
+        raise ValueError("hierarchical scan start leaf is out of range")
+    if start_leaf == plan.leaf_block_count:
+        return residual
+
+    start_superblock = start_leaf // plan.superblock_fanout
+    for superblock_idx in range(start_superblock, len(plan.superblocks)):
         if residual == 1:
             break
+        sb = plan.superblocks[superblock_idx]
         perf.superblocks_tested += 1
-        if gmpy2.gcd(residual, sb.product) == 1:
+        super_hit = gmpy2.gcd(residual, sb.product)
+        if super_hit == 1:
             perf.leaf_blocks_skipped += (
                 sb.stop_leaf - sb.start_leaf
             )
@@ -711,6 +914,8 @@ def _scan_blocks_hierarchical(residual: mpz, inside: dict, plan, perf: "PoolPerf
         found_positive_leaf = False
         for leaf_idx in range(sb.start_leaf, sb.stop_leaf):
             if residual == 1:
+                break
+            if super_hit == 1:
                 break
 
             rebuild_started = time.perf_counter_ns()
@@ -725,7 +930,8 @@ def _scan_blocks_hierarchical(residual: mpz, inside: dict, plan, perf: "PoolPerf
             perf.dynamic_leaf_prime_values += stop - start
 
             perf.leaf_blocks_tested += 1
-            if gmpy2.gcd(residual, leaf_product) == 1:
+            leaf_hit = gmpy2.gcd(super_hit, leaf_product)
+            if leaf_hit == 1:
                 continue
             found_positive_leaf = True
             perf.positive_blocks += 1
@@ -737,6 +943,9 @@ def _scan_blocks_hierarchical(residual: mpz, inside: dict, plan, perf: "PoolPerf
                 stop,
                 perf,
             )
+            # Leaf prime sets are disjoint and the superblock product is
+            # squarefree, so these hit primes cannot occur in a later leaf.
+            super_hit //= leaf_hit
         if __debug__ and not found_positive_leaf:
             raise AssertionError(
                 "positive superblock produced no positive leaf"
@@ -757,30 +966,34 @@ class SigmaPoolAnalyzer:
                  gcd_mode: str = "flat",
                  plan_chunk_primes: int = POOL_PLAN_CHUNK_PRIMES,
                  pool_perf: "PoolPerformance | None" = None,
-                 structure: "StructureMetrics | None" = None) -> None:
-        if not primes:
-            raise ValueError("prime pool must not be empty")
-        if int(primes[0]) != 3:
-            raise ValueError("complete odd-prime pool must start at 3")
-        previous = 1
-        for raw_q in primes:
-            q = int(raw_q)
-            if q < 3 or q % 2 == 0:
-                raise ValueError("prime pool must contain only odd integers >= 3")
-            if q <= previous:
-                raise ValueError("prime pool must be strictly increasing")
-            previous = q
+                 structure: "StructureMetrics | None" = None,
+                 database_path: str | None = None,
+                 plan_build_policy: str = "eager",
+                 adaptive_build_threshold: int =
+                 POOL_ADAPTIVE_BUILD_THRESHOLD) -> None:
+        validate_prime_pool_vectorized(primes)
         if gcd_mode not in {"flat", "hierarchical"}:
             raise ValueError("gcd_mode must be 'flat' or 'hierarchical'")
         if superblock_fanout < 2:
             raise ValueError("superblock_fanout must be at least 2")
+        if plan_build_policy not in {
+            "eager",
+            "after_db_miss",
+            "adaptive",
+        }:
+            raise ValueError("invalid pool plan build policy")
+        if adaptive_build_threshold < 1:
+            raise ValueError("adaptive build threshold must be positive")
 
         self.primes = primes
+        self._prime_view, _dtype = _numpy_prime_view(primes)
         self.prime_limit = int(primes[-1])
         self.block_size = block_size
         self.superblock_fanout = superblock_fanout
         self.gcd_mode = gcd_mode
         self.plan_chunk_primes = plan_chunk_primes
+        self.plan_build_policy = plan_build_policy
+        self.adaptive_build_threshold = adaptive_build_threshold
         self._scan = _scan_blocks_hierarchical if gcd_mode == "hierarchical" else _scan_blocks_flat
         self._use_superblocks = (gcd_mode == "hierarchical")
 
@@ -788,10 +1001,201 @@ class SigmaPoolAnalyzer:
         self._full_plan: PrimeBlockPlan | None = None
         # Plans are keyed by rad(exp + 1), not exp + 1 itself.
         self._plans_by_radical: Dict[int, PrimeBlockPlan] = {}
+        # Incremental plans are keyed by (prefix stop, 0-or-radical).
+        self._interval_plans: Dict[Tuple[int, int], PrimeBlockPlan] = {}
+        self._required_exponents: Tuple[int, ...] = ()
+        self._normal_plan_miss_keys: set[int] = set()
 
         self._cache: Dict[Tuple[int, int], SigmaPoolAnalysis] = {}
         self._perf: "PoolPerformance" = pool_perf if pool_perf is not None else PoolPerformance()
         self._structure: "StructureMetrics | None" = structure
+        self._pool_digest_cache: Dict[int, bytes] = {}
+        self._prime_prefix_stop_cache: Dict[int, int] = {}
+        self._normal_plan_scan_leaf_cache: Dict[Tuple[int, int], int] = {}
+        self._database: SigmaAnalysisDatabase | None = None
+        self.database_error: str | None = None
+        if database_path is not None:
+            try:
+                self._database = SigmaAnalysisDatabase(database_path)
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                self.database_error = str(exc)
+
+    def configure_plan_build(
+        self,
+        exponents: Sequence[int],
+    ) -> None:
+        """Record the exponent domain and eagerly build only by policy."""
+        self._required_exponents = tuple(
+            sorted(set(int(exp) for exp in exponents))
+        )
+        if self.plan_build_policy == "eager":
+            self.prebuild_plans(self._required_exponents)
+
+    @staticmethod
+    def _normal_plan_key(exp: int) -> int:
+        n = exp + 1
+        return 0 if n % 2 == 0 else squarefree_kernel(n)
+
+    def _cached_normal_plan(
+        self,
+        exp: int,
+    ) -> PrimeBlockPlan | None:
+        key = self._normal_plan_key(exp)
+        if key == 0:
+            return self._full_plan
+        return self._plans_by_radical.get(key)
+
+    def _evict_interval_plans_for_key(self, key: int) -> None:
+        stale = [
+            interval_key
+            for interval_key in self._interval_plans
+            if interval_key[1] == key
+        ]
+        for interval_key in stale:
+            del self._interval_plans[interval_key]
+
+    def _maybe_adaptive_prebuild(self, exp: int) -> None:
+        if (
+            self.plan_build_policy != "adaptive"
+            or not self._required_exponents
+        ):
+            return
+        self._normal_plan_miss_keys.add(
+            self._normal_plan_key(exp)
+        )
+        if (
+            len(self._normal_plan_miss_keys)
+            >= self.adaptive_build_threshold
+        ):
+            # Full-window plans supersede incremental plans.  Release the
+            # latter before bulk construction so both layers never define
+            # the steady-state memory footprint.
+            self._interval_plans.clear()
+            self.prebuild_plans(self._required_exponents)
+
+    def _pool_digest_for_limit(
+        self,
+        limit: int,
+    ) -> bytes | None:
+        """Return the certified current-pool prefix ending at *limit*."""
+        limit = int(limit)
+        cached = self._pool_digest_cache.get(limit)
+        if cached is not None:
+            return cached
+        if limit > self.prime_limit:
+            return None
+
+        stop = self._prime_prefix_stop(limit)
+        if (
+            stop == 0
+            or int(self._prime_view[stop - 1]) != limit
+        ):
+            return None
+
+        digest = prime_pool_prefix_digest(
+            self._prime_view,
+            stop,
+        )
+        self._pool_digest_cache[limit] = digest
+        return digest
+
+    def _prime_prefix_stop(self, limit: int) -> int:
+        """Return the number of pool primes not exceeding ``limit``."""
+        limit = int(limit)
+        cached = self._prime_prefix_stop_cache.get(limit)
+        if cached is not None:
+            return cached
+        stop = _typed_searchsorted_right(self._prime_view, limit)
+        self._prime_prefix_stop_cache[limit] = stop
+        return stop
+
+    def _scan_start_leaf(
+        self,
+        plan: PrimeBlockPlan,
+        exp: int,
+        lower_limit: int | None,
+    ) -> int:
+        """Locate a certified prefix boundary in a shared normal plan.
+
+        An interval plan already begins above ``lower_limit`` and scans from
+        leaf zero.  A normal plan can be reused without rescanning the certified
+        prefix by starting at the leaf containing its first eligible prime
+        above the persisted limit.
+        """
+        if lower_limit is None:
+            return 0
+
+        normal = self._cached_normal_plan(exp)
+        if plan is not normal:
+            return 0
+
+        cache_key = (
+            self._normal_plan_key(exp),
+            int(lower_limit),
+        )
+        cached = self._normal_plan_scan_leaf_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        plan_view, _dtype = _numpy_prime_view(plan.primes)
+        first_new_index = _typed_searchsorted_right(
+            plan_view,
+            int(lower_limit),
+        )
+        if first_new_index >= len(plan_view):
+            start_leaf = plan.leaf_block_count
+        else:
+            start_leaf = first_new_index // plan.block_size
+        self._normal_plan_scan_leaf_cache[cache_key] = start_leaf
+        return start_leaf
+
+    def _candidate_leaf_count(
+        self,
+        plan: PrimeBlockPlan,
+        start_leaf: int,
+    ) -> int:
+        """Return the logical leaf count reachable by this scan."""
+        if start_leaf < 0 or start_leaf > plan.leaf_block_count:
+            raise ValueError("candidate start leaf is out of range")
+        if start_leaf == plan.leaf_block_count:
+            return 0
+        if not self._use_superblocks:
+            return plan.leaf_block_count - start_leaf
+
+        start_superblock = start_leaf // plan.superblock_fanout
+        effective_start = plan.superblocks[start_superblock].start_leaf
+        return plan.leaf_block_count - effective_start
+
+    def _record_structure(
+        self,
+        p: int,
+        exp: int,
+        result: SigmaPoolAnalysis,
+    ) -> None:
+        if self._structure is None:
+            return
+        key = (int(p), int(exp))
+        if key in self._structure.sigma_classified_keys:
+            return
+        self._structure.sigma_classified_keys.add(key)
+        if result.exact:
+            self._structure.sigma_exact += 1
+        else:
+            self._structure.sigma_outside += 1
+            residual_bits = int(result.residual).bit_length()
+            self._structure.outside_pool_sources[
+                (key[0], key[1], residual_bits)
+            ] += 1
+
+    def flush(self) -> None:
+        """Durably commit pending persistent-cache records."""
+        if self._database is not None:
+            self._database.flush()
+
+    def close(self) -> None:
+        if self._database is not None:
+            self._database.close()
+            self._database = None
 
     def prebuild_plans(
         self,
@@ -824,6 +1228,8 @@ class SigmaPoolAnalyzer:
         )
 
         if missing_radicals:
+            for radical in missing_radicals:
+                self._evict_interval_plans_for_key(radical)
             filtered_pools = (
                 build_filtered_prime_pools_vectorized(
                     self.primes,
@@ -846,6 +1252,7 @@ class SigmaPoolAnalyzer:
                 )
 
         if need_full_plan and self._full_plan is None:
+            self._evict_interval_plans_for_key(0)
             self._full_plan = build_prime_block_plan(
                 self.primes,
                 block_size=self.block_size,
@@ -859,12 +1266,34 @@ class SigmaPoolAnalyzer:
         self._perf.full_plan_built = self._full_plan is not None
         self._perf.plan_prebuild_ns += (time.perf_counter_ns() - started)
 
-    def plan_for_exp(self, exp: int) -> PrimeBlockPlan:
-        """Return the necessary-order block plan for one exponent."""
+    def plan_for_exp(
+        self,
+        exp: int,
+        *,
+        lower_limit: int | None = None,
+    ) -> PrimeBlockPlan:
+        """Return a full-window or incremental necessary-order plan."""
+        if lower_limit is not None and lower_limit >= 3:
+            normal = self._cached_normal_plan(exp)
+            if normal is not None:
+                return normal
+            prefix_stop = self._prime_prefix_stop(lower_limit)
+            if (
+                prefix_stop / len(self._prime_view)
+                >= POOL_INCREMENTAL_MIN_PREFIX_FRACTION
+            ):
+                return self._interval_plan_for_exp(
+                    exp,
+                    lower_limit=int(lower_limit),
+                )
+
         n = exp + 1
 
         if n % 2 == 0:
             if self._full_plan is None:
+                self._maybe_adaptive_prebuild(exp)
+            if self._full_plan is None:
+                self._evict_interval_plans_for_key(0)
                 self._full_plan = build_prime_block_plan(
                     self.primes,
                     block_size=self.block_size,
@@ -880,6 +1309,12 @@ class SigmaPoolAnalyzer:
         if cached is not None:
             return cached
 
+        self._maybe_adaptive_prebuild(exp)
+        cached = self._plans_by_radical.get(radical)
+        if cached is not None:
+            return cached
+
+        self._evict_interval_plans_for_key(radical)
         filtered = build_filtered_prime_pools_vectorized(
             self.primes,
             [radical],
@@ -900,6 +1335,171 @@ class SigmaPoolAnalyzer:
         self._perf.filtered_plan_count = len(self._plans_by_radical)
         return plan
 
+    def _interval_plan_for_exp(
+        self,
+        exp: int,
+        *,
+        lower_limit: int,
+    ) -> PrimeBlockPlan:
+        """Build a shared plan over primes in ``(lower_limit, P]``."""
+        start = self._prime_prefix_stop(lower_limit)
+        if start >= len(self._prime_view):
+            raise ValueError("incremental prime interval is empty")
+
+        n = exp + 1
+        radical = 0 if n % 2 == 0 else squarefree_kernel(n)
+        key = (start, radical)
+        cached = self._interval_plans.get(key)
+        if cached is not None:
+            return cached
+
+        interval = self._prime_view[start:]
+        if radical == 0:
+            eligible = interval
+        else:
+            eligible = build_filtered_prime_pools_vectorized(
+                interval,
+                [radical],
+                chunk_primes=self.plan_chunk_primes,
+                pool_perf=self._perf,
+            )[radical]
+
+        plan = build_prime_block_plan(
+            interval,
+            block_size=self.block_size,
+            superblock_fanout=self.superblock_fanout,
+            eligible_primes=eligible,
+            build_superblocks=self._use_superblocks,
+            pool_perf=self._perf,
+        )
+        self._interval_plans[key] = plan
+        return plan
+
+    def _analysis_from_exact(
+        self,
+        valuations: Dict[int, int],
+    ) -> SigmaPoolAnalysis:
+        inside: Dict[int, int] = {}
+        outside_residual = mpz(1)
+        outside_witness: Optional[int] = None
+
+        for q, exponent in valuations.items():
+            if q <= self.prime_limit:
+                inside[q] = exponent
+                continue
+            outside_residual *= mpz(q) ** exponent
+            if outside_witness is None or q < outside_witness:
+                outside_witness = q
+
+        if outside_witness is None:
+            return SigmaPoolAnalysis(
+                exact=True,
+                valuations=valuations,
+                residual=mpz(1),
+            )
+        return SigmaPoolAnalysis(
+            exact=False,
+            valuations=inside,
+            residual=outside_residual,
+            outside_witness=outside_witness,
+        )
+
+    def _disable_database(self, exc: Exception) -> None:
+        self.database_error = str(exc)
+        database = self._database
+        self._database = None
+        if database is not None:
+            try:
+                database.close()
+            except (OSError, sqlite3.Error):
+                pass
+
+    def _load_persisted(
+        self,
+        p: int,
+        exp: int,
+        *,
+        sigma_odd: mpz,
+    ) -> PersistedSigmaRecord | None:
+        if self._database is None:
+            return None
+        try:
+            candidates, invalid = self._database.load_candidates(
+                p,
+                exp,
+                sigma_odd=sigma_odd,
+            )
+        except sqlite3.Error as exc:
+            self._perf.persistent_invalid += 1
+            self._disable_database(exc)
+            return None
+
+        self._perf.persistent_invalid += invalid
+        for record in candidates:
+            if record.exact:
+                self._perf.persistent_hits += 1
+                return record
+            if record.scanned_limit > self.prime_limit:
+                continue
+            expected_digest = self._pool_digest_for_limit(
+                record.scanned_limit
+            )
+            if (
+                expected_digest is not None
+                and expected_digest == record.pool_digest
+            ):
+                self._perf.persistent_hits += 1
+                return record
+
+        self._perf.persistent_misses += 1
+        return None
+
+    def _store_persisted(
+        self,
+        p: int,
+        exp: int,
+        *,
+        sigma_odd: mpz,
+        result: SigmaPoolAnalysis,
+        exact_valuations: Dict[int, int] | None = None,
+    ) -> None:
+        if self._database is None:
+            return
+        try:
+            if exact_valuations is not None:
+                self._database.store(
+                    p=p,
+                    exp=exp,
+                    exact=True,
+                    scanned_limit=0,
+                    pool_digest=b"",
+                    valuations=exact_valuations,
+                    residual=mpz(1),
+                    sigma_odd=sigma_odd,
+                )
+                return
+
+            pool_digest = self._pool_digest_for_limit(
+                self.prime_limit
+            )
+            if pool_digest is None:
+                raise ValueError(
+                    "current prime pool has no certifiable upper bound"
+                )
+            self._database.store(
+                p=p,
+                exp=exp,
+                exact=result.exact,
+                scanned_limit=self.prime_limit,
+                pool_digest=pool_digest,
+                valuations=result.valuations,
+                residual=result.residual,
+                sigma_odd=sigma_odd,
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self._perf.persistent_invalid += 1
+            self._disable_database(exc)
+
     def analyze(self, p: int, exp: int) -> SigmaPoolAnalysis:
         key = (p, exp)
         cached = self._cache.get(key)
@@ -913,42 +1513,100 @@ class SigmaPoolAnalyzer:
         # Fast path: a globally exact factorisation already exists
         exact_cached = _SIG_VALUATIONS.get(key)
         if exact_cached is not None:
-            outside = next((q for q in exact_cached if q > self.prime_limit), None)
-            if outside is None:
-                result = SigmaPoolAnalysis(exact=True, valuations=exact_cached, residual=mpz(1))
+            result = self._analysis_from_exact(exact_cached)
+            if result.exact:
                 self._perf.exact_from_global_cache += 1
             else:
-                result = SigmaPoolAnalysis(
-                    exact=False,
-                    valuations={q: e for q, e in exact_cached.items() if q <= self.prime_limit},
-                    residual=mpz(outside),
-                    outside_witness=outside,
-                )
                 self._perf.outside_from_global_cache += 1
+            if self._database is not None:
+                sigma_odd = mpz(sigma_prime_power(p, exp))
+                sigma_odd, _v2 = _remove_all(sigma_odd, 2)
+                self._store_persisted(
+                    p,
+                    exp,
+                    sigma_odd=sigma_odd,
+                    result=result,
+                    exact_valuations=exact_cached,
+                )
+            self._record_structure(p, exp, result)
             self._cache[key] = result
             return result
 
-        residual = mpz(sigma_prime_power(p, exp))
-        residual, _v2 = _remove_all(residual, 2)
-        inside: Dict[int, int] = {}
+        sigma_odd = mpz(sigma_prime_power(p, exp))
+        sigma_odd, _v2 = _remove_all(sigma_odd, 2)
 
-        plan = self.plan_for_exp(exp)
-        self._perf.candidate_leaf_blocks += plan.leaf_block_count
+        persisted = self._load_persisted(
+            p,
+            exp,
+            sigma_odd=sigma_odd,
+        )
+        if persisted is not None and persisted.exact:
+            _SIG_VALUATIONS[key] = persisted.valuations
+            _SIG_FACTORS[key] = set(persisted.valuations)
+            result = self._analysis_from_exact(
+                persisted.valuations
+            )
+            self._record_structure(p, exp, result)
+            self._cache[key] = result
+            return result
+
+        if persisted is None:
+            residual = mpz(sigma_odd)
+            inside: Dict[int, int] = {}
+            lower_limit = None
+        else:
+            residual = mpz(persisted.residual)
+            inside = dict(persisted.valuations)
+            lower_limit = persisted.scanned_limit
+
+            if lower_limit == self.prime_limit:
+                result = SigmaPoolAnalysis(
+                    exact=False,
+                    valuations=inside,
+                    residual=residual,
+                )
+                self._record_structure(p, exp, result)
+                self._cache[key] = result
+                return result
+
+        plan = self.plan_for_exp(
+            exp,
+            lower_limit=lower_limit,
+        )
+        start_leaf = self._scan_start_leaf(
+            plan,
+            exp,
+            lower_limit,
+        )
+        self._perf.candidate_leaf_blocks += (
+            self._candidate_leaf_count(plan, start_leaf)
+        )
 
         scan_started = time.perf_counter_ns()
-        residual = self._scan(residual, inside, plan, self._perf)
+        residual = self._scan(
+            residual,
+            inside,
+            plan,
+            self._perf,
+            start_leaf=start_leaf,
+        )
         self._perf.cold_scan_ns += (time.perf_counter_ns() - scan_started)
 
         if residual == 1:
             result = SigmaPoolAnalysis(exact=True, valuations=inside, residual=mpz(1))
             _SIG_VALUATIONS[key] = inside
             _SIG_FACTORS[key] = set(inside)
-            if self._structure is not None:
-                self._structure.sigma_exact += 1
         else:
             result = SigmaPoolAnalysis(exact=False, valuations=inside, residual=residual)
-            if self._structure is not None:
-                self._structure.sigma_outside += 1
+
+        self._store_persisted(
+            p,
+            exp,
+            sigma_odd=sigma_odd,
+            result=result,
+            exact_valuations=inside if result.exact else None,
+        )
+        self._record_structure(p, exp, result)
 
         elapsed = time.perf_counter() - started
         self._perf.analysis_ns += int(elapsed * 1_000_000_000)

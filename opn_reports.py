@@ -429,6 +429,9 @@ def _performance_lines(
         w(f"  hit rate:           {100.0*pool.hits/total_pool_calls:>11.1f}%")
     w(f"  exact_from_global:  {pool.exact_from_global_cache:>12,}")
     w(f"  outside_from_global:{pool.outside_from_global_cache:>12,}")
+    w(f"  persistent hits:    {pool.persistent_hits:>12,}")
+    w(f"  persistent misses:  {pool.persistent_misses:>12,}")
+    w(f"  persistent invalid: {pool.persistent_invalid:>12,}")
 
     # ── GCD block workload ──
     w("\n## GCD block workload")
@@ -551,6 +554,9 @@ def write_performance_json(
             "misses": pool.misses,
             "exact_from_global_cache": pool.exact_from_global_cache,
             "outside_from_global_cache": pool.outside_from_global_cache,
+            "persistent_hits": pool.persistent_hits,
+            "persistent_misses": pool.persistent_misses,
+            "persistent_invalid": pool.persistent_invalid,
             "candidate_leaf_blocks": pool.candidate_leaf_blocks,
             "superblocks_tested": pool.superblocks_tested,
             "positive_superblocks": pool.positive_superblocks,

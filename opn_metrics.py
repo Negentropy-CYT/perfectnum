@@ -129,6 +129,13 @@ class StructureMetrics:
 
     sigma_exact: int = 0
     sigma_outside: int = 0
+    # Checkpointed bookkeeping that keeps classification counters stable when
+    # an in-memory SigmaPoolAnalyzer cache is rebuilt after process restart.
+    # It is intentionally omitted from human and JSON telemetry reports.
+    sigma_classified_keys: set[tuple[int, int]] = field(
+        default_factory=set,
+        repr=False,
+    )
 
     def __setstate__(self, state) -> None:
         """Restore metrics while discarding the removed signature telemetry.
@@ -205,6 +212,12 @@ class PoolPerformance:
     exact_from_global_cache: int = 0
     outside_from_global_cache: int = 0
 
+    # Long-term persistent-cache health.  Detailed optimisation-only
+    # counters intentionally remain in tests rather than production reports.
+    persistent_hits: int = 0
+    persistent_misses: int = 0
+    persistent_invalid: int = 0
+
     candidate_leaf_blocks: int = 0
     superblocks_tested: int = 0
     positive_superblocks: int = 0
@@ -244,7 +257,7 @@ class PoolPerformance:
     )
 
     def __setstate__(self, state) -> None:
-        """Restore schema-1/2 checkpoint metrics with schema-3 defaults."""
+        """Restore older checkpoint metrics with current-schema defaults."""
         restored = {}
         if isinstance(state, tuple):
             for part in state:
@@ -330,7 +343,7 @@ class PerformanceMetrics:
 class RunMetrics:
     """Single source of truth for all search observability data."""
 
-    schema_version: int = 3
+    schema_version: int = 5
     structure: StructureMetrics = field(default_factory=StructureMetrics)
     performance: PerformanceMetrics = field(default_factory=PerformanceMetrics)
 
@@ -368,11 +381,11 @@ class RunMetrics:
     @classmethod
     def from_checkpoint_payload(cls, payload: dict) -> "RunMetrics":
         """Restore RunMetrics from a checkpoint dict."""
-        if payload.get("schema_version") not in {1, 2, 3}:
+        if payload.get("schema_version") not in {1, 2, 3, 4, 5}:
             raise ValueError("unsupported metrics schema version")
 
         return cls(
-            schema_version=3,
+            schema_version=5,
             structure=payload["structure"],
             performance=payload["performance"],
         )

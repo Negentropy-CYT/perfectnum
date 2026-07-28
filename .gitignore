@@ -12,6 +12,8 @@ venv/
 # Checkpoint & solution files (generated at runtime)
 checkpoint*.pkl
 solutions*.txt
+sigma_pool*.sqlite3
+sigma_pool*.sqlite3-*
 *.tmp
 
 # Per-run output directory

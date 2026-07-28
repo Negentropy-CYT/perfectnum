@@ -405,6 +405,21 @@ def _performance_lines(
             if ns_val:
                 w(f"  {label:<28} {ns_val*1e-9:>12.3f}")
 
+    if pool.dynamic_leaf_product_ns:
+        w("\n## Dynamic leaf rebuilding")
+        w(
+            f"  {'rebuild time':<28} "
+            f"{pool.dynamic_leaf_product_ns*1e-9:>12.3f}"
+        )
+        w(
+            f"  {'products rebuilt':<28} "
+            f"{pool.dynamic_leaf_products_built:>12,}"
+        )
+        w(
+            f"  {'prime values multiplied':<28} "
+            f"{pool.dynamic_leaf_prime_values:>12,}"
+        )
+
     # ── sigma pool cache ──
     w("\n## Sigma pool cache")
     w(f"  hits:               {pool.hits:>12,}")
@@ -424,6 +439,10 @@ def _performance_lines(
     w(f"  leaf_blocks_skipped    {pool.leaf_blocks_skipped:>12,}")
     w(f"  positive_blocks        {pool.positive_blocks:>12,}")
     w(f"  factors_removed        {pool.factors_removed:>12,}")
+    w(f"  logical_leaf_blocks    {pool.logical_leaf_blocks:>12,}")
+    w(f"  resident_leaf_blocks   {pool.resident_leaf_blocks:>12,}")
+    w(f"  dynamic_leaf_products  {pool.dynamic_leaf_products_built:>12,}")
+    w(f"  dynamic_prime_values   {pool.dynamic_leaf_prime_values:>12,}")
     if pool.candidate_leaf_blocks:
         skip = 100.0 * (1 - pool.leaf_blocks_tested / pool.candidate_leaf_blocks)
         w(f"  screening skip rate    {skip:>12.3f}%")
@@ -555,6 +574,11 @@ def write_performance_json(
             "plans_built": pool.plans_built,
             "plan_leaf_blocks": pool.plan_leaf_blocks,
             "plan_superblocks": pool.plan_superblocks,
+            "logical_leaf_blocks": pool.logical_leaf_blocks,
+            "resident_leaf_blocks": pool.resident_leaf_blocks,
+            "dynamic_leaf_products_built": pool.dynamic_leaf_products_built,
+            "dynamic_leaf_prime_values": pool.dynamic_leaf_prime_values,
+            "dynamic_leaf_product_ns": pool.dynamic_leaf_product_ns,
             "slowest": [
                 {
                     "seconds": s,

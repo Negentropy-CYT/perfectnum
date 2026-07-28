@@ -21,6 +21,7 @@ import math
 import os
 import pickle
 import json
+import random
 import sys
 from array import array
 from fractions import Fraction
@@ -43,6 +44,7 @@ from opn_core import (
     _SIG_VALUATIONS,
     _TOTIENT_CACHE,
     _CAPACITY_CACHE,
+    _build_dynamic_leaf_product,
     FRIEND_10_MODE,
     OPN_MODE,
     SEARCH_MODE,
@@ -51,6 +53,7 @@ from opn_core import (
     _scan_blocks_flat,
     _scan_blocks_hierarchical,
     build_filtered_prime_pools_vectorized,
+    build_compact_superblocks,
     build_prime_block_plan,
     build_prime_blocks,
     build_prime_superblocks,
@@ -1022,15 +1025,91 @@ class TestBoundedStructureMetrics:
         assert "obligation_signatures" not in report
         assert report["pending_prime_frequency"] == {"7": 10, "13": 5}
 
-    def test_metrics_schema_one_payload_migrates_to_two(self):
+    def test_metrics_schema_one_payload_migrates_to_three(self):
         original = RunMetrics()
         payload = original.checkpoint_payload()
         payload["schema_version"] = 1
 
         restored = RunMetrics.from_checkpoint_payload(payload)
 
-        assert restored.schema_version == 2
+        assert restored.schema_version == 3
         assert not hasattr(restored.structure, "obligation_signatures")
+
+    @pytest.mark.parametrize("schema_version", [1, 2])
+    def test_legacy_pool_metrics_gain_dynamic_leaf_defaults(
+        self,
+        schema_version,
+    ):
+        original = RunMetrics()
+        pool_state = original.performance.pool.__getstate__()[1]
+        for name in (
+            "logical_leaf_blocks",
+            "resident_leaf_blocks",
+            "dynamic_leaf_products_built",
+            "dynamic_leaf_prime_values",
+            "dynamic_leaf_product_ns",
+        ):
+            pool_state.pop(name)
+
+        restored_pool = PoolPerformance.__new__(PoolPerformance)
+        restored_pool.__setstate__((None, pool_state))
+        original.performance.pool = restored_pool
+        payload = original.checkpoint_payload()
+        payload["schema_version"] = schema_version
+
+        restored = RunMetrics.from_checkpoint_payload(payload)
+
+        assert restored.schema_version == 3
+        assert restored.performance.pool.logical_leaf_blocks == 0
+        assert restored.performance.pool.resident_leaf_blocks == 0
+        assert restored.performance.pool.dynamic_leaf_products_built == 0
+        assert restored.performance.pool.dynamic_leaf_prime_values == 0
+        assert restored.performance.pool.dynamic_leaf_product_ns == 0
+
+    def test_performance_reports_include_dynamic_leaf_metrics(
+        self,
+        tmp_path,
+    ):
+        from opn_reports import (
+            write_performance_json,
+            write_performance_text,
+        )
+
+        metrics = RunMetrics()
+        pool = metrics.performance.pool
+        pool.logical_leaf_blocks = 123
+        pool.resident_leaf_blocks = 0
+        pool.dynamic_leaf_products_built = 7
+        pool.dynamic_leaf_prime_values = 1_700
+        pool.dynamic_leaf_product_ns = 25_000_000
+
+        write_performance_json(
+            tmp_path,
+            metrics,
+            elapsed=1.0,
+            sampled_peak_rss=42,
+        )
+        write_performance_text(
+            tmp_path,
+            metrics,
+            elapsed=1.0,
+            sampled_peak_rss=42,
+        )
+
+        report = json.loads(
+            (tmp_path / "performance.json").read_text(encoding="utf-8")
+        )
+        text_report = (
+            tmp_path / "performance.txt"
+        ).read_text(encoding="utf-8")
+
+        assert report["schema_version"] == 3
+        assert report["pool"]["logical_leaf_blocks"] == 123
+        assert report["pool"]["resident_leaf_blocks"] == 0
+        assert report["pool"]["dynamic_leaf_products_built"] == 7
+        assert report["pool"]["dynamic_leaf_prime_values"] == 1_700
+        assert report["pool"]["dynamic_leaf_product_ns"] == 25_000_000
+        assert "## Dynamic leaf rebuilding" in text_report
 
 
 class TestCheckpoint:
@@ -1352,7 +1431,7 @@ class TestSuperblockGCD:
         supers = build_prime_superblocks(blocks, fanout=4)
         covered = []
         for sb in supers:
-            covered.extend(range(sb.start, sb.stop))
+            covered.extend(range(sb.start_leaf, sb.stop_leaf))
         assert covered == list(range(len(blocks)))
 
     def test_superblock_product_matches_children(self):
@@ -1361,9 +1440,190 @@ class TestSuperblockGCD:
         supers = build_prime_superblocks(blocks, fanout=4)
         for sb in supers:
             expected = mpz(1)
-            for idx in range(sb.start, sb.stop):
+            for idx in range(sb.start_leaf, sb.stop_leaf):
                 expected *= blocks[idx].product
             assert sb.product == expected
+
+    def test_compact_superblocks_cover_tail_and_match_prime_products(self):
+        primes = generate_odd_primes(1_000)
+        supers, leaf_count, leaf_ns, super_ns = (
+            build_compact_superblocks(
+                primes,
+                block_size=7,
+                superblock_fanout=4,
+            )
+        )
+
+        covered = []
+        for sb in supers:
+            covered.extend(range(sb.start_leaf, sb.stop_leaf))
+            expected = mpz(1)
+            prime_start = sb.start_leaf * 7
+            prime_stop = min(sb.stop_leaf * 7, len(primes))
+            for idx in range(prime_start, prime_stop):
+                expected *= int(primes[idx])
+            assert sb.product == expected
+
+        assert covered == list(range(leaf_count))
+        assert leaf_count == math.ceil(len(primes) / 7)
+        assert supers[-1].stop_leaf == leaf_count
+        assert leaf_ns > 0
+        assert super_ns > 0
+
+    def test_hierarchical_plan_has_no_resident_leaf_products(self):
+        primes = generate_odd_primes(10_000)
+        perf = PoolPerformance()
+        plan = build_prime_block_plan(
+            primes,
+            block_size=13,
+            superblock_fanout=4,
+            build_superblocks=True,
+            pool_perf=perf,
+        )
+
+        assert plan.blocks == ()
+        assert plan.leaf_block_count == math.ceil(len(primes) / 13)
+        assert plan.superblocks
+        assert perf.plan_leaf_blocks == plan.leaf_block_count
+        assert perf.logical_leaf_blocks == plan.leaf_block_count
+        assert perf.resident_leaf_blocks == 0
+
+    def test_flat_plan_retains_only_logical_leaf_count_as_resident(self):
+        primes = generate_odd_primes(1_000)
+        perf = PoolPerformance()
+        plan = build_prime_block_plan(
+            primes,
+            block_size=7,
+            superblock_fanout=4,
+            build_superblocks=False,
+            pool_perf=perf,
+        )
+
+        assert len(plan.blocks) == plan.leaf_block_count
+        assert plan.superblocks == ()
+        assert perf.logical_leaf_blocks == plan.leaf_block_count
+        assert perf.resident_leaf_blocks == plan.leaf_block_count
+
+    def test_dynamic_leaf_rebuild_handles_partial_final_leaf(self):
+        primes = generate_odd_primes(100)
+        plan = build_prime_block_plan(
+            primes,
+            block_size=8,
+            superblock_fanout=3,
+            build_superblocks=True,
+        )
+
+        start, stop, product = _build_dynamic_leaf_product(
+            plan,
+            plan.leaf_block_count - 1,
+        )
+        expected = mpz(1)
+        for idx in range(start, stop):
+            expected *= int(primes[idx])
+
+        assert stop == len(primes)
+        assert 0 < stop - start <= plan.block_size
+        assert product == expected
+
+    def test_dynamic_scanner_strips_multiple_leaves_and_valuations(self):
+        primes = generate_odd_primes(200)
+        plan = build_prime_block_plan(
+            primes,
+            block_size=3,
+            superblock_fanout=2,
+            build_superblocks=True,
+        )
+        q0 = int(primes[0])
+        q1 = int(primes[4])
+        q2 = int(primes[7])
+        residual = mpz(q0) ** 3 * mpz(q1) ** 2 * q2
+        inside = {}
+        perf = PoolPerformance()
+
+        residual = _scan_blocks_hierarchical(
+            residual,
+            inside,
+            plan,
+            perf,
+        )
+
+        assert residual == 1
+        assert inside == {q0: 3, q1: 2, q2: 1}
+        assert perf.positive_superblocks == 2
+        assert perf.positive_blocks == 3
+        assert perf.dynamic_leaf_products_built == 3
+        assert perf.dynamic_leaf_products_built == perf.leaf_blocks_tested
+        assert perf.dynamic_leaf_prime_values == 9
+        assert perf.dynamic_leaf_product_ns > 0
+
+    @pytest.mark.parametrize(
+        ("block_size", "fanout"),
+        [(1, 2), (3, 2), (7, 4), (16, 5)],
+    )
+    def test_random_residuals_match_flat_oracle(
+        self,
+        block_size,
+        fanout,
+    ):
+        primes = generate_odd_primes(200)
+        flat_plan = build_prime_block_plan(
+            primes,
+            block_size=block_size,
+            superblock_fanout=fanout,
+            build_superblocks=False,
+        )
+        compact_plan = build_prime_block_plan(
+            primes,
+            block_size=block_size,
+            superblock_fanout=fanout,
+            build_superblocks=True,
+        )
+        rng = random.Random(10_000 + block_size * 100 + fanout)
+
+        for _ in range(100):
+            value = mpz(1)
+            for raw_q in rng.sample(
+                list(primes),
+                rng.randrange(0, 9),
+            ):
+                value *= mpz(int(raw_q)) ** rng.randrange(1, 5)
+            if rng.randrange(2):
+                value *= mpz(211) ** rng.randrange(1, 4)
+
+            flat_inside = {}
+            compact_inside = {}
+            flat_residual = _scan_blocks_flat(
+                value,
+                flat_inside,
+                flat_plan,
+                PoolPerformance(),
+            )
+            compact_residual = _scan_blocks_hierarchical(
+                value,
+                compact_inside,
+                compact_plan,
+                PoolPerformance(),
+            )
+
+            assert compact_residual == flat_residual
+            assert compact_inside == flat_inside
+
+    def test_candidate_leaf_telemetry_uses_logical_count(self):
+        primes = generate_odd_primes(500)
+        analyzer = SigmaPoolAnalyzer(
+            primes,
+            block_size=7,
+            superblock_fanout=4,
+            gcd_mode="hierarchical",
+        )
+        plan = analyzer.plan_for_exp(2)
+
+        analyzer.analyze(3, 2)
+
+        assert plan.blocks == ()
+        assert analyzer._perf.candidate_leaf_blocks == (
+            plan.leaf_block_count
+        )
 
     def test_flat_and_hierarchical_match(self):
         primes = generate_odd_primes(500)

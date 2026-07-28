@@ -231,11 +231,42 @@ class PoolPerformance:
     plans_built: int = 0
     plan_leaf_blocks: int = 0
     plan_superblocks: int = 0
+    logical_leaf_blocks: int = 0
+    resident_leaf_blocks: int = 0
+
+    dynamic_leaf_products_built: int = 0
+    dynamic_leaf_prime_values: int = 0
+    dynamic_leaf_product_ns: int = 0
 
     slowest: list[tuple[float, int, int, int, bool]] = field(
         default_factory=list,
         repr=False,
     )
+
+    def __setstate__(self, state) -> None:
+        """Restore schema-1/2 checkpoint metrics with schema-3 defaults."""
+        restored = {}
+        if isinstance(state, tuple):
+            for part in state:
+                if isinstance(part, dict):
+                    restored.update(part)
+        elif isinstance(state, dict):
+            restored.update(state)
+        else:
+            raise TypeError("unsupported PoolPerformance pickle state")
+
+        for metric_field in fields(type(self)):
+            if metric_field.name in restored:
+                value = restored[metric_field.name]
+            elif metric_field.default is not MISSING:
+                value = metric_field.default
+            elif metric_field.default_factory is not MISSING:
+                value = metric_field.default_factory()
+            else:
+                raise ValueError(
+                    f"missing PoolPerformance field: {metric_field.name}"
+                )
+            object.__setattr__(self, metric_field.name, value)
 
     def record_slow_analysis(
         self,
@@ -299,7 +330,7 @@ class PerformanceMetrics:
 class RunMetrics:
     """Single source of truth for all search observability data."""
 
-    schema_version: int = 2
+    schema_version: int = 3
     structure: StructureMetrics = field(default_factory=StructureMetrics)
     performance: PerformanceMetrics = field(default_factory=PerformanceMetrics)
 
@@ -337,11 +368,11 @@ class RunMetrics:
     @classmethod
     def from_checkpoint_payload(cls, payload: dict) -> "RunMetrics":
         """Restore RunMetrics from a checkpoint dict."""
-        if payload.get("schema_version") not in {1, 2}:
+        if payload.get("schema_version") not in {1, 2, 3}:
             raise ValueError("unsupported metrics schema version")
 
         return cls(
-            schema_version=2,
+            schema_version=3,
             structure=payload["structure"],
             performance=payload["performance"],
         )

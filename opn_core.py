@@ -28,7 +28,7 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 9000000000     # largest odd prime considered
+MAX_PRIME         = 12500000000     # largest odd prime considered
 MAX_FACTORS       = 60         # max distinct prime factors in N
 MAX_EXP           = 25         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = Descartes-spoof DFS; True = true OPN chain
@@ -108,17 +108,21 @@ class PrimeBlock:
 
 @dataclass(slots=True, frozen=True)
 class PrimeSuperBlock:
-    """A consecutive range of leaf PrimeBlock objects."""
-    start: int          # inclusive leaf-block index
-    stop: int           # exclusive leaf-block index
-    product: mpz        # product of every child block product
+    """A logical range of leaf blocks with one persistent product."""
+    start_leaf: int     # inclusive logical leaf-block index
+    stop_leaf: int      # exclusive logical leaf-block index
+    product: mpz        # product of every prime in the logical range
 
 
 @dataclass(slots=True, frozen=True)
 class PrimeBlockPlan:
-    """Compact prime data plus a two-level GCD screening structure."""
+    """Prime pool with persistent superblocks and optional flat blocks."""
     primes: Sequence[int]
-    blocks: Tuple[PrimeBlock, ...]
+    block_size: int
+    superblock_fanout: int
+    leaf_block_count: int
+    # Flat-mode correctness oracle only.  Hierarchical plans keep this empty.
+    blocks: Tuple[PrimeBlock, ...] = ()
     superblocks: Tuple[PrimeSuperBlock, ...] = ()
 
 
@@ -450,6 +454,18 @@ def build_filtered_prime_pools_vectorized(
     return outputs
 
 
+def _product_prime_range(
+    primes: Sequence[int],
+    start: int,
+    stop: int,
+) -> mpz:
+    """Return the exact product of ``primes[start:stop]``."""
+    product = mpz(1)
+    for idx in range(start, stop):
+        product *= int(primes[idx])
+    return product
+
+
 def build_prime_blocks(primes, block_size: int = 256):
     """Partition a compact prime sequence into indexed blocks."""
     if block_size <= 0:
@@ -457,15 +473,18 @@ def build_prime_blocks(primes, block_size: int = 256):
     blocks = []
     for start in range(0, len(primes), block_size):
         stop = min(start + block_size, len(primes))
-        product = mpz(1)
-        for idx in range(start, stop):
-            product *= int(primes[idx])
+        product = _product_prime_range(primes, start, stop)
         blocks.append(PrimeBlock(start=start, stop=stop, product=product))
     return tuple(blocks)
 
 
 def build_prime_superblocks(blocks: tuple, fanout: int):
-    """Group consecutive leaf blocks into superblocks."""
+    """Group resident flat-mode leaf blocks into superblocks.
+
+    This helper remains available for tests and comparison tooling. Production
+    hierarchical plans use :func:`build_compact_superblocks` so the complete
+    leaf-product layer is never resident.
+    """
     if fanout < 2:
         raise ValueError("superblock fanout must be at least 2")
     result = []
@@ -474,8 +493,81 @@ def build_prime_superblocks(blocks: tuple, fanout: int):
         product = mpz(1)
         for idx in range(start, stop):
             product *= blocks[idx].product
-        result.append(PrimeSuperBlock(start=start, stop=stop, product=product))
+        result.append(
+            PrimeSuperBlock(
+                start_leaf=start,
+                stop_leaf=stop,
+                product=product,
+            )
+        )
     return tuple(result)
+
+
+def build_compact_superblocks(
+    primes: Sequence[int],
+    *,
+    block_size: int,
+    superblock_fanout: int,
+) -> tuple[Tuple[PrimeSuperBlock, ...], int, int, int]:
+    """Build superblocks while retaining at most one fanout of leaf products.
+
+    Returns ``(superblocks, leaf_count, leaf_product_ns, super_product_ns)``.
+    Leaf products are exact temporary construction values and become
+    unreachable after their superblock has been assembled.
+    """
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if superblock_fanout < 2:
+        raise ValueError("superblock fanout must be at least 2")
+
+    prime_count = len(primes)
+    leaf_count = (prime_count + block_size - 1) // block_size
+    result = []
+    leaf_product_ns = 0
+    super_product_ns = 0
+
+    for start_leaf in range(0, leaf_count, superblock_fanout):
+        stop_leaf = min(
+            start_leaf + superblock_fanout,
+            leaf_count,
+        )
+
+        leaf_started = time.perf_counter_ns()
+        temporary_leaf_products = []
+        for leaf_idx in range(start_leaf, stop_leaf):
+            prime_start = leaf_idx * block_size
+            prime_stop = min(prime_start + block_size, prime_count)
+            temporary_leaf_products.append(
+                _product_prime_range(
+                    primes,
+                    prime_start,
+                    prime_stop,
+                )
+            )
+        leaf_product_ns += time.perf_counter_ns() - leaf_started
+
+        super_started = time.perf_counter_ns()
+        super_product = mpz(1)
+        for leaf_product in temporary_leaf_products:
+            super_product *= leaf_product
+        super_product_ns += time.perf_counter_ns() - super_started
+
+        result.append(
+            PrimeSuperBlock(
+                start_leaf=start_leaf,
+                stop_leaf=stop_leaf,
+                product=super_product,
+            )
+        )
+        del leaf_product
+        del temporary_leaf_products
+
+    return (
+        tuple(result),
+        leaf_count,
+        leaf_product_ns,
+        super_product_ns,
+    )
 
 
 def build_prime_block_plan(
@@ -494,48 +586,58 @@ def build_prime_block_plan(
         else primes
     )
 
-    leaf_started = time.perf_counter_ns()
-
-    blocks = build_prime_blocks(
-        pool,
-        block_size,
-    )
-
-    leaf_ns = time.perf_counter_ns() - leaf_started
-
-    superblock_ns = 0
-
     if build_superblocks:
-        super_started = time.perf_counter_ns()
-
-        superblocks = build_prime_superblocks(
-            blocks,
-            superblock_fanout,
+        (
+            superblocks,
+            leaf_count,
+            leaf_ns,
+            superblock_ns,
+        ) = build_compact_superblocks(
+            pool,
+            block_size=block_size,
+            superblock_fanout=superblock_fanout,
         )
-
-        superblock_ns = (
-            time.perf_counter_ns() - super_started
-        )
+        blocks = ()
     else:
+        leaf_started = time.perf_counter_ns()
+        blocks = build_prime_blocks(
+            pool,
+            block_size,
+        )
+        leaf_ns = time.perf_counter_ns() - leaf_started
+        leaf_count = len(blocks)
         superblocks = ()
+        superblock_ns = 0
 
     if pool_perf is not None:
         pool_perf.leaf_product_ns += leaf_ns
         pool_perf.superblock_product_ns += superblock_ns
         pool_perf.plans_built += 1
-        pool_perf.plan_leaf_blocks += len(blocks)
+        pool_perf.plan_leaf_blocks += leaf_count
         pool_perf.plan_superblocks += len(superblocks)
+        pool_perf.logical_leaf_blocks += leaf_count
+        pool_perf.resident_leaf_blocks += len(blocks)
 
     return PrimeBlockPlan(
         primes=pool,
+        block_size=block_size,
+        superblock_fanout=superblock_fanout,
+        leaf_block_count=leaf_count,
         blocks=blocks,
         superblocks=superblocks,
     )
 
 
-def _strip_prime_block(residual: mpz, inside: dict, plan, block, perf: "PoolPerformance") -> mpz:
-    """Remove all factors represented by one positive leaf block."""
-    for idx in range(block.start, block.stop):
+def _strip_prime_range(
+    residual: mpz,
+    inside: dict,
+    plan: PrimeBlockPlan,
+    start: int,
+    stop: int,
+    perf: "PoolPerformance",
+) -> mpz:
+    """Remove every pool factor represented by one positive prime range."""
+    for idx in range(start, stop):
         if residual == 1:
             break
         q = int(plan.primes[idx])
@@ -545,6 +647,40 @@ def _strip_prime_block(residual: mpz, inside: dict, plan, block, perf: "PoolPerf
         inside[q] = inside.get(q, 0) + exponent
         perf.factors_removed += 1
     return residual
+
+
+def _strip_prime_block(
+    residual: mpz,
+    inside: dict,
+    plan: PrimeBlockPlan,
+    block: PrimeBlock,
+    perf: "PoolPerformance",
+) -> mpz:
+    """Remove all factors represented by one resident flat-mode block."""
+    return _strip_prime_range(
+        residual,
+        inside,
+        plan,
+        block.start,
+        block.stop,
+        perf,
+    )
+
+
+def _build_dynamic_leaf_product(
+    plan: PrimeBlockPlan,
+    leaf_idx: int,
+) -> tuple[int, int, mpz]:
+    """Rebuild one logical leaf product from the immutable prime sequence."""
+    if leaf_idx < 0 or leaf_idx >= plan.leaf_block_count:
+        raise IndexError("logical leaf index out of range")
+    start = leaf_idx * plan.block_size
+    stop = min(start + plan.block_size, len(plan.primes))
+    return (
+        start,
+        stop,
+        _product_prime_range(plan.primes, start, stop),
+    )
 
 
 def _scan_blocks_flat(residual: mpz, inside: dict, plan, perf: "PoolPerformance") -> mpz:
@@ -562,23 +698,49 @@ def _scan_blocks_flat(residual: mpz, inside: dict, plan, perf: "PoolPerformance"
 
 def _scan_blocks_hierarchical(residual: mpz, inside: dict, plan, perf: "PoolPerformance") -> mpz:
     """Two-level scanner: superblock gcd → leaf-block gcd."""
-    blocks = plan.blocks
     for sb in plan.superblocks:
         if residual == 1:
             break
         perf.superblocks_tested += 1
         if gmpy2.gcd(residual, sb.product) == 1:
-            perf.leaf_blocks_skipped += sb.stop - sb.start
+            perf.leaf_blocks_skipped += (
+                sb.stop_leaf - sb.start_leaf
+            )
             continue
         perf.positive_superblocks += 1
-        for idx in range(sb.start, sb.stop):
+        found_positive_leaf = False
+        for leaf_idx in range(sb.start_leaf, sb.stop_leaf):
             if residual == 1:
                 break
+
+            rebuild_started = time.perf_counter_ns()
+            start, stop, leaf_product = _build_dynamic_leaf_product(
+                plan,
+                leaf_idx,
+            )
+            perf.dynamic_leaf_product_ns += (
+                time.perf_counter_ns() - rebuild_started
+            )
+            perf.dynamic_leaf_products_built += 1
+            perf.dynamic_leaf_prime_values += stop - start
+
             perf.leaf_blocks_tested += 1
-            if gmpy2.gcd(residual, blocks[idx].product) == 1:
+            if gmpy2.gcd(residual, leaf_product) == 1:
                 continue
+            found_positive_leaf = True
             perf.positive_blocks += 1
-            residual = _strip_prime_block(residual, inside, plan, blocks[idx], perf)
+            residual = _strip_prime_range(
+                residual,
+                inside,
+                plan,
+                start,
+                stop,
+                perf,
+            )
+        if __debug__ and not found_positive_leaf:
+            raise AssertionError(
+                "positive superblock produced no positive leaf"
+            )
     return residual
 
 
@@ -771,7 +933,7 @@ class SigmaPoolAnalyzer:
         inside: Dict[int, int] = {}
 
         plan = self.plan_for_exp(exp)
-        self._perf.candidate_leaf_blocks += len(plan.blocks)
+        self._perf.candidate_leaf_blocks += plan.leaf_block_count
 
         scan_started = time.perf_counter_ns()
         residual = self._scan(residual, inside, plan, self._perf)

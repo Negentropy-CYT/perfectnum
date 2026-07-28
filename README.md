@@ -97,7 +97,7 @@ opn_main.py        Entry point (main loop, SIGINT, checkpoint/resume)
 opn_core.py        Arithmetic engine
                      · segmented odd-prime sieve → compact uint32/64 array
                      · exponent-specific necessary-order filtering
-                     · indexed prime blocks + hierarchical GCD screening
+                     · compact persistent superblocks + on-demand leaf GCD
                      · exact / outside-window σ-pool analysis
                      · general-purpose Brent Pollard-Rho factorisation
                      · factor-slot-aware ratio bounds
@@ -281,6 +281,13 @@ POOL_SUPERBLOCK_FANOUT = 16
 ENABLE_FERMAT_DEBT = False      # conservative debt-capacity bound (off)
 CHECKPOINT_INTERVAL_SECONDS = 300.0
 ```
+
+In `hierarchical` mode, plans retain only exact superblock products.  Leaf
+products are rebuilt from the immutable eligible-prime array after a positive
+superblock GCD and released immediately after the leaf check.  The `flat` mode
+continues to retain leaf products as a correctness oracle.  Performance schema
+3 reports logical/resident leaf counts and dynamic rebuild work separately;
+schema-1/2 checkpoints remain readable.
 
 ### Search Modes
 

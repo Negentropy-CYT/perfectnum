@@ -203,6 +203,9 @@ def search_opn(
             flush=True,
         )
 
+        if observer is not None:
+            observer.set_phase("plan_prebuild")
+
         plan_started = time.perf_counter()
 
         sigma_pool_analyzer.prebuild_plans(
@@ -212,6 +215,13 @@ def search_opn(
         plan_elapsed = (
             time.perf_counter() - plan_started
         )
+
+        if observer is not None:
+            observer.capture_memory_phase(
+                metrics.performance.memory_phases,
+                "after_plan_prebuild",
+            )
+            observer.set_phase("search")
 
         print(
             "[init] sigma-pool plans ready: "

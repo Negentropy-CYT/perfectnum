@@ -8,8 +8,6 @@ semantically-clean output files.
 from __future__ import annotations
 
 import json
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -26,12 +24,43 @@ def prepare_run_directory(run_id: str) -> Path:
     return run_dir
 
 
+def write_manifest(
+    run_dir: Path,
+    *,
+    run_id: str,
+    git_commit: str,
+    started_at: str,
+    config: dict,
+) -> None:
+    """Write manifest.json — machine-readable run identity and configuration."""
+    doc = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "git_commit": git_commit,
+        "started_at": started_at,
+        "configuration": {
+            "max_prime": config["max_prime"],
+            "max_factors": config["max_factors"],
+            "max_exp": config["max_exp"],
+            "target_num": config["target_num"],
+            "target_den": config["target_den"],
+            "require_euler": config["require_euler"],
+            "propagate": config["propagate"],
+            "pool_gcd_mode": config["pool_gcd_mode"],
+            "pool_fanout": config["pool_fanout"],
+        },
+    }
+    with (run_dir / "manifest.json").open("w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+
+
 def write_summary(
     run_dir: Path,
     *,
     run_id: str,
     git_commit: str,
     status: str,
+    started_at: str = "",
     max_prime: int,
     max_factors: int,
     max_exp: int,
@@ -52,7 +81,7 @@ def write_summary(
     w(f"  run_id:      {run_id}")
     w(f"  git_commit:  {git_commit}")
     w(f"  status:      {status}")
-    w(f"  started:     {datetime.now(timezone.utc).isoformat()}")
+    w(f"  started:     {started_at}")
     w("")
     w("Configuration")
     w("-" * 40)
@@ -308,8 +337,12 @@ def _counter_rows_3(counter, *, key_names=("first", "second", "third")):
     ]
 
 
-def _obligation_rows(counter):
-    """Convert obligation signature Counter to JSON-safe rows."""
+def _obligation_rows(counter, limit: int = 0):
+    """Convert obligation signature Counter to JSON-safe rows.
+
+    When *limit* > 0 only the most-common entries are included.
+    """
+    items = counter.most_common(limit) if limit > 0 else counter.items()
     return [
         {
             "pending": list(k[0]),
@@ -317,7 +350,7 @@ def _obligation_rows(counter):
             "coarse_headroom": k[2],
             "count": v,
         }
-        for k, v in counter.items()
+        for k, v in items
     ]
 
 
@@ -326,6 +359,7 @@ def write_structure_json(run_dir: Path, metrics: RunMetrics) -> None:
     s = metrics.structure
 
     doc = {
+        "schema_version": metrics.schema_version,
         "productive_states": s.productive_states,
         "prune_reasons": dict(s.prune_reasons),
         "depth_histogram": dict(s.depth_histogram),
@@ -336,7 +370,8 @@ def write_structure_json(run_dir: Path, metrics: RunMetrics) -> None:
             for k, v in s.headroom_by_factor.items()
         ],
         "obligation_signatures": _obligation_rows(
-            s.obligation_signatures
+            s.obligation_signatures,
+            limit=100,
         ),
         "contradiction_attribution": [
             {"prime": k[0], "reason": k[1], "count": v}
@@ -425,7 +460,7 @@ def _performance_lines(
     w(f"  factors_removed        {pool.factors_removed:>12,}")
     if pool.candidate_leaf_blocks:
         skip = 100.0 * (1 - pool.leaf_blocks_tested / pool.candidate_leaf_blocks)
-        w(f"  screening skip rate    {skip:>12.1f}%")
+        w(f"  screening skip rate    {skip:>12.3f}%")
 
     # ── prune mechanisms ──
     if p.prune_mechanisms:
@@ -517,6 +552,7 @@ def write_performance_json(
     pool = perf.pool
 
     doc: Dict[str, Any] = {
+        "schema_version": metrics.schema_version,
         "elapsed_seconds": elapsed,
         "sampled_peak_rss_bytes": sampled_peak_rss,
         "prune_mechanisms": dict(perf.prune_mechanisms),
@@ -528,17 +564,31 @@ def write_performance_json(
         "pool": {
             "hits": pool.hits,
             "misses": pool.misses,
+            "exact_from_global_cache": pool.exact_from_global_cache,
+            "outside_from_global_cache": pool.outside_from_global_cache,
+            "candidate_leaf_blocks": pool.candidate_leaf_blocks,
+            "superblocks_tested": pool.superblocks_tested,
+            "positive_superblocks": pool.positive_superblocks,
+            "leaf_blocks_tested": pool.leaf_blocks_tested,
+            "leaf_blocks_skipped": pool.leaf_blocks_skipped,
+            "positive_blocks": pool.positive_blocks,
+            "factors_removed": pool.factors_removed,
             "analysis_ns": pool.analysis_ns,
             "cold_scan_ns": pool.cold_scan_ns,
             "plan_prebuild_ns": pool.plan_prebuild_ns,
             "plan_filter_ns": pool.plan_filter_ns,
             "plan_filter_count_ns": pool.plan_filter_count_ns,
             "plan_filter_fill_ns": pool.plan_filter_fill_ns,
+            "plan_filter_source_values": pool.plan_filter_source_values,
             "leaf_product_ns": pool.leaf_product_ns,
             "superblock_product_ns": pool.superblock_product_ns,
+            "filtered_prime_values": pool.filtered_prime_values,
             "filtered_prime_bytes": pool.filtered_prime_bytes,
             "filtered_plan_count": pool.filtered_plan_count,
             "full_plan_built": pool.full_plan_built,
+            "plans_built": pool.plans_built,
+            "plan_leaf_blocks": pool.plan_leaf_blocks,
+            "plan_superblocks": pool.plan_superblocks,
             "slowest": [
                 {
                     "seconds": s,
@@ -612,6 +662,7 @@ def write_all_reports(
     run_id: str,
     git_commit: str,
     status: str,
+    started_at: str = "",
     config: dict,
     metrics: RunMetrics,
     elapsed_seconds: float,
@@ -620,11 +671,19 @@ def write_all_reports(
     _sig_factors: dict | None = None,
 ) -> None:
     """Write all output files for a completed run."""
+    write_manifest(
+        run_dir,
+        run_id=run_id,
+        git_commit=git_commit,
+        started_at=started_at,
+        config=config,
+    )
     write_summary(
         run_dir,
         run_id=run_id,
         git_commit=git_commit,
         status=status,
+        started_at=started_at,
         max_prime=config["max_prime"],
         max_factors=config["max_factors"],
         max_exp=config["max_exp"],

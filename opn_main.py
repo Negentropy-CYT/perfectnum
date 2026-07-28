@@ -106,13 +106,36 @@ def main() -> None:
         metrics = RunMetrics()
         run_id = _make_run_id(MAX_PRIME, MAX_FACTORS, MAX_EXP)
         elapsed_offset = 0.0
+        resume_state = None
+
+    started_at = datetime.now(timezone.utc)
+    git_commit = _git_commit()
+    run_dir = prepare_run_directory(run_id)
+
+    # Create sampler before prime generation so the phase is recorded
+    sampler = RuntimeSampler(
+        run_dir / "performance_samples.csv",
+        elapsed_offset=elapsed_offset,
+        append=(chk is not None),
+    )
+    sampler.start()
+
+    if chk is not None:
+        sampler.set_phase("prime_generation")
+        primes = generate_odd_primes(chk["prime_limit"])
+        max_factors = chk.get("max_factors", MAX_FACTORS)
+        max_exp = chk.get("max_exp", MAX_EXP)
+        sampler.capture_memory_phase(
+            metrics.performance.memory_phases, "after_prime_generation",
+        )
+    else:
+        sampler.set_phase("prime_generation")
         primes = generate_odd_primes(MAX_PRIME)
         max_factors = MAX_FACTORS
         max_exp = MAX_EXP
-        resume_state = None
-
-    git_commit = _git_commit()
-    run_dir = prepare_run_directory(run_id)
+        sampler.capture_memory_phase(
+            metrics.performance.memory_phases, "after_prime_generation",
+        )
 
     # header
     mode_str = ("伪解搜索 (独立质数, propagate=False)" if not PROPAGATE
@@ -136,12 +159,6 @@ def main() -> None:
     stop_requested = False
     interrupt_count = 0
 
-    sampler = RuntimeSampler(
-        run_dir / "performance_samples.csv",
-        elapsed_offset=elapsed_offset,
-        append=(chk is not None),
-    )
-    sampler.start()
     sampler.set_phase("startup")
 
     # ── progress callback ──
@@ -262,6 +279,7 @@ def main() -> None:
             run_id=run_id,
             git_commit=git_commit,
             status=status,
+            started_at=started_at.isoformat(),
             config=config,
             metrics=metrics,
             elapsed_seconds=elapsed,

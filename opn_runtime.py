@@ -61,9 +61,12 @@ class RuntimeSampler:
         )
         self._writer = csv.writer(self._file)
 
+        self._wall_start = time.monotonic()
+
         if not append or csv_path.stat().st_size == 0:
             self._writer.writerow([
                 "elapsed_s",
+                "wall_s",
                 "phase",
                 "states_started",
                 "states_completed",
@@ -92,9 +95,19 @@ class RuntimeSampler:
         self._thread.start()
 
     def set_phase(self, phase: str) -> None:
-        """Set the current run phase label (thread-safe)."""
+        """Set the current run phase label (thread-safe).
+
+        Resets the rate computation baseline so the first sample in the
+        new phase does not blend wall-time with the previous phase.
+        """
         with self._lock:
             self._snapshot = replace(self._snapshot, phase=phase)
+            self._previous_elapsed = (
+                self.elapsed_offset
+                + time.monotonic()
+                - self._started
+            )
+            self._previous_completed = self._snapshot.states_completed
 
     def update_progress(
         self,
@@ -155,6 +168,7 @@ class RuntimeSampler:
 
         self._writer.writerow([
             f"{elapsed:.3f}",
+            f"{time.monotonic() - self._wall_start:.3f}",
             snapshot.phase,
             snapshot.states_started,
             snapshot.states_completed,
@@ -171,6 +185,14 @@ class RuntimeSampler:
 
         self._previous_elapsed = elapsed
         self._previous_completed = snapshot.states_completed
+
+    def capture_memory_phase(
+        self,
+        phases: dict[str, dict[str, int]],
+        phase: str,
+    ) -> None:
+        """Snapshot memory under *phase* in the *phases* dict."""
+        phases[phase] = self.capture_memory()
 
     def capture_memory(self) -> dict[str, int]:
         """Return a labeled memory snapshot for phase tracking."""

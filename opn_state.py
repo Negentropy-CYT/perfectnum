@@ -383,8 +383,15 @@ def assign_prime_dfs(
             clone_effect=CloneEffect.WASTED,
         )
 
-    metrics.structure.depth_histogram[ns.depth] += 1
-    metrics.structure.productive_states += 1
+    metrics.structure.record_productive(
+        depth=ns.depth,
+        assigned_count=len(ns.assigned),
+        pending=(),
+        ratio_num=int(ns.ratio_num),
+        ratio_den=int(ns.ratio_den),
+        target_num=SEARCH_MODE.target_num,
+        target_den=SEARCH_MODE.target_den,
+    )
     return ns
 
 
@@ -534,7 +541,6 @@ def assign_prime_chain(
         ns.priority = 0.0
 
     if not propagate:
-        metrics.structure.depth_histogram[ns.depth] += 1
         metrics.structure.record_productive(
             depth=ns.depth,
             assigned_count=len(ns.assigned),
@@ -603,7 +609,6 @@ def assign_prime_chain(
             _enqueue_pending(ns, q)
             cascade_steps += 1
 
-    metrics.structure.depth_histogram[ns.depth] += 1
     metrics.structure.record_productive(
         depth=ns.depth,
         assigned_count=len(ns.assigned),

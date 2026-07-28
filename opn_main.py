@@ -79,11 +79,9 @@ def main() -> None:
         metrics = RunMetrics.from_checkpoint_payload(chk["metrics"])
         run_id = chk["run_id"]
         elapsed_offset = chk["elapsed"]
-
-        # rebuild prime pool from fingerprint
-        primes = generate_odd_primes(chk["prime_limit"])
-        if len(primes) != chk["prime_count"]:
-            print(f"警告: 素数数量不匹配 (expected {chk['prime_count']}, got {len(primes)})")
+        # primes, max_factors, max_exp are set below in the unified
+        # prime-generation phase (after the sampler is created).
+        primes = None
         max_factors = chk.get("max_factors", MAX_FACTORS)
         max_exp = chk.get("max_exp", MAX_EXP)
         resume_state = {
@@ -123,8 +121,27 @@ def main() -> None:
     if chk is not None:
         sampler.set_phase("prime_generation")
         primes = generate_odd_primes(chk["prime_limit"])
-        max_factors = chk.get("max_factors", MAX_FACTORS)
-        max_exp = chk.get("max_exp", MAX_EXP)
+        # strict fingerprint verification — any mismatch aborts
+        if len(primes) != chk["prime_count"]:
+            raise RuntimeError(
+                f"checkpoint prime_count mismatch: "
+                f"expected {chk['prime_count']}, got {len(primes)}"
+            )
+        if primes.typecode != chk["prime_typecode"]:
+            raise RuntimeError(
+                f"checkpoint prime_typecode mismatch: "
+                f"expected {chk['prime_typecode']!r}, got {primes.typecode!r}"
+            )
+        if int(primes[0]) != chk["first_prime"]:
+            raise RuntimeError(
+                f"checkpoint first_prime mismatch: "
+                f"expected {chk['first_prime']}, got {int(primes[0])}"
+            )
+        if int(primes[-1]) != chk["last_prime"]:
+            raise RuntimeError(
+                f"checkpoint last_prime mismatch: "
+                f"expected {chk['last_prime']}, got {int(primes[-1])}"
+            )
         sampler.capture_memory_phase(
             metrics.performance.memory_phases, "after_prime_generation",
         )
@@ -176,9 +193,6 @@ def main() -> None:
     def _save_stable_boundary(holder: dict, reason: str) -> None:
         if reason in {"initial", "periodic"}:
             save_checkpoint(holder, solutions, run_id=run_id, metrics=metrics)
-        holder["states_started"] = (
-            holder.get("live_total_states", holder.get("total_states", 0))
-        )
 
     previous_sigint = signal.getsignal(signal.SIGINT)
 
@@ -259,9 +273,9 @@ def main() -> None:
         )
 
         config = {
-            "max_prime": MAX_PRIME,
-            "max_factors": MAX_FACTORS,
-            "max_exp": MAX_EXP,
+            "max_prime": int(primes[-1]) if len(primes) > 0 else MAX_PRIME,
+            "max_factors": max_factors,
+            "max_exp": max_exp,
             "target_num": SEARCH_MODE.target_num,
             "target_den": SEARCH_MODE.target_den,
             "require_euler": SEARCH_MODE.require_euler,

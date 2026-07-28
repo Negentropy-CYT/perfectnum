@@ -26,6 +26,17 @@ class ProgressSnapshot:
     frontier_size: int = 0
 
 
+def _safe_cpu_percent(proc) -> float:
+    """Return cpu_percent() safely across psutil versions."""
+    try:
+        return float(proc.cpu_percent(None))
+    except Exception:
+        try:
+            return float(proc.cpu_percent())
+        except Exception:
+            return 0.0
+
+
 class RuntimeSampler:
     """Periodic RSS/CPU/rate CSV logger (daemon thread, no search coupling)."""
 
@@ -86,7 +97,10 @@ class RuntimeSampler:
     def start(self) -> None:
         """Start the background sampling daemon thread."""
         self._started = time.monotonic()
-        self._process.cpu_percent(None)  # prime the first reading
+        try:
+            self._process.cpu_percent(None)
+        except Exception:
+            self._process.cpu_percent()
         self._thread = threading.Thread(
             target=self._run,
             name="runtime-sampler",
@@ -178,7 +192,7 @@ class RuntimeSampler:
             rss,
             self.sampled_peak_rss,
             vms,
-            f"{self._process.cpu_percent(None):.1f}",
+            f"{_safe_cpu_percent(self._process):.1f}",
             self._process.num_threads(),
             psutil.virtual_memory().available,
         ])

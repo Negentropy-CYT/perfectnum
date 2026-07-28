@@ -26,6 +26,8 @@ classifiers = [
 ]
 dependencies = [
     "gmpy2>=2.0.0",
+    "numpy",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]

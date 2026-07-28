@@ -290,6 +290,8 @@ def search_opn(
         int(resume_state.get("snapshot_id", 0))
         if resume_state is not None else 0
     )
+    states_started = int(resume_state.get("states_started", 0)) if resume_state else 0
+    states_completed = int(resume_state.get("states_completed", 0)) if resume_state else 0
     last_checkpoint = time.monotonic()
 
     def _publish_frontier(reason: str) -> None:
@@ -300,11 +302,14 @@ def search_opn(
             return
         snapshot_id += 1
         snapshot_elapsed = time.time() - t0
-        # The callback runs synchronously before this live frontier mutates.
+        # Write progress counters *before* the callback so the
+        # checkpoint always contains the most recent values.
         state_holder.update({
             "heap": heap,
             "heap_counter": heap_counter,
             "total_states": total_states,
+            "states_started": states_started,
+            "states_completed": states_completed,
             "elapsed": snapshot_elapsed,
             "snapshot_id": snapshot_id,
             "snapshot_reason": reason,
@@ -322,8 +327,6 @@ def search_opn(
     _last_progress = 0.0
 
     # ── main loop ──
-    states_started = 0
-    states_completed = 0
     while heap:
         if stop_requested is not None and stop_requested():
             _publish_frontier("stop")

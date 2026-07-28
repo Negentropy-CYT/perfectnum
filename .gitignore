@@ -14,6 +14,21 @@ checkpoint*.pkl
 solutions*.txt
 *.tmp
 
+# Per-run output directory
+runs/
+
+# Legacy telemetry (now in runs/ directory)
+telemetry.txt
+telemetry.*.txt
+
+# Runtime output
+factor_graph.*
+*.docx
+
+# Reference materials (Nielsen Mathematica, Thackeray SageMath — local only)
+reference/
+improvements/
+
 # IDE
 .idea/
 .vscode/

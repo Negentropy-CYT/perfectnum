@@ -9,20 +9,15 @@ Usage
     python opn_main.py            # run the configured finite search box
     # edit PROPAGATE              # switch spoof/true-OPN mode
     # edit MAX_PRIME / MAX_EXP    # adjust search scope
-
-Modules
--------
-    opn_core      — arithmetic engine (primes, factorisation, caches)
-    opn_state     — State dataclass & constraint propagation
-    opn_search    — search engine
-    opn_io        — display, checkpoint, file I/O
 """
 
 import os
 import signal
+import subprocess
 import sys
 import time
-from typing import List
+from datetime import datetime, timezone
+from pathlib import Path
 
 from opn_core import (
     CHECKPOINT_INTERVAL_SECONDS,
@@ -31,20 +26,40 @@ from opn_core import (
     MAX_FACTORS,
     MAX_EXP,
     PROPAGATE,
+    POOL_GCD_MODE,
+    POOL_SUPERBLOCK_FANOUT,
+    SEARCH_MODE,
     generate_odd_primes,
     valid_euler_exponents,
     valid_even_exponents,
+    _SIG_FACTORS,
 )
 from opn_io import (
     display_solution,
-    display_telemetry_brief,
     export_factor_graph,
     load_checkpoint,
     save_checkpoint,
     save_solutions_txt,
-    write_telemetry_report,
 )
+from opn_metrics import RunMetrics
+from opn_reports import prepare_run_directory, write_all_reports
+from opn_runtime import RuntimeSampler
 from opn_search import SearchStopped, search_opn
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _make_run_id(max_prime: int, max_factors: int, max_exp: int) -> str:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{ts}_P{max_prime}_F{max_factors}_E{max_exp}"
 
 
 # ── main ──────────────────────────────────────────────────────
@@ -53,32 +68,51 @@ def main() -> None:
     chk = load_checkpoint()
     prev_solutions: list = []
 
-    if chk is not None:
+    if chk is not None and chk.get("format_version") == 4:
         print("=" * 60)
-        print("发现已有检查点，将从中断处继续 ...")
+        print("发现已有检查点 (v4)，将从中断处继续 ...")
         print(f"  已完成状态: {chk['total_states']:,}")
         print(f"  已用时间:   {chk['elapsed']:.1f}s")
         print(f"  已找到解:   {len(chk.get('solutions', []))}")
         print("=" * 60)
         prev_solutions = chk.get("solutions", [])
-        primes      = chk.get("primes", [])
+        metrics = RunMetrics.from_checkpoint_payload(chk["metrics"])
+        run_id = chk["run_id"]
+        elapsed_offset = chk["elapsed"]
+
+        # rebuild prime pool from fingerprint
+        primes = generate_odd_primes(chk["prime_limit"])
+        if len(primes) != chk["prime_count"]:
+            print(f"警告: 素数数量不匹配 (expected {chk['prime_count']}, got {len(primes)})")
         max_factors = chk.get("max_factors", MAX_FACTORS)
-        max_exp     = chk.get("max_exp", MAX_EXP)
-        if not primes:
-            primes = generate_odd_primes(MAX_PRIME)
+        max_exp = chk.get("max_exp", MAX_EXP)
         resume_state = {
             "heap":         chk.get("heap", []),
             "heap_counter": chk.get("heap_counter", 0),
+            "states_started": chk.get("states_started", 0),
+            "states_completed": chk.get("states_completed", 0),
             "total_states": chk.get("total_states", 0),
             "elapsed":      chk.get("elapsed", 0.0),
             "use_heap":     chk.get("use_heap", PROPAGATE),
             "snapshot_id":  chk.get("snapshot_id", 0),
         } if chk.get("heap") else None
+
+    elif chk is not None:
+        print("警告: 检查点格式过旧 (v3 或更早)，本次无法恢复。")
+        print("请删除 checkpoint_merged.pkl 后重新开始，或切回旧分支完成当前运行。")
+        return
+
     else:
-        primes      = generate_odd_primes(MAX_PRIME)
+        metrics = RunMetrics()
+        run_id = _make_run_id(MAX_PRIME, MAX_FACTORS, MAX_EXP)
+        elapsed_offset = 0.0
+        primes = generate_odd_primes(MAX_PRIME)
         max_factors = MAX_FACTORS
-        max_exp     = MAX_EXP
+        max_exp = MAX_EXP
         resume_state = None
+
+    git_commit = _git_commit()
+    run_dir = prepare_run_directory(run_id)
 
     # header
     mode_str = ("伪解搜索 (独立质数, propagate=False)" if not PROPAGATE
@@ -90,6 +124,7 @@ def main() -> None:
     print(f"非 Euler:    {valid_even_exponents(2, max_exp)}")
     print(f"搜索模式:    {mode_str}")
     print(f"自动检查点:  每 {CHECKPOINT_INTERVAL_SECONDS:g} 秒")
+    print(f"运行 ID:     {run_id}")
     print("=" * 60)
     print("按一次 Ctrl+C 在当前状态完成后安全保存；再次按下立即中断\n")
 
@@ -101,7 +136,15 @@ def main() -> None:
     stop_requested = False
     interrupt_count = 0
 
-    # ── progress callback (decoupled from search engine) ──
+    sampler = RuntimeSampler(
+        run_dir / "performance_samples.csv",
+        elapsed_offset=elapsed_offset,
+        append=(chk is not None),
+    )
+    sampler.start()
+    sampler.set_phase("startup")
+
+    # ── progress callback ──
     def _show_progress(total_states: int, st, elapsed: float) -> None:
         rate = total_states / elapsed if elapsed > 0 else 0
         sys.stdout.write(
@@ -115,7 +158,10 @@ def main() -> None:
 
     def _save_stable_boundary(holder: dict, reason: str) -> None:
         if reason in {"initial", "periodic"}:
-            save_checkpoint(holder, solutions)
+            save_checkpoint(holder, solutions, run_id=run_id, metrics=metrics)
+        holder["states_started"] = (
+            holder.get("live_total_states", holder.get("total_states", 0))
+        )
 
     previous_sigint = signal.getsignal(signal.SIGINT)
 
@@ -134,12 +180,16 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
+    status = "FAILED"
     try:
+        sampler.set_phase("search")
         for st in search_opn(
             primes, max_factors, max_exp,
+            metrics=metrics,
+            propagate=PROPAGATE,
             state_holder=state_holder,
             resume_state=resume_state,
-            propagate=PROPAGATE,
+            observer=sampler,
             progress_callback=_show_progress,
             checkpoint_callback=_save_stable_boundary,
             checkpoint_interval_seconds=CHECKPOINT_INTERVAL_SECONDS,
@@ -152,56 +202,97 @@ def main() -> None:
             solutions.append((dict(st.assigned), st.euler_prime, st.spoof))
             display_solution(st, len(solutions), time.time() - t0)
             export_factor_graph(st, path=f"factor_graph_{len(solutions)}")
-            # ponytail: chain-mode spoof is non-terminal — the heap at
-            # this point lacks st and its successors.  The periodic
-            # checkpoint covers the live frontier; skip the snapshot here.
             if not st.spoof or not PROPAGATE:
-                save_checkpoint(state_holder, solutions)
+                save_checkpoint(state_holder, solutions, run_id=run_id, metrics=metrics)
             save_solutions_txt(solutions)
+        status = "COMPLETE"
 
     except SearchStopped:
         print("\n\n已到达稳定搜索边界，正在保存 ...")
-        save_checkpoint(state_holder, solutions)
+        save_checkpoint(state_holder, solutions, run_id=run_id, metrics=metrics)
         save_solutions_txt(solutions)
-        write_telemetry_report(time.time() - t0, found_true + found_spoof)
-        display_telemetry_brief()
-        print(
-            f"已精确保存。已完成 "
-            f"{state_holder.get('total_states', 0):,} 个状态；"
-            f"前沿还有 {state_holder.get('frontier_size', 0):,} 个状态。"
-        )
-        return
+        status = "STOPPED"
 
     except KeyboardInterrupt:
         print("\n\n已立即中断搜索。")
         save_solutions_txt(solutions)
-        write_telemetry_report(time.time() - t0, found_true + found_spoof)
-        display_telemetry_brief()
+        status = "INTERRUPTED"
         if os.path.exists(CHECKPOINT_FILE):
             print("保留了最近一次完整的原子检查点；恢复时可能重算少量状态。")
         else:
             print("中断发生在首次检查点完成前，本次没有可恢复的完整检查点。")
-        return
 
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
+        sampler.set_phase("report_write")
+        sampler.stop()
 
-    elapsed = time.time() - t0
-    print(
-        f"\n搜索完成。总状态: {state_holder.get('total_states', 0):,}, "
-        f"耗时: {elapsed:.1f}s"
-    )
-    write_telemetry_report(elapsed, found_true + found_spoof)
-    display_telemetry_brief()
+        elapsed = time.time() - t0
 
-    if solutions:
-        print(f"\n=== 共 {found_true} 个真解 + {found_spoof} 个伪解 ===")
-    else:
-        print("\n在搜索范围内无解。")
+        metrics.performance.cache_sizes = {
+            "SIGMA_CACHE": len(
+                __import__("opn_core").SIGMA_CACHE
+            ),
+            "_SIG_VALUATIONS": len(
+                __import__("opn_core")._SIG_VALUATIONS
+            ),
+        }
+        metrics.performance.memory_phases["at_report"] = (
+            sampler.capture_memory()
+        )
 
-    if os.path.exists(CHECKPOINT_FILE):
-        os.remove(CHECKPOINT_FILE)
-        print("已清理检查点文件。")
+        config = {
+            "max_prime": MAX_PRIME,
+            "max_factors": MAX_FACTORS,
+            "max_exp": MAX_EXP,
+            "target_num": SEARCH_MODE.target_num,
+            "target_den": SEARCH_MODE.target_den,
+            "require_euler": SEARCH_MODE.require_euler,
+            "propagate": PROPAGATE,
+            "pool_gcd_mode": POOL_GCD_MODE,
+            "pool_fanout": POOL_SUPERBLOCK_FANOUT,
+        }
+        environment = {
+            "git_commit": git_commit,
+            "run_id": run_id,
+        }
+
+        write_all_reports(
+            run_dir=run_dir,
+            run_id=run_id,
+            git_commit=git_commit,
+            status=status,
+            config=config,
+            metrics=metrics,
+            elapsed_seconds=elapsed,
+            solutions_found=found_true + found_spoof,
+            sampled_peak_rss=sampler.sampled_peak_rss,
+            _sig_factors=__import__("opn_core")._SIG_FACTORS,
+        )
+
+        if status == "STOPPED":
+            print(
+                f"已精确保存。已完成 "
+                f"{state_holder.get('total_states', 0):,} 个状态；"
+                f"前沿还有 {state_holder.get('frontier_size', 0):,} 个状态。"
+            )
+            return
+
+        if status == "COMPLETE":
+            print(
+                f"\n搜索完成。总状态: {state_holder.get('total_states', 0):,}, "
+                f"耗时: {elapsed:.1f}s"
+            )
+            if solutions:
+                print(f"\n=== 共 {found_true} 个真解 + {found_spoof} 个伪解 ===")
+            else:
+                print("\n在搜索范围内无解。")
+            if os.path.exists(CHECKPOINT_FILE):
+                os.remove(CHECKPOINT_FILE)
+                print("已清理检查点文件。")
+
+        if status in ("INTERRUPTED", "FAILED"):
+            print(f"运行状态: {status}，报告已保存到 {run_dir}")
 
 
 if __name__ == "__main__":

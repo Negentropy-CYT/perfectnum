@@ -20,24 +20,8 @@ from typing import Deque, Dict, Optional, Tuple
 from gmpy2 import mpz
 
 from opn_core import (
-    CASCADE_DEPTH_HIST,
-    CLONE_PAYLOAD,
-    CLONE_STATS,
-    CONTRADICTION_ATTR,
-    DEPTH_FACTOR_MAP,
-    DEPTH_STATS,
     FERMAT_PRIMES,
     SEARCH_MODE,
-    HEADROOM_BY_FACTOR,
-    OBLIGATION_SIGS,
-    OUTSIDE_POOL_SOURCES,
-    OUTSIDE_WINDOW_SOURCE,
-    PENDING_PRIME_FREQ,
-    PENDING_SIZE_HIST,
-    PROPAGATION_EDGES,
-    PROPAGATION_EXP_EDGES,
-    PRUNE_STATS,
-    RATIO_HEADROOM,
     _SIG_FACTORS,
     MAX_EXP,
     RESONANCE_REUSE_W,
@@ -53,6 +37,12 @@ from opn_core import (
     touchard_force_3,
     valid_euler_exponents,
     valid_even_exponents,
+)
+from opn_metrics import (
+    CloneEffect,
+    PruneMechanism,
+    PruneReason,
+    RunMetrics,
 )
 
 
@@ -87,8 +77,6 @@ class DFSState:
     spoof:      bool           = False
 
     def clone(self) -> "DFSState":
-        CLONE_STATS["total"] += 1
-        CLONE_PAYLOAD[len(self.assigned)] += 1
         return DFSState(
             assigned=dict(self.assigned),
             excluded=set(self.excluded),
@@ -125,8 +113,6 @@ class ChainState:
     priority:    float           = 0.0
 
     def clone(self) -> "ChainState":
-        CLONE_STATS["total"] += 1
-        CLONE_PAYLOAD[len(self.assigned)] += 1
         return ChainState(
             assigned=dict(self.assigned),
             required_v=dict(self.required_v),
@@ -147,18 +133,19 @@ class ChainState:
 
 # ── prune telemetry helper ──────────────────────────────────
 
-def _reject(reason: str):
-    """Increment prune counter and return None (sentinel for pruned branch).
-
-    Also classifies the prune as pre-clone (saved) or post-clone (wasted)
-    for clone-effectiveness telemetry.
-    """
-    PRUNE_STATS[reason] += 1
-    if reason in ("excluded", "ratio", "euler", "valuation_pre",
-                  "window_prime_pre", "window_residual_pre"):
-        CLONE_STATS["saved"] += 1   # clone was avoided
-    else:
-        CLONE_STATS["wasted"] += 1  # clone was already paid
+def _reject(
+    metrics: RunMetrics,
+    *,
+    reason: PruneReason,
+    mechanism: PruneMechanism,
+    clone_effect: CloneEffect,
+):
+    """Record a prune event and return None (sentinel for pruned branch)."""
+    metrics.record_prune(
+        reason=reason,
+        mechanism=mechanism,
+        clone_effect=clone_effect,
+    )
     return None
 
 
@@ -347,17 +334,39 @@ def fermat_debt_capacity(
 
 # ── assign_prime_dfs (lightweight, no propagation) ───────────
 
-def assign_prime_dfs(st: DFSState, p: int, exp: int,
-                     max_exp: int = MAX_EXP) -> Optional[DFSState]:
+def assign_prime_dfs(
+    st: DFSState,
+    p: int,
+    exp: int,
+    *,
+    metrics: RunMetrics,
+    max_exp: int = MAX_EXP,
+) -> Optional[DFSState]:
     """Assign p^exp to a DFSState.  No factor-chain propagation."""
     if p in st.excluded or p in st.assigned:
-        return _reject("excluded")
+        return _reject(
+            metrics,
+            reason=PruneReason.EXCLUDED_PRIME,
+            mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+            clone_effect=CloneEffect.AVOIDED,
+        )
     if _early_ratio_prune(st.ratio_num, st.ratio_den, p, exp):
-        return _reject("ratio")
+        return _reject(
+            metrics,
+            reason=PruneReason.RATIO_OVERSHOOT,
+            mechanism=PruneMechanism.PROSPECTIVE_RATIO,
+            clone_effect=CloneEffect.AVOIDED,
+        )
     if not _euler_ok(p, exp, st.euler_prime):
-        return _reject("euler")
+        return _reject(
+            metrics,
+            reason=PruneReason.EULER_FORM,
+            mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+            clone_effect=CloneEffect.AVOIDED,
+        )
 
     ns = st.clone()
+    metrics.record_clone(len(st.assigned))
     ns.assigned[p] = exp
     sig = sigma_prime_power(p, exp)
     pa = mpz(power_pa(p, exp))
@@ -367,40 +376,58 @@ def assign_prime_dfs(st: DFSState, p: int, exp: int,
         ns.euler_prime = p
 
     if not check_touchard(ns.euler_prime, ns.assigned, ns.excluded):
-        return _reject("touchard")
+        return _reject(
+            metrics,
+            reason=PruneReason.TOUCHARD,
+            mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+            clone_effect=CloneEffect.WASTED,
+        )
 
-    DEPTH_STATS[ns.depth] += 1
-    CLONE_STATS["productive"] += 1
+    metrics.structure.depth_histogram[ns.depth] += 1
+    metrics.structure.productive_states += 1
     return ns
 
 
 # ── assign_prime_chain (full factor-chain propagation) ───────
 
-def assign_prime_chain(st: ChainState, p: int, exp: int, *,
-                       propagate: bool = True,
-                       max_exp: int = MAX_EXP,
-                       prime_limit: int | None = None,
-                       sigma_pool_analyzer=None) -> Optional[ChainState]:
+def assign_prime_chain(
+    st: ChainState,
+    p: int,
+    exp: int,
+    *,
+    metrics: RunMetrics,
+    propagate: bool = True,
+    max_exp: int = MAX_EXP,
+    prime_limit: int | None = None,
+    sigma_pool_analyzer=None,
+) -> Optional[ChainState]:
     """Assign p^exp to a ChainState with full factor-chain propagation.
 
     The exact sigma-valuation map is populated on demand before cloning, so
     valuation contradictions avoid both unnecessary clones and global eager
     factorisation of unreachable (p, a) pairs.
-
-    When *sigma_pool_analyzer* is provided and the analysis is not exact
-    (residual > 1 after stripping all in-pool primes), the branch is pruned
-    via ``window_residual_pre`` without running full Pollard–Rho.
     """
     if p in st.excluded or p in st.assigned:
-        return _reject("excluded")
+        return _reject(
+            metrics,
+            reason=PruneReason.EXCLUDED_PRIME,
+            mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+            clone_effect=CloneEffect.AVOIDED,
+        )
     if _early_ratio_prune(st.ratio_num, st.ratio_den, p, exp):
-        return _reject("ratio")
+        return _reject(
+            metrics,
+            reason=PruneReason.RATIO_OVERSHOOT,
+            mechanism=PruneMechanism.PROSPECTIVE_RATIO,
+            clone_effect=CloneEffect.AVOIDED,
+        )
     if not _euler_ok(p, exp, st.euler_prime):
-        return _reject("euler")
-
-    # ── interval skip (pre-clone, counts as saved) ──
-    # Tracked via _reject but actually handled in the expansion loop.
-    # The _reject path here is for future per-assign interval checks.
+        return _reject(
+            metrics,
+            reason=PruneReason.EULER_FORM,
+            mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+            clone_effect=CloneEffect.AVOIDED,
+        )
 
     # ── pre-clone valuation check (populates the exact map lazily) ──
     pre_vals = None
@@ -409,43 +436,77 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
             analysis = sigma_pool_analyzer.analyze(p, exp)
             if not analysis.exact:
                 residual_bits = int(analysis.residual).bit_length()
-                OUTSIDE_POOL_SOURCES[(p, exp, residual_bits)] += 1
-                return _reject("window_residual_pre")
+                metrics.structure.outside_pool_sources[
+                    (p, exp, residual_bits)
+                ] += 1
+                return _reject(
+                    metrics,
+                    reason=PruneReason.OUTSIDE_WINDOW,
+                    mechanism=PruneMechanism.COLD_POOL_CERTIFICATE,
+                    clone_effect=CloneEffect.AVOIDED,
+                )
             pre_vals = analysis.valuations
         else:
             pre_vals = sigma_valuation_map(p, exp)
 
         for q, incoming in pre_vals.items():
-            # q is an odd prime factor of σ(p^a) with exponent e
             offset = _target_valuation_offset(q)
             new_req = st.required_v.get(q, 0) + incoming
 
-            # Finite-window prune: q is outside the configured prime pool,
-            # the target offset cannot absorb the required valuation,
-            # so q would be forced into N — impossible in this window.
             if prime_limit is not None and q > prime_limit and new_req > offset:
-                CONTRADICTION_ATTR[(q, "maxprime_pre")] += 1
-                OUTSIDE_WINDOW_SOURCE[(p, exp, q)] += 1
-                return _reject("window_prime_pre")
+                metrics.structure.contradiction_attribution[
+                    (q, "maxprime_pre")
+                ] += 1
+                metrics.structure.outside_window_sources[
+                    (p, exp, q)
+                ] += 1
+                return _reject(
+                    metrics,
+                    reason=PruneReason.OUTSIDE_WINDOW,
+                    mechanism=PruneMechanism.EXACT_FACTOR_OUTSIDE,
+                    clone_effect=CloneEffect.AVOIDED,
+                )
 
             if q in st.excluded and new_req > offset:
-                CONTRADICTION_ATTR[(q, "excluded_pre")] += 1
-                return _reject("valuation_pre")
+                metrics.structure.contradiction_attribution[
+                    (q, "excluded_pre")
+                ] += 1
+                return _reject(
+                    metrics,
+                    reason=PruneReason.VALUATION_CONTRADICTION,
+                    mechanism=PruneMechanism.PRECLONE_VALUATION,
+                    clone_effect=CloneEffect.AVOIDED,
+                )
             if q in st.assigned:
                 if new_req > st.current_v[q] + offset:
-                    CONTRADICTION_ATTR[(q, "overrun_pre")] += 1
-                    return _reject("valuation_pre")
+                    metrics.structure.contradiction_attribution[
+                        (q, "overrun_pre")
+                    ] += 1
+                    return _reject(
+                        metrics,
+                        reason=PruneReason.VALUATION_CONTRADICTION,
+                        mechanism=PruneMechanism.PRECLONE_VALUATION,
+                        clone_effect=CloneEffect.AVOIDED,
+                    )
             else:
                 if (
                     new_req
                     > _max_possible_valuation(q, st.euler_prime, max_exp)
                     + offset
                 ):
-                    CONTRADICTION_ATTR[(q, "budget_pre")] += 1
-                    return _reject("valuation_pre")
+                    metrics.structure.contradiction_attribution[
+                        (q, "budget_pre")
+                    ] += 1
+                    return _reject(
+                        metrics,
+                        reason=PruneReason.VALUATION_CONTRADICTION,
+                        mechanism=PruneMechanism.PRECLONE_VALUATION,
+                        clone_effect=CloneEffect.AVOIDED,
+                    )
 
     # ── clone & apply ──
     ns = st.clone()
+    metrics.record_clone(len(st.assigned))
     ns.assigned[p] = exp
     ns.current_v[p] = ns.current_v.get(p, 0) + exp
     sig = sigma_prime_power(p, exp)
@@ -456,7 +517,12 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         ns.euler_prime = p
 
     if not check_touchard(ns.euler_prime, ns.assigned, ns.excluded):
-        return _reject("touchard")
+        return _reject(
+            metrics,
+            reason=PruneReason.TOUCHARD,
+            mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+            clone_effect=CloneEffect.WASTED,
+        )
 
     # resonance (chain mode only)
     if propagate:
@@ -468,42 +534,67 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
         ns.priority = 0.0
 
     if not propagate:
-        DEPTH_STATS[ns.depth] += 1
-        CLONE_STATS["productive"] += 1
-        PENDING_SIZE_HIST[len(ns.pending)] += 1
-        CASCADE_DEPTH_HIST[0] += 1
-        _record_productive_telemetry(ns)
+        metrics.structure.depth_histogram[ns.depth] += 1
+        metrics.structure.record_productive(
+            depth=ns.depth,
+            assigned_count=len(ns.assigned),
+            pending=ns.pending,
+            ratio_num=int(ns.ratio_num),
+            ratio_den=int(ns.ratio_den),
+            target_num=SEARCH_MODE.target_num,
+            target_den=SEARCH_MODE.target_den,
+        )
         return ns
 
     # factor-chain propagation (additive valuation)
     cascade_steps = 0
-    # ponytail: reuse the exact map already computed pre-clone
     post_vals = pre_vals if pre_vals is not None else {}
     for q, incoming in post_vals.items():
         if q == 2:
             continue
-        PROPAGATION_EDGES[(p, q)] += 1
-        PROPAGATION_EXP_EDGES[(p, exp, q)] += 1
+        metrics.structure.propagation_edges[(p, q)] += 1
+        metrics.structure.propagation_exp_edges[(p, exp, q)] += 1
         offset = _target_valuation_offset(q)
         new_req = ns.required_v.get(q, 0) + incoming
         if q in ns.excluded and new_req > offset:
-            CONTRADICTION_ATTR[(q, "excluded_post")] += 1
-            return _reject("valuation_post")
+            metrics.structure.contradiction_attribution[
+                (q, "excluded_post")
+            ] += 1
+            return _reject(
+                metrics,
+                reason=PruneReason.VALUATION_CONTRADICTION,
+                mechanism=PruneMechanism.POSTCLONE_VALUATION,
+                clone_effect=CloneEffect.WASTED,
+            )
 
         ns.required_v[q] = new_req
 
         if q in ns.assigned:
             if ns.required_v[q] > ns.current_v[q] + offset:
-                CONTRADICTION_ATTR[(q, "overrun_post")] += 1
-                return _reject("valuation_post")
+                metrics.structure.contradiction_attribution[
+                    (q, "overrun_post")
+                ] += 1
+                return _reject(
+                    metrics,
+                    reason=PruneReason.VALUATION_CONTRADICTION,
+                    mechanism=PruneMechanism.POSTCLONE_VALUATION,
+                    clone_effect=CloneEffect.WASTED,
+                )
         else:
             if (
                 ns.required_v[q]
                 > _max_possible_valuation(q, ns.euler_prime, max_exp)
                 + offset
             ):
-                CONTRADICTION_ATTR[(q, "budget_post")] += 1
-                return _reject("valuation_post")
+                metrics.structure.contradiction_attribution[
+                    (q, "budget_post")
+                ] += 1
+                return _reject(
+                    metrics,
+                    reason=PruneReason.VALUATION_CONTRADICTION,
+                    mechanism=PruneMechanism.POSTCLONE_VALUATION,
+                    clone_effect=CloneEffect.WASTED,
+                )
 
         if (
             ns.required_v[q] - offset
@@ -512,11 +603,16 @@ def assign_prime_chain(st: ChainState, p: int, exp: int, *,
             _enqueue_pending(ns, q)
             cascade_steps += 1
 
-    DEPTH_STATS[ns.depth] += 1
-    CLONE_STATS["productive"] += 1
-    PENDING_SIZE_HIST[len(ns.pending)] += 1
-    CASCADE_DEPTH_HIST[cascade_steps] += 1
-    _record_productive_telemetry(ns)
+    metrics.structure.depth_histogram[ns.depth] += 1
+    metrics.structure.record_productive(
+        depth=ns.depth,
+        assigned_count=len(ns.assigned),
+        pending=ns.pending,
+        ratio_num=int(ns.ratio_num),
+        ratio_den=int(ns.ratio_den),
+        target_num=SEARCH_MODE.target_num,
+        target_den=SEARCH_MODE.target_den,
+    )
     return ns
 
 
@@ -542,31 +638,6 @@ def validate_chain_state(st: ChainState) -> bool:
         if cq < 0:
             return False
     return True
-
-
-# ── productive telemetry recording ───────────────────────────
-
-def _record_productive_telemetry(ns) -> None:
-    """Record ratio headroom and depth×|f| for a productive state."""
-    ratio = float(ns.ratio_num / ns.ratio_den)
-    headroom = SEARCH_MODE.target_num / SEARCH_MODE.target_den - ratio
-    if headroom <= 1e-6:       bucket = "<1e-6"
-    elif headroom <= 1e-5:     bucket = "1e-6-1e-5"
-    elif headroom <= 1e-4:     bucket = "1e-5-1e-4"
-    elif headroom <= 1e-3:     bucket = "1e-4-1e-3"
-    elif headroom <= 1e-2:     bucket = "1e-3-1e-2"
-    else:                      bucket = ">1e-2"
-    RATIO_HEADROOM[bucket] += 1
-    DEPTH_FACTOR_MAP[(ns.depth, len(ns.assigned))] += 1
-    HEADROOM_BY_FACTOR[(len(ns.assigned), bucket)] += 1
-    for q in ns.pending_set:
-        PENDING_PRIME_FREQ[q] += 1
-    # coarse headroom for signature dedup
-    if headroom > 0:
-        coarse = int(math.floor(-math.log10(headroom)))
-    else:
-        coarse = 99
-    OBLIGATION_SIGS[(frozenset(ns.pending), len(ns.assigned), coarse)] += 1
 
 
 # ── resonance update ─────────────────────────────────────────

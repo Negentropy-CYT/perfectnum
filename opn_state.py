@@ -2,7 +2,7 @@
 opn_state — polymorphic search states and constraint propagation.
 
 Defines two state classes:
-  - DFSState   — minimal (5 fields) for pseudo-solution DFS
+  - DFSState   — minimal (5 fields) for Descartes-spoof DFS
   - ChainState — full (14 fields, 6 collections cloned) for factor-chain best-first search
 
 Key improvements over v1 unified State:
@@ -66,12 +66,12 @@ def _compute_priority(ratio_num, ratio_den, resonance, n_assigned):
 
 
 # ══════════════════════════════════════════════════════════════
-# DFSState — minimal state for pseudo-solution DFS
+# DFSState — minimal state for Descartes-spoof DFS
 # ══════════════════════════════════════════════════════════════
 
 @dataclass(slots=True)
 class DFSState:
-    """Minimal state for DFS pseudo-solution search (propagate=False).
+    """Minimal state for DFS Descartes-spoof search (propagate=False).
 
     Omits: required_v, current_v, pending, pending_set, resonance, priority.
     Saves 5 collection deep-copies per clone vs the old unified State.
@@ -84,7 +84,7 @@ class DFSState:
     ratio_den:   mpz            = field(default_factory=lambda: mpz(1))
     next_idx:    int            = 0
     depth:       int            = 0
-    pseudo:      bool           = False
+    spoof:      bool           = False
 
     def clone(self) -> "DFSState":
         CLONE_STATS["total"] += 1
@@ -97,7 +97,7 @@ class DFSState:
             ratio_den=mpz(self.ratio_den),
             next_idx=self.next_idx,
             depth=self.depth + 1,
-            pseudo=self.pseudo,
+            spoof=self.spoof,
         )
 
 
@@ -120,7 +120,7 @@ class ChainState:
     ratio_den:   mpz             = field(default_factory=lambda: mpz(1))
     next_idx:    int             = 0
     depth:       int             = 0
-    pseudo:      bool            = False
+    spoof:      bool            = False
     resonance:   float           = 0.0
     priority:    float           = 0.0
 
@@ -139,7 +139,7 @@ class ChainState:
             ratio_den=mpz(self.ratio_den),
             next_idx=self.next_idx,
             depth=self.depth + 1,
-            pseudo=self.pseudo,
+            spoof=self.spoof,
             resonance=self.resonance,
             priority=self.priority,
         )

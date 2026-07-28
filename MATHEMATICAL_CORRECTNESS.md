@@ -213,13 +213,13 @@ for the maximum prime.  The rounding helpers `euler_max_exp_capacity` and
 `_max_possible_valuation` bound is often tighter.  The capacity bound
 becomes the dominant constraint when `MAX_EXP` is raised significantly.
 
-## Pseudo-Solution Expansion
+## Spoof-State Expansion
 
 In factor-chain (true-OPN) mode a state that satisfies the Descartes-spoof
-formula (`_check_pseudo`) is yielded but **not** terminated: the state may
+formula (`_check_spoof`) is yielded but **not** terminated: the state may
 still accept more real prime-power components and evolve into a genuine
 `σ(N) = 2N` solution.  The `continue` is guarded by `not use_heap`, i.e.
-it stops expansion only in DFS (pseudo-solution) mode where the spoof is
+it stops expansion only in DFS (Descartes-spoof) mode where the spoof is
 the intended end product.
 
 ## Deferred Constraints

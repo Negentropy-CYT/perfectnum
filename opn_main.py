@@ -7,7 +7,7 @@ candidates of the form  N = q^{4k+1} × ∏ p_i^{2a_i}.
 Usage
 -----
     python opn_main.py            # run the configured finite search box
-    # edit PROPAGATE              # switch pseudo/true-OPN mode
+    # edit PROPAGATE              # switch spoof/true-OPN mode
     # edit MAX_PRIME / MAX_EXP    # adjust search scope
 
 Modules
@@ -97,7 +97,7 @@ def main() -> None:
     state_holder: dict = {}
     t0           = time.time()
     found_true   = 0
-    found_pseudo = 0
+    found_spoof = 0
     stop_requested = False
     interrupt_count = 0
 
@@ -145,17 +145,17 @@ def main() -> None:
             checkpoint_interval_seconds=CHECKPOINT_INTERVAL_SECONDS,
             stop_requested=lambda: stop_requested,
         ):
-            if st.pseudo:
-                found_pseudo += 1
+            if st.spoof:
+                found_spoof += 1
             else:
                 found_true += 1
-            solutions.append((dict(st.assigned), st.euler_prime, st.pseudo))
+            solutions.append((dict(st.assigned), st.euler_prime, st.spoof))
             display_solution(st, len(solutions), time.time() - t0)
             export_factor_graph(st, path=f"factor_graph_{len(solutions)}")
-            # ponytail: chain-mode pseudo is non-terminal — the heap at
+            # ponytail: chain-mode spoof is non-terminal — the heap at
             # this point lacks st and its successors.  The periodic
             # checkpoint covers the live frontier; skip the snapshot here.
-            if not st.pseudo or not PROPAGATE:
+            if not st.spoof or not PROPAGATE:
                 save_checkpoint(state_holder, solutions)
             save_solutions_txt(solutions)
 
@@ -163,7 +163,7 @@ def main() -> None:
         print("\n\n已到达稳定搜索边界，正在保存 ...")
         save_checkpoint(state_holder, solutions)
         save_solutions_txt(solutions)
-        write_telemetry_report(time.time() - t0, found_true + found_pseudo)
+        write_telemetry_report(time.time() - t0, found_true + found_spoof)
         display_telemetry_brief()
         print(
             f"已精确保存。已完成 "
@@ -175,7 +175,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n\n已立即中断搜索。")
         save_solutions_txt(solutions)
-        write_telemetry_report(time.time() - t0, found_true + found_pseudo)
+        write_telemetry_report(time.time() - t0, found_true + found_spoof)
         display_telemetry_brief()
         if os.path.exists(CHECKPOINT_FILE):
             print("保留了最近一次完整的原子检查点；恢复时可能重算少量状态。")
@@ -191,11 +191,11 @@ def main() -> None:
         f"\n搜索完成。总状态: {state_holder.get('total_states', 0):,}, "
         f"耗时: {elapsed:.1f}s"
     )
-    write_telemetry_report(elapsed, found_true + found_pseudo)
+    write_telemetry_report(elapsed, found_true + found_spoof)
     display_telemetry_brief()
 
     if solutions:
-        print(f"\n=== 共 {found_true} 个真解 + {found_pseudo} 个伪解 ===")
+        print(f"\n=== 共 {found_true} 个真解 + {found_spoof} 个伪解 ===")
     else:
         print("\n在搜索范围内无解。")
 

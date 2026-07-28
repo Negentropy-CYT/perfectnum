@@ -1,7 +1,7 @@
 # perfectnum — Odd Perfect Number Search Engine
 
 High-performance constraint-propagation search engine for odd perfect
-numbers and Descartes-type pseudo-candidates.  Factor-chain propagation,
+numbers and Descartes-type spoof candidates.  Factor-chain propagation,
 finite-window proof pruning, Nielsen-interval bounds, obligation-attractor
 telemetry.
 
@@ -47,14 +47,14 @@ $$N = q^{4k+1} \prod_{i} p_i^{2a_i}$$
 where $q \equiv 1 \pmod{4}$ is the *special* (Euler) prime — the only
 prime factor with odd exponent.  All other exponents are even.
 
-### Pseudo-OPN (Descartes-type) Candidates
+### Descartes Spoofs
 
 If we relax the requirement that the "Euler factor" be a single prime
 power and instead allow a composite *r* satisfying
 
 $$(r+1) \prod \sigma\!\left(p_i^{a_i}\right) = 2r \prod p_i^{a_i}$$
 
-we obtain *spoofs* or *pseudo-candidates*.  The smallest known example,
+we obtain *spoofs* or *Descartes spoofs*.  The smallest known example,
 due to Descartes, has
 
 $$N = 3^{2} \cdot 7^{2} \cdot 11^{2} \cdot 13^{2} \cdot 22021 \qquad (r = 22021 = 19^{2} \cdot 61)$$
@@ -63,7 +63,7 @@ where 22021 is treated *as if* it were prime — σ(22021) is replaced
 by 22021 + 1 in the perfect-number equation.
 
 This program searches for both true OPN (Euler-prime) candidates **and**
-Descartes-type pseudo-candidates.
+Descartes-type Descartes spoofs.
 
 ### Factor Chains
 
@@ -105,7 +105,7 @@ opn_core.py        Arithmetic engine
                      · telemetry counters + all user-configurable constants
 opn_state.py       Search state & constraint propagation
                      · DFSState (8 fields, 2 collections cloned) — lightweight
-                       pseudo-solution DFS
+                       Descartes-spoof DFS
                      · ChainState (14 fields, 6 collections cloned) — full
                        factor-chain search
                      · assign_prime_dfs / assign_prime_chain — separate
@@ -113,12 +113,12 @@ opn_state.py       Search state & constraint propagation
                      · pending-queue dedup helpers
 opn_search.py      Search engine
                      · search_opn() — generator with polymorphic dispatch
-                     · DFS (stack) for pseudo-solution mode (DFSState)
+                     · DFS (stack) for Descartes-spoof mode (DFSState)
                      · best-first (heap) for factor-chain mode (ChainState)
                      · Touchard congruence pruning + exact-state deduplication
                      · capacity-bound prune on last-slot expansions + pending drain
-                     · true-OPN & pseudo-solution checks
-                     · pseudo-solutions continue expanding in chain mode
+                     · true-OPN & Descartes-spoof checks
+                     · Descartes-spoofs continue expanding in chain mode
 opn_io.py          Display, checkpoint, file I/O
                      · display_solution()
                      · factor-chain trace
@@ -171,8 +171,8 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 | **Exponents** | fixed: all $a_i = 1$ | variable, bounded by `MAX_EXP` |
 | **Euler prime** | folded into composite $r$ | explicitly tracked ($q \equiv 1 \pmod{4}$, exponent $\equiv 1 \pmod{4}$) |
 | **Factor coupling** | none — primes are independent | factor chains propagate via $\sigma(p^{a})$ factorisation |
-| **Search strategy** | DFS (stack, fixed order) | DFS for pseudo-solution; best-first heap for true OPN |
-| **Pseudo-solutions** | primary output (composite $r$) | found in `propagate=False` mode |
+| **Search strategy** | DFS (stack, fixed order) | DFS for Descartes-spoof; best-first heap for true OPN |
+| **Spoofs** | primary output (composite $r$) | found in `propagate=False` mode |
 
 ### Performance
 
@@ -180,7 +180,7 @@ An early factor-chain prototype is also preserved under `legacy/`: `opn_factor_c
 |---|---|---|---|
 | **Per-state cost** | $O(1)$ — stack push + mpz multiply | $O(1)$ — same core operations | $\sigma$-pool analysis + tiered GCD |
 | **Memory** | ~1 MB (stack only) | ~10 MB (stack + caches) | ~50 MB (heap + factor/sigma/power caches) |
-| **Time to first pseudo-solution** (PRIME=397) | ~7 min | ~7 min | N/A (not applicable) |
+| **Time to first Descartes-spoof** (PRIME=397) | ~7 min | ~7 min | N/A (not applicable) |
 
 ### Why the Current Engine Is Slower Per State
 
@@ -290,7 +290,7 @@ CHECKPOINT_INTERVAL_SECONDS = 300.0
 
 | `PROPAGATE` | Strategy | Description |
 |:-----------:|----------|-------------|
-| `False` | DFS (stack) | Independent primes. Finds pseudo-candidates via composite‑r formula. Fast per-state. |
+| `False` | DFS (stack) | Independent primes. Finds Descartes spoofs via composite‑r formula. Fast per-state. |
 | `True` | best-first (heap) | Factor-chain propagation with pool-analyser outside-window pruning. Searches for genuine Euler-prime OPN. |
 
 ### Interpreting Output
@@ -303,9 +303,9 @@ CHECKPOINT_INTERVAL_SECONDS = 300.0
 - `ratio` — current $\sigma(N)/N$ (target: $2.0$)
 - `reson` — resonance heuristic score (higher = more $\sigma$-factor reuse)
 
-**Pseudo-candidate:**
+**Descartes spoof:**
 ```
-*** Pseudo-OPN Candidate  #1 ***
+*** Descartes Spoof  #1 ***
   N              = 198585576189
   r (composite)  = 22021  =  19^2 × 61^1
   r ≡ 1 mod 4    = True
@@ -340,7 +340,7 @@ exported as two files (numbered by solution index):
 
 Each edge `p → q` means σ(p^a) contains prime factor q, i.e. assigning
 p forces q into N.  Cycles in this graph (e.g. 3 → 13 → 3) are the
-structural signature of Descartes-type pseudo-solutions and explain why
+structural signature of Descartes-type Descartes-spoofs and explain why
 the resonance heuristic works.
 
 ### Search Telemetry

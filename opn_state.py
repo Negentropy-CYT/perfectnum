@@ -43,6 +43,10 @@ from opn_metrics import (
     PruneMechanism,
     PruneReason,
     RunMetrics,
+    VALUATION_EXCLUDED,
+    VALUATION_OVERRUN,
+    VALUATION_BUDGET,
+    VALUATION_KIND_COUNT,
 )
 
 
@@ -474,6 +478,12 @@ def assign_prime_chain(
                 metrics.structure.contradiction_attribution[
                     (q, "excluded_pre")
                 ] += 1
+                if exp < len(metrics.structure.valuation_contradictions_by_exp):
+                    metrics.structure.valuation_contradictions_by_exp[exp][
+                        VALUATION_EXCLUDED
+                    ] += 1
+                    if q == 3:
+                        metrics.structure.valuation_q3_by_exp[exp] += 1
                 return _reject(
                     metrics,
                     reason=PruneReason.VALUATION_CONTRADICTION,
@@ -485,6 +495,12 @@ def assign_prime_chain(
                     metrics.structure.contradiction_attribution[
                         (q, "overrun_pre")
                     ] += 1
+                    if exp < len(metrics.structure.valuation_contradictions_by_exp):
+                        metrics.structure.valuation_contradictions_by_exp[exp][
+                            VALUATION_OVERRUN
+                        ] += 1
+                        if q == 3:
+                            metrics.structure.valuation_q3_by_exp[exp] += 1
                     return _reject(
                         metrics,
                         reason=PruneReason.VALUATION_CONTRADICTION,
@@ -500,6 +516,12 @@ def assign_prime_chain(
                     metrics.structure.contradiction_attribution[
                         (q, "budget_pre")
                     ] += 1
+                    if exp < len(metrics.structure.valuation_contradictions_by_exp):
+                        metrics.structure.valuation_contradictions_by_exp[exp][
+                            VALUATION_BUDGET
+                        ] += 1
+                        if q == 3:
+                            metrics.structure.valuation_q3_by_exp[exp] += 1
                     return _reject(
                         metrics,
                         reason=PruneReason.VALUATION_CONTRADICTION,
@@ -562,6 +584,12 @@ def assign_prime_chain(
             metrics.structure.contradiction_attribution[
                 (q, "excluded_post")
             ] += 1
+            if exp < len(metrics.structure.valuation_contradictions_by_exp):
+                metrics.structure.valuation_contradictions_by_exp[exp][
+                    VALUATION_EXCLUDED
+                ] += 1
+                if q == 3:
+                    metrics.structure.valuation_q3_by_exp[exp] += 1
             return _reject(
                 metrics,
                 reason=PruneReason.VALUATION_CONTRADICTION,
@@ -576,6 +604,12 @@ def assign_prime_chain(
                 metrics.structure.contradiction_attribution[
                     (q, "overrun_post")
                 ] += 1
+                if exp < len(metrics.structure.valuation_contradictions_by_exp):
+                    metrics.structure.valuation_contradictions_by_exp[exp][
+                        VALUATION_OVERRUN
+                    ] += 1
+                    if q == 3:
+                        metrics.structure.valuation_q3_by_exp[exp] += 1
                 return _reject(
                     metrics,
                     reason=PruneReason.VALUATION_CONTRADICTION,
@@ -591,6 +625,12 @@ def assign_prime_chain(
                 metrics.structure.contradiction_attribution[
                     (q, "budget_post")
                 ] += 1
+                if exp < len(metrics.structure.valuation_contradictions_by_exp):
+                    metrics.structure.valuation_contradictions_by_exp[exp][
+                        VALUATION_BUDGET
+                    ] += 1
+                    if q == 3:
+                        metrics.structure.valuation_q3_by_exp[exp] += 1
                 return _reject(
                     metrics,
                     reason=PruneReason.VALUATION_CONTRADICTION,

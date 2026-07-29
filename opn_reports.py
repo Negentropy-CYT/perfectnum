@@ -31,10 +31,14 @@ def write_manifest(
     git_commit: str,
     started_at: str,
     config: dict,
+    pruning_policy: str = "",
+    telemetry_schema_version: int = 0,
 ) -> None:
     """Write manifest.json — machine-readable run identity and configuration."""
     doc = {
         "schema_version": 1,
+        "telemetry_schema_version": telemetry_schema_version,
+        "pruning_policy": pruning_policy,
         "run_id": run_id,
         "git_commit": git_commit,
         "started_at": started_at,
@@ -254,6 +258,24 @@ def _structure_lines(
     w(f"  exact:             {s.sigma_exact:>12,}")
     w(f"  outside-window:    {s.sigma_outside:>12,}")
 
+    if s.sigma_exact_by_exp or s.sigma_outside_by_exp:
+        w("\n## Sigma classifications by exponent")
+        w(f"  {'exp':>4}  {'exact':>10}  {'outside':>10}  {'total':>10}  {'exact%':>7}")
+        for exp in range(len(s.sigma_exact_by_exp)):
+            e = s.sigma_exact_by_exp[exp]
+            o = s.sigma_outside_by_exp[exp]
+            t = e + o
+            if t:
+                w(f"  {exp:>4}  {e:>10,}  {o:>10,}  {t:>10,}  {100.0*e/t:>6.1f}%")
+
+    if s.valuation_contradictions_by_exp:
+        w("\n## Valuation contradictions by source exponent")
+        w(f"  {'exp':>4}  {'excluded':>10}  {'overrun':>10}  {'budget':>10}  {'q=3 total':>10}")
+        for exp, counts in enumerate(s.valuation_contradictions_by_exp):
+            q3 = s.valuation_q3_by_exp[exp]
+            if any(counts) or q3:
+                w(f"  {exp:>4}  {counts[0]:>10,}  {counts[1]:>10,}  {counts[2]:>10,}  {q3:>10,}")
+
     # ── outside-pool residual sources ──
     if s.outside_pool_sources:
         w("\n## Outside-pool residual sources (top-10)")
@@ -358,6 +380,28 @@ def write_structure_json(run_dir: Path, metrics: RunMetrics) -> None:
         ),
         "sigma_exact": s.sigma_exact,
         "sigma_outside": s.sigma_outside,
+        "sigma_by_exponent": [
+            {
+                "exp": exp,
+                "exact": exact,
+                "outside": s.sigma_outside_by_exp[exp],
+            }
+            for exp, exact in enumerate(s.sigma_exact_by_exp)
+            if exact or s.sigma_outside_by_exp[exp]
+        ],
+        "valuation_contradictions_by_exponent": [
+            {
+                "exp": exp,
+                "excluded": counts[0],
+                "overrun": counts[1],
+                "budget": counts[2],
+                "q3_total": s.valuation_q3_by_exp[exp],
+            }
+            for exp, counts in enumerate(
+                s.valuation_contradictions_by_exp
+            )
+            if any(counts) or s.valuation_q3_by_exp[exp]
+        ],
         "pending_prime_frequency": dict(s.pending_prime_frequency),
     }
 
@@ -419,6 +463,17 @@ def _performance_lines(
             f"  {'prime values multiplied':<28} "
             f"{pool.dynamic_leaf_prime_values:>12,}"
         )
+
+    if pool.pool_misses_by_exp:
+        w("\n## Sigma-pool workload by exponent")
+        w(f"  {'exp':>4}  {'mem-miss':>10}  {'cold-scan':>10}  {'scan-seconds':>13}  {'ms/scan':>8}")
+        for exp in range(len(pool.pool_misses_by_exp)):
+            miss = pool.pool_misses_by_exp[exp]
+            scans = pool.cold_scans_by_exp[exp]
+            ns_val = pool.cold_scan_ns_by_exp[exp]
+            if miss or scans or ns_val:
+                ms = ns_val / (scans * 1e6) if scans else 0
+                w(f"  {exp:>4}  {miss:>10,}  {scans:>10,}  {ns_val*1e-9:>13.3f}  {ms:>7.1f}")
 
     # ── sigma pool cache ──
     w("\n## Sigma pool cache")
@@ -565,6 +620,21 @@ def write_performance_json(
             "disk_plan_misses": pool.disk_plan_misses,
             "disk_plan_invalid": pool.disk_plan_invalid,
             "disk_plan_writes": pool.disk_plan_writes,
+            "cold_scans": pool.cold_scans,
+            "pool_by_exponent": [
+                {
+                    "exp": exp,
+                    "memory_misses": pool.pool_misses_by_exp[exp],
+                    "cold_scans": pool.cold_scans_by_exp[exp],
+                    "cold_scan_ns": pool.cold_scan_ns_by_exp[exp],
+                }
+                for exp in range(len(pool.pool_misses_by_exp))
+                if (
+                    pool.pool_misses_by_exp[exp]
+                    or pool.cold_scans_by_exp[exp]
+                    or pool.cold_scan_ns_by_exp[exp]
+                )
+            ],
             "candidate_leaf_blocks": pool.candidate_leaf_blocks,
             "superblocks_tested": pool.superblocks_tested,
             "positive_superblocks": pool.positive_superblocks,
@@ -669,6 +739,8 @@ def write_all_reports(
     elapsed_seconds: float,
     solutions_found: int,
     sampled_peak_rss: int,
+    pruning_policy: str = "",
+    telemetry_schema_version: int = 0,
     _sig_factors: dict | None = None,
 ) -> None:
     """Write all output files for a completed run."""
@@ -678,6 +750,8 @@ def write_all_reports(
         git_commit=git_commit,
         started_at=started_at,
         config=config,
+        pruning_policy=pruning_policy,
+        telemetry_schema_version=telemetry_schema_version,
     )
     write_summary(
         run_dir,

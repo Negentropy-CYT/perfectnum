@@ -58,6 +58,16 @@ class CloneEffect(str, Enum):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Valuation contradiction kind indices
+# ═══════════════════════════════════════════════════════════════
+
+VALUATION_EXCLUDED = 0
+VALUATION_OVERRUN  = 1
+VALUATION_BUDGET   = 2
+VALUATION_KIND_COUNT = 3
+
+
+# ═══════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════
 
@@ -129,6 +139,15 @@ class StructureMetrics:
 
     sigma_exact: int = 0
     sigma_outside: int = 0
+
+    sigma_exact_by_exp: list[int] = field(default_factory=list)
+    sigma_outside_by_exp: list[int] = field(default_factory=list)
+
+    valuation_contradictions_by_exp: list[list[int]] = field(
+        default_factory=list
+    )
+    valuation_q3_by_exp: list[int] = field(default_factory=list)
+
     # Checkpointed bookkeeping that keeps classification counters stable when
     # an in-memory SigmaPoolAnalyzer cache is rebuilt after process restart.
     # It is intentionally omitted from human and JSON telemetry reports.
@@ -235,6 +254,11 @@ class PoolPerformance:
 
     analysis_ns: int = 0
     cold_scan_ns: int = 0
+    cold_scans: int = 0
+
+    pool_misses_by_exp: list[int] = field(default_factory=list)
+    cold_scans_by_exp: list[int] = field(default_factory=list)
+    cold_scan_ns_by_exp: list[int] = field(default_factory=list)
     plan_prebuild_ns: int = 0
     plan_filter_ns: int = 0
     plan_filter_count_ns: int = 0
@@ -353,6 +377,32 @@ class RunMetrics:
     schema_version: int = 5
     structure: StructureMetrics = field(default_factory=StructureMetrics)
     performance: PerformanceMetrics = field(default_factory=PerformanceMetrics)
+
+    def configure_exponent_telemetry(self, max_exp: int) -> None:
+        """Pre-allocate per-exponent arrays so hot paths use plain indexing."""
+        if max_exp < 0:
+            raise ValueError("max_exp must be non-negative")
+
+        size = max_exp + 1
+        s = self.structure
+        p = self.performance.pool
+
+        def _extend(values: list[int]) -> None:
+            if len(values) < size:
+                values.extend([0] * (size - len(values)))
+
+        _extend(s.sigma_exact_by_exp)
+        _extend(s.sigma_outside_by_exp)
+        _extend(s.valuation_q3_by_exp)
+
+        while len(s.valuation_contradictions_by_exp) < size:
+            s.valuation_contradictions_by_exp.append(
+                [0] * VALUATION_KIND_COUNT
+            )
+
+        _extend(p.pool_misses_by_exp)
+        _extend(p.cold_scans_by_exp)
+        _extend(p.cold_scan_ns_by_exp)
 
     def record_prune(
         self,

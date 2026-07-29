@@ -40,7 +40,7 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 1000000000     # largest odd prime considered
+MAX_PRIME         = 10000000     # largest odd prime considered
 MAX_FACTORS       = 60         # max distinct prime factors in N
 MAX_EXP           = 35         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = Descartes-spoof DFS; True = true OPN chain
@@ -57,6 +57,9 @@ POOL_PLAN_BUILD_POLICY = "adaptive"  # "eager", "after_db_miss", "adaptive"
 POOL_PLAN_DISK_CACHE_ENABLED = True
 POOL_PLAN_DISK_CACHE_DIR = "plan_cache"
 POOL_PLAN_DISK_MIN_FREE_BYTES = 2 * 1024**3
+
+PRUNING_POLICY = "baseline-v0"
+TELEMETRY_SCHEMA_VERSION = 3
 POOL_ADAPTIVE_BUILD_THRESHOLD = 3
 # Incremental plans are worthwhile only when the persisted prefix represents
 # a substantial part of the current pool.  Otherwise one reusable full plan
@@ -1681,8 +1684,12 @@ class SigmaPoolAnalyzer:
         self._structure.sigma_classified_keys.add(key)
         if result.exact:
             self._structure.sigma_exact += 1
+            if exp < len(self._structure.sigma_exact_by_exp):
+                self._structure.sigma_exact_by_exp[exp] += 1
         else:
             self._structure.sigma_outside += 1
+            if exp < len(self._structure.sigma_outside_by_exp):
+                self._structure.sigma_outside_by_exp[exp] += 1
             residual_bits = int(result.residual).bit_length()
             self._structure.outside_pool_sources[
                 (key[0], key[1], residual_bits)
@@ -2063,6 +2070,8 @@ class SigmaPoolAnalyzer:
             return cached
 
         self._perf.misses += 1
+        if exp < len(self._perf.pool_misses_by_exp):
+            self._perf.pool_misses_by_exp[exp] += 1
         started = time.perf_counter()
 
         # Fast path: a globally exact factorisation already exists
@@ -2145,7 +2154,12 @@ class SigmaPoolAnalyzer:
             self._perf,
             start_leaf=start_leaf,
         )
-        self._perf.cold_scan_ns += (time.perf_counter_ns() - scan_started)
+        scan_elapsed = time.perf_counter_ns() - scan_started
+        self._perf.cold_scan_ns += scan_elapsed
+        self._perf.cold_scans += 1
+        if exp < len(self._perf.cold_scans_by_exp):
+            self._perf.cold_scans_by_exp[exp] += 1
+            self._perf.cold_scan_ns_by_exp[exp] += scan_elapsed
 
         if residual == 1:
             result = SigmaPoolAnalysis(exact=True, valuations=inside, residual=mpz(1))

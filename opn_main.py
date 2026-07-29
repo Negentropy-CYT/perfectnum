@@ -32,7 +32,9 @@ from opn_core import (
     POOL_PLAN_DISK_MIN_FREE_BYTES,
     POOL_PLAN_BUILD_POLICY,
     POOL_SUPERBLOCK_FANOUT,
+    PRUNING_POLICY,
     SEARCH_MODE,
+    TELEMETRY_SCHEMA_VERSION,
     SIGMA_DATABASE_ENABLED,
     SIGMA_DATABASE_FILE,
     generate_odd_primes,
@@ -329,6 +331,8 @@ def main() -> None:
             elapsed_seconds=elapsed,
             solutions_found=found_true + found_spoof,
             sampled_peak_rss=sampler.sampled_peak_rss,
+            pruning_policy=PRUNING_POLICY,
+            telemetry_schema_version=TELEMETRY_SCHEMA_VERSION,
             _sig_factors=__import__("opn_core")._SIG_FACTORS,
         )
 

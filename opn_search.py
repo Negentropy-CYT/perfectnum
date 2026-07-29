@@ -171,6 +171,8 @@ def search_opn(
     opn_core._sigma_map_perf = metrics.performance
 
     # ── pool-aware sigma analyser (OPN chain mode only) ──
+    metrics.configure_exponent_telemetry(max_exp)
+
     sigma_pool_analyzer = None
     if propagate and SEARCH_MODE.target_num == 2 and SEARCH_MODE.target_den == 1:
         sigma_pool_analyzer = SigmaPoolAnalyzer(

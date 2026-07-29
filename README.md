@@ -13,7 +13,7 @@ $$\sigma(N) = 2N \qquad\text{(perfect number condition)}$$
 ## Quick Start
 
 > **Note:** The checked-in configuration is **experimental**
-> (`MAX_PRIME=4e9`, `MAX_FACTORS=60`, `MAX_EXP=25`).  For a first run,
+> (`MAX_PRIME=9e9`, `MAX_FACTORS=60`, `MAX_EXP=25`).  For a first run,
 > set `MAX_PRIME = 100_000`, `MAX_FACTORS = 12`, and `MAX_EXP = 6`
 > at the top of `opn_core.py`.  See
 > [Configuration](#configuration) for safe defaults.
@@ -109,6 +109,9 @@ opn_core.py        Arithmetic engine
 opn_sigma_db.py    Validated persistent σ-analysis cache
                      · exact and window-partial SQLite records
                      · payload checksums + prime-prefix certificates
+opn_plan_cache.py  Validated persistent hierarchical-plan storage
+                     - mmap filtered-prime arrays + resident mpz products
+                     - atomic transactions, checksums, compatibility keys
 opn_metrics.py     Typed observability data models
                      · PruneReason / PruneMechanism / CloneEffect enums
                      · StructureMetrics, PoolPerformance, PerformanceMetrics
@@ -140,7 +143,7 @@ opn_runtime.py     Background performance sampler
 ```
 opn_metrics  (standalone)
 opn_sigma_db ← sqlite3, gmpy2
-opn_core     ← gmpy2, numpy, opn_metrics, opn_sigma_db
+opn_core     ← gmpy2, numpy, opn_metrics, opn_sigma_db, opn_plan_cache
 opn_state    ← opn_core, opn_metrics
 opn_search   ← opn_core, opn_state, opn_metrics
 opn_io       ← opn_core, opn_state
@@ -284,7 +287,7 @@ MAX_PRIME  = 9_000_000_000  # requires ~4 GiB prime storage
 The checked-in local configuration is currently:
 
 ```python
-MAX_PRIME = 5_000_000_000
+MAX_PRIME = 9_000_000_000
 MAX_FACTORS = 60
 MAX_EXP = 25
 ```
@@ -299,6 +302,9 @@ POOL_SUPERBLOCK_FANOUT = 16
 SIGMA_DATABASE_ENABLED = True
 SIGMA_DATABASE_FILE = "sigma_pool.sqlite3"
 POOL_PLAN_BUILD_POLICY = "adaptive"  # eager / after_db_miss / adaptive
+POOL_PLAN_DISK_CACHE_ENABLED = True
+POOL_PLAN_DISK_CACHE_DIR = "plan_cache"
+POOL_PLAN_DISK_MIN_FREE_BYTES = 2 * 1024**3
 ENABLE_FERMAT_DEBT = False      # conservative debt-capacity bound (off)
 CHECKPOINT_INTERVAL_SECONDS = 300.0
 ```
@@ -309,6 +315,33 @@ superblock GCD and released immediately after the leaf check.  The `flat` mode
 continues to retain leaf products as a correctness oracle.  Performance schema
 5 reports logical/resident leaf counts, dynamic rebuild work, and persistent
 cache health; schema-1/2/3/4 checkpoints remain readable.
+
+With the disk-plan cache enabled, exponent-filtered prime arrays are created
+directly as read-only NumPy memory maps under `plan_cache/`. Exact superblock
+products are also persisted, but are checksum-verified and fully deserialised
+to resident `mpz` values before any GCD scan; the hot mathematical path never
+decodes products from disk. A cache key includes the complete prime-pool
+digest, limit, source interval, radical filter, dtype, leaf size, fanout,
+schema, and semantics version. Consequently a 32-bit 4B plan cannot be
+mistaken for a 64-bit 5B plan, and a partial expansion interval cannot collide
+with a full-window plan.
+
+Cold creation uses a locked staging directory, `fsync`, checksums, and atomic
+rename. An interrupted or corrupt entry is invisible or treated as a miss;
+insufficient disk space falls back to an ordinary in-memory plan without
+changing the search. Files remain useful across restarts with exactly the same
+compatible plan key. Different windows or plan geometry create separate
+entries, so `plan_cache/` can grow over a series of experiments and may be
+deleted while the program is stopped. It is derived data, not a checkpoint.
+
+Local acceptance measurements produced identical plan digests at 100M, 500M,
+and 1B. At 1B, pure-memory/cold-disk/warm-disk plan construction was
+39.89/52.06/1.74 seconds, while the sampled construction peak was
+1.300/0.833/0.818 GiB. A completed 100M search had identical 48,980-state
+trees and prune counters in all modes; three warm runs took
+13.53/13.41/13.38 seconds and peaked near 0.132 GiB, versus 16.98 seconds and
+0.178 GiB for pure memory. These figures are engineering observations, not
+mathematical assumptions or universal hardware guarantees.
 
 The sigma database stores validated exact and window-partial analyses.  Lookup
 occurs before any pool plan is built.  Exact records are window-independent;

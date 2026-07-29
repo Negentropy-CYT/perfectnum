@@ -20,6 +20,20 @@ first be stopped.  Delete the main database and any matching `-wal` and `-shm`
 files together; deleting SQLite files while the process is running can lose
 pending cache writes or damage the cache.
 
+## Persistent plan cache
+
+`plan_cache/` contains derived filtered-prime arrays and hierarchical
+superblock products. Entries use compatibility keys, size bounds, SHA-256
+checksums, locked staging directories, `fsync`, and atomic publication.
+Incomplete or accidentally corrupt entries are ignored and rebuilt.
+
+Like checkpoints, this directory is trusted local input rather than an
+authenticated format. Do not copy plan entries from an untrusted source:
+SHA-256 detects accidental changes but does not prove who created a file.
+The cache may be deleted to recover disk space while the program is stopped;
+it is not needed to resume the search and does not contain authoritative
+mathematical results.
+
 ## Supported versions
 
 Only the latest commit on the `main` branch is actively maintained.

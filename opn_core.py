@@ -23,6 +23,14 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from opn_metrics import PoolPerformance
+from opn_plan_cache import (
+    PersistentPlanCache,
+    PlanCacheBuild,
+    PlanCacheBusyError,
+    PlanCacheError,
+    PlanCacheKey,
+    PlanCacheValidationError,
+)
 from opn_sigma_db import PersistedSigmaRecord, SigmaAnalysisDatabase
 if TYPE_CHECKING:
     from opn_metrics import PerformanceMetrics, StructureMetrics
@@ -32,9 +40,9 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 9000000000     # largest odd prime considered
+MAX_PRIME         = 1000000000     # largest odd prime considered
 MAX_FACTORS       = 60         # max distinct prime factors in N
-MAX_EXP           = 25         # max exponent (2 = a_i=1 restriction)
+MAX_EXP           = 35         # max exponent (2 = a_i=1 restriction)
 PROPAGATE         = True     # False = Descartes-spoof DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
@@ -46,6 +54,9 @@ POOL_SUPERBLOCK_FANOUT = 16
 SIGMA_DATABASE_ENABLED = True
 SIGMA_DATABASE_FILE = "sigma_pool.sqlite3"
 POOL_PLAN_BUILD_POLICY = "adaptive"  # "eager", "after_db_miss", "adaptive"
+POOL_PLAN_DISK_CACHE_ENABLED = True
+POOL_PLAN_DISK_CACHE_DIR = "plan_cache"
+POOL_PLAN_DISK_MIN_FREE_BYTES = 2 * 1024**3
 POOL_ADAPTIVE_BUILD_THRESHOLD = 3
 # Incremental plans are worthwhile only when the persisted prefix represents
 # a substantial part of the current pool.  Otherwise one reusable full plan
@@ -229,7 +240,9 @@ def _numpy_prime_view(
 ) -> Tuple[np.ndarray, np.dtype]:
     """Return a zero-copy NumPy view when the pool is array('I'/'Q').
 
-    A normal Python sequence is converted to one compact NumPy array.
+    A normal Python raverse the complete
+    input.  Converting the scalar to the array's exact dtype preserves the
+    intended O(log n) binary search.sequence is converted to one compact NumPy array.
     """
     if isinstance(primes, array):
         if primes.typecode == "I" and primes.itemsize == 4:
@@ -262,9 +275,7 @@ def _typed_searchsorted_right(
     """Return a right insertion point without whole-array dtype promotion.
 
     On very large unsigned arrays, passing a Python ``int`` directly to
-    NumPy's ``searchsorted`` can make dtype resolution traverse the complete
-    input.  Converting the scalar to the array's exact dtype preserves the
-    intended O(log n) binary search.
+    NumPy's ``searchsorted`` can make dtype resolution t
     """
     if sorted_values.ndim != 1:
         raise ValueError("searchsorted input must be one-dimensional")
@@ -627,6 +638,120 @@ def build_filtered_prime_pools_vectorized(
     return outputs
 
 
+def build_filtered_prime_pools_vectorized_memmap(
+    primes: Sequence[int],
+    builds: Dict[int, PlanCacheBuild],
+    *,
+    chunk_primes: int = POOL_PLAN_CHUNK_PRIMES,
+    pool_perf: "PoolPerformance | None" = None,
+) -> Dict[int, int]:
+    """Filter several radical pools directly into cache-owned mmap files.
+
+    This is the same two-pass necessary-order filter as
+    :func:`build_filtered_prime_pools_vectorized`, but the exact-sized outputs
+    are disk-backed from their creation.  All radicals still share both source
+    passes, avoiding one full traversal per exponent class.
+    """
+    if chunk_primes <= 0:
+        raise ValueError("chunk_primes must be positive")
+    radical_keys = tuple(sorted(builds))
+    if not radical_keys:
+        return {}
+
+    factors_by_radical = {
+        radical: distinct_prime_factors(radical)
+        for radical in radical_keys
+    }
+    all_factors = tuple(
+        sorted({
+            factor
+            for factors in factors_by_radical.values()
+            for factor in factors
+        })
+    )
+    prime_view, _dtype = _numpy_prime_view(primes)
+    source_count = len(prime_view)
+    counts = {radical: 0 for radical in radical_keys}
+
+    count_started = time.perf_counter_ns()
+    for start in range(0, source_count, chunk_primes):
+        stop = min(start + chunk_primes, source_count)
+        chunk = prime_view[start:stop]
+        factor_masks = _factor_masks_for_chunk(
+            chunk,
+            all_factors,
+        )
+        for radical in radical_keys:
+            mask = _mask_for_factors(
+                factor_masks,
+                factors_by_radical[radical],
+            )
+            counts[radical] += int(np.count_nonzero(mask))
+    count_ns = time.perf_counter_ns() - count_started
+
+    outputs: Dict[int, np.ndarray] = {}
+    try:
+        outputs = {
+            radical: builds[radical].allocate_primes(
+                counts[radical]
+            )
+            for radical in radical_keys
+        }
+        positions = {radical: 0 for radical in radical_keys}
+
+        fill_started = time.perf_counter_ns()
+        for start in range(0, source_count, chunk_primes):
+            stop = min(start + chunk_primes, source_count)
+            chunk = prime_view[start:stop]
+            factor_masks = _factor_masks_for_chunk(
+                chunk,
+                all_factors,
+            )
+            for radical in radical_keys:
+                mask = _mask_for_factors(
+                    factor_masks,
+                    factors_by_radical[radical],
+                )
+                selected = chunk[mask]
+                destination_start = positions[radical]
+                destination_stop = (
+                    destination_start + len(selected)
+                )
+                outputs[radical][
+                    destination_start:destination_stop
+                ] = selected
+                positions[radical] = destination_stop
+        fill_ns = time.perf_counter_ns() - fill_started
+
+        for radical in radical_keys:
+            if positions[radical] != counts[radical]:
+                raise RuntimeError(
+                    f"disk-plan fill mismatch for rad={radical}: "
+                    f"{positions[radical]} != {counts[radical]}"
+                )
+            mapping = outputs[radical]
+            if isinstance(mapping, np.memmap):
+                mapping.flush()
+                mapping._mmap.close()
+    except BaseException:
+        for mapping in outputs.values():
+            if isinstance(mapping, np.memmap):
+                try:
+                    mapping._mmap.close()
+                except (BufferError, OSError):
+                    pass
+        raise
+
+    if pool_perf is not None:
+        pool_perf.plan_filter_count_ns += count_ns
+        pool_perf.plan_filter_fill_ns += fill_ns
+        pool_perf.plan_filter_ns += count_ns + fill_ns
+        pool_perf.plan_filter_source_values += 2 * source_count
+        pool_perf.filtered_prime_values += sum(counts.values())
+
+    return counts
+
+
 def _product_prime_range(
     primes: Sequence[int],
     start: int,
@@ -968,6 +1093,9 @@ class SigmaPoolAnalyzer:
                  pool_perf: "PoolPerformance | None" = None,
                  structure: "StructureMetrics | None" = None,
                  database_path: str | None = None,
+                 plan_cache_dir: str | None = None,
+                 plan_cache_minimum_free_bytes: int =
+                 POOL_PLAN_DISK_MIN_FREE_BYTES,
                  plan_build_policy: str = "eager",
                  adaptive_build_threshold: int =
                  POOL_ADAPTIVE_BUILD_THRESHOLD) -> None:
@@ -984,6 +1112,10 @@ class SigmaPoolAnalyzer:
             raise ValueError("invalid pool plan build policy")
         if adaptive_build_threshold < 1:
             raise ValueError("adaptive build threshold must be positive")
+        if plan_cache_dir is not None and gcd_mode != "hierarchical":
+            raise ValueError(
+                "persistent plan cache requires hierarchical GCD mode"
+            )
 
         self.primes = primes
         self._prime_view, _dtype = _numpy_prime_view(primes)
@@ -1019,6 +1151,18 @@ class SigmaPoolAnalyzer:
                 self._database = SigmaAnalysisDatabase(database_path)
             except (OSError, sqlite3.Error, ValueError) as exc:
                 self.database_error = str(exc)
+        self._plan_cache: PersistentPlanCache | None = None
+        self.plan_cache_error: str | None = None
+        if plan_cache_dir is not None:
+            try:
+                self._plan_cache = PersistentPlanCache(
+                    plan_cache_dir,
+                    minimum_free_bytes=(
+                        plan_cache_minimum_free_bytes
+                    ),
+                )
+            except (OSError, ValueError) as exc:
+                self.plan_cache_error = str(exc)
 
     def configure_plan_build(
         self,
@@ -1098,6 +1242,363 @@ class SigmaPoolAnalyzer:
         )
         self._pool_digest_cache[limit] = digest
         return digest
+
+    def _disk_plan_key(
+        self,
+        radical: int,
+        *,
+        source_start: int,
+    ) -> PlanCacheKey:
+        if source_start < 0 or source_start >= len(self._prime_view):
+            raise ValueError("disk plan source start is out of range")
+        digest = self._pool_digest_for_limit(self.prime_limit)
+        if digest is None:
+            raise ValueError(
+                "current prime pool has no certifiable upper bound"
+            )
+        return PlanCacheKey(
+            pool_digest=digest.hex(),
+            prime_limit=self.prime_limit,
+            source_start=int(source_start),
+            source_count=len(self._prime_view) - source_start,
+            radical=int(radical),
+            dtype=self._prime_view.dtype.str,
+            block_size=self.block_size,
+            superblock_fanout=self.superblock_fanout,
+        )
+
+    def _source_primes(self, source_start: int):
+        if source_start == 0:
+            return self.primes
+        return self._prime_view[source_start:]
+
+    def _plan_from_disk_payload(
+        self,
+        key: PlanCacheKey,
+        loaded,
+    ) -> PrimeBlockPlan:
+        source = self._source_primes(key.source_start)
+        if key.radical == 0:
+            if loaded.prime_count != len(source):
+                raise PlanCacheValidationError(
+                    "unfiltered disk plan prime count mismatch"
+                )
+            pool = source
+        else:
+            if loaded.eligible_primes is None:
+                raise PlanCacheValidationError(
+                    "filtered disk plan lacks its mmap array"
+                )
+            pool = loaded.eligible_primes
+
+        superblocks = tuple(
+            PrimeSuperBlock(
+                start_leaf=index * self.superblock_fanout,
+                stop_leaf=min(
+                    (index + 1) * self.superblock_fanout,
+                    loaded.leaf_count,
+                ),
+                product=product,
+            )
+            for index, product in enumerate(
+                loaded.superblock_products
+            )
+        )
+        self._perf.plan_leaf_blocks += loaded.leaf_count
+        self._perf.plan_superblocks += len(superblocks)
+        self._perf.logical_leaf_blocks += loaded.leaf_count
+        return PrimeBlockPlan(
+            primes=pool,
+            block_size=self.block_size,
+            superblock_fanout=self.superblock_fanout,
+            leaf_block_count=loaded.leaf_count,
+            blocks=(),
+            superblocks=superblocks,
+        )
+
+    def _load_disk_plan(
+        self,
+        radical: int,
+        *,
+        source_start: int,
+    ) -> tuple[PrimeBlockPlan | None, PlanCacheKey | None]:
+        cache = self._plan_cache
+        if cache is None:
+            return None, None
+        key = self._disk_plan_key(
+            radical,
+            source_start=source_start,
+        )
+        try:
+            loaded = cache.load(key)
+            if loaded is None:
+                self._perf.disk_plan_misses += 1
+                return None, key
+            plan = self._plan_from_disk_payload(key, loaded)
+        except PlanCacheValidationError:
+            self._perf.disk_plan_invalid += 1
+            return None, key
+        except (OSError, PlanCacheError, ValueError) as exc:
+            self.plan_cache_error = str(exc)
+            self._plan_cache = None
+            return None, None
+        self._perf.disk_plan_hits += 1
+        return plan, key
+
+    def _commit_disk_plan(
+        self,
+        build: PlanCacheBuild,
+        plan: PrimeBlockPlan,
+        *,
+        prime_count: int | None = None,
+        first_prime: int | None = None,
+        last_prime: int | None = None,
+    ):
+        if prime_count is None:
+            prime_count = len(plan.primes)
+        if first_prime is None or last_prime is None:
+            if prime_count:
+                first_prime = int(plan.primes[0])
+                last_prime = int(plan.primes[-1])
+            else:
+                first_prime = 0
+                last_prime = 0
+        mapped = build.commit(
+            prime_count=prime_count,
+            leaf_count=plan.leaf_block_count,
+            superblock_products=tuple(
+                block.product
+                for block in plan.superblocks
+            ),
+            first_prime=first_prime,
+            last_prime=last_prime,
+        )
+        self._perf.disk_plan_writes += 1
+        return mapped
+
+    def _disk_unfiltered_plan(
+        self,
+        *,
+        source_start: int,
+    ) -> PrimeBlockPlan:
+        loaded, key = self._load_disk_plan(
+            0,
+            source_start=source_start,
+        )
+        if loaded is not None:
+            return loaded
+        source = self._source_primes(source_start)
+        if key is None or self._plan_cache is None:
+            return build_prime_block_plan(
+                source,
+                block_size=self.block_size,
+                superblock_fanout=self.superblock_fanout,
+                eligible_primes=None,
+                build_superblocks=True,
+                pool_perf=self._perf,
+            )
+
+        build = None
+        plan = None
+        try:
+            build = self._plan_cache.begin(key)
+            plan = build_prime_block_plan(
+                source,
+                block_size=self.block_size,
+                superblock_fanout=self.superblock_fanout,
+                eligible_primes=None,
+                build_superblocks=True,
+                pool_perf=self._perf,
+            )
+            self._commit_disk_plan(build, plan)
+            return plan
+        except PlanCacheBusyError:
+            if build is not None:
+                build.abort()
+        except (OSError, PlanCacheError, ValueError) as exc:
+            if build is not None:
+                build.abort()
+            self.plan_cache_error = str(exc)
+            self._plan_cache = None
+            if plan is not None:
+                return plan
+        except BaseException:
+            if build is not None:
+                build.abort()
+            raise
+        return build_prime_block_plan(
+            source,
+            block_size=self.block_size,
+            superblock_fanout=self.superblock_fanout,
+            eligible_primes=None,
+            build_superblocks=True,
+            pool_perf=self._perf,
+        )
+
+    def _disk_filtered_plans(
+        self,
+        radicals: Sequence[int],
+        *,
+        source_start: int,
+    ) -> Dict[int, PrimeBlockPlan]:
+        """Load or build filtered plans with mmap-backed prime arrays."""
+        radical_keys = tuple(sorted(set(int(r) for r in radicals)))
+        results: Dict[int, PrimeBlockPlan] = {}
+        keys: Dict[int, PlanCacheKey] = {}
+        missing = []
+
+        for radical in radical_keys:
+            loaded, key = self._load_disk_plan(
+                radical,
+                source_start=source_start,
+            )
+            if loaded is not None:
+                results[radical] = loaded
+            else:
+                missing.append(radical)
+                if key is not None:
+                    keys[radical] = key
+
+        if not missing:
+            return results
+        cache = self._plan_cache
+        if cache is None:
+            return self._memory_filtered_plans(
+                missing,
+                source_start=source_start,
+                destination=results,
+            )
+
+        builds: Dict[int, PlanCacheBuild] = {}
+        fallback = []
+        for radical in missing:
+            key = keys.get(radical)
+            if key is None:
+                fallback.append(radical)
+                continue
+            try:
+                builds[radical] = cache.begin(key)
+            except PlanCacheBusyError:
+                fallback.append(radical)
+            except (OSError, PlanCacheError, ValueError) as exc:
+                self.plan_cache_error = str(exc)
+                fallback.append(radical)
+
+        source = self._source_primes(source_start)
+        if builds:
+            try:
+                counts = (
+                    build_filtered_prime_pools_vectorized_memmap(
+                        source,
+                        builds,
+                        chunk_primes=self.plan_chunk_primes,
+                        pool_perf=self._perf,
+                    )
+                )
+            except BaseException as exc:
+                for build in builds.values():
+                    build.abort()
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                self.plan_cache_error = str(exc)
+                fallback.extend(builds)
+                builds = {}
+                counts = {}
+
+            for radical, build in tuple(builds.items()):
+                mapping = None
+                plan = None
+                try:
+                    mapping = build.open_staging_primes(
+                        counts[radical]
+                    )
+                    plan = build_prime_block_plan(
+                        source,
+                        block_size=self.block_size,
+                        superblock_fanout=self.superblock_fanout,
+                        eligible_primes=mapping,
+                        build_superblocks=True,
+                        pool_perf=self._perf,
+                    )
+                    prime_count = len(mapping)
+                    if prime_count:
+                        first_prime = int(mapping[0])
+                        last_prime = int(mapping[-1])
+                    else:
+                        first_prime = 0
+                        last_prime = 0
+                    if isinstance(mapping, np.memmap):
+                        mapping._mmap.close()
+                    mapping = None
+                    committed_mapping = self._commit_disk_plan(
+                        build,
+                        plan,
+                        prime_count=prime_count,
+                        first_prime=first_prime,
+                        last_prime=last_prime,
+                    )
+                    assert committed_mapping is not None
+                    results[radical] = PrimeBlockPlan(
+                        primes=committed_mapping,
+                        block_size=plan.block_size,
+                        superblock_fanout=(
+                            plan.superblock_fanout
+                        ),
+                        leaf_block_count=plan.leaf_block_count,
+                        blocks=(),
+                        superblocks=plan.superblocks,
+                    )
+                except BaseException as exc:
+                    if isinstance(mapping, np.memmap):
+                        try:
+                            mapping._mmap.close()
+                        except (BufferError, OSError):
+                            pass
+                    build.abort()
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        for other_radical, other in builds.items():
+                            if other_radical != radical:
+                                other.abort()
+                        raise
+                    self.plan_cache_error = str(exc)
+                    fallback.append(radical)
+
+        if fallback:
+            self._memory_filtered_plans(
+                fallback,
+                source_start=source_start,
+                destination=results,
+            )
+        return results
+
+    def _memory_filtered_plans(
+        self,
+        radicals: Sequence[int],
+        *,
+        source_start: int,
+        destination: Dict[int, PrimeBlockPlan] | None = None,
+    ) -> Dict[int, PrimeBlockPlan]:
+        results = destination if destination is not None else {}
+        radical_keys = tuple(sorted(set(int(r) for r in radicals)))
+        if not radical_keys:
+            return results
+        source = self._source_primes(source_start)
+        pools = build_filtered_prime_pools_vectorized(
+            source,
+            radical_keys,
+            chunk_primes=self.plan_chunk_primes,
+            pool_perf=self._perf,
+        )
+        for radical in radical_keys:
+            results[radical] = build_prime_block_plan(
+                source,
+                block_size=self.block_size,
+                superblock_fanout=self.superblock_fanout,
+                eligible_primes=pools[radical],
+                build_superblocks=self._use_superblocks,
+                pool_perf=self._perf,
+            )
+        return results
 
     def _prime_prefix_stop(self, limit: int) -> int:
         """Return the number of pool primes not exceeding ``limit``."""
@@ -1193,6 +1694,24 @@ class SigmaPoolAnalyzer:
             self._database.flush()
 
     def close(self) -> None:
+        seen_mappings: set[int] = set()
+        plans = list(self._plans_by_radical.values())
+        plans.extend(self._interval_plans.values())
+        if self._full_plan is not None:
+            plans.append(self._full_plan)
+        for plan in plans:
+            mapping = plan.primes
+            if (
+                isinstance(mapping, np.memmap)
+                and id(mapping) not in seen_mappings
+            ):
+                seen_mappings.add(id(mapping))
+                mmap_object = getattr(mapping, "_mmap", None)
+                if mmap_object is not None:
+                    try:
+                        mmap_object.close()
+                    except (BufferError, OSError):
+                        pass
         if self._database is not None:
             self._database.close()
             self._database = None
@@ -1230,37 +1749,49 @@ class SigmaPoolAnalyzer:
         if missing_radicals:
             for radical in missing_radicals:
                 self._evict_interval_plans_for_key(radical)
-            filtered_pools = (
-                build_filtered_prime_pools_vectorized(
-                    self.primes,
+            if self._plan_cache is not None:
+                built_plans = self._disk_filtered_plans(
                     missing_radicals,
-                    chunk_primes=self.plan_chunk_primes,
-                    pool_perf=self._perf,
+                    source_start=0,
                 )
-            )
-
-            for radical in missing_radicals:
-                self._plans_by_radical[radical] = (
-                    build_prime_block_plan(
+                self._plans_by_radical.update(built_plans)
+            else:
+                filtered_pools = (
+                    build_filtered_prime_pools_vectorized(
                         self.primes,
-                        block_size=self.block_size,
-                        superblock_fanout=self.superblock_fanout,
-                        eligible_primes=filtered_pools[radical],
-                        build_superblocks=self._use_superblocks,
+                        missing_radicals,
+                        chunk_primes=self.plan_chunk_primes,
                         pool_perf=self._perf,
                     )
                 )
 
+                for radical in missing_radicals:
+                    self._plans_by_radical[radical] = (
+                        build_prime_block_plan(
+                            self.primes,
+                            block_size=self.block_size,
+                            superblock_fanout=self.superblock_fanout,
+                            eligible_primes=filtered_pools[radical],
+                            build_superblocks=self._use_superblocks,
+                            pool_perf=self._perf,
+                        )
+                    )
+
         if need_full_plan and self._full_plan is None:
             self._evict_interval_plans_for_key(0)
-            self._full_plan = build_prime_block_plan(
-                self.primes,
-                block_size=self.block_size,
-                superblock_fanout=self.superblock_fanout,
-                eligible_primes=None,
-                build_superblocks=self._use_superblocks,
-                pool_perf=self._perf,
-            )
+            if self._plan_cache is not None:
+                self._full_plan = self._disk_unfiltered_plan(
+                    source_start=0,
+                )
+            else:
+                self._full_plan = build_prime_block_plan(
+                    self.primes,
+                    block_size=self.block_size,
+                    superblock_fanout=self.superblock_fanout,
+                    eligible_primes=None,
+                    build_superblocks=self._use_superblocks,
+                    pool_perf=self._perf,
+                )
 
         self._perf.filtered_plan_count = len(self._plans_by_radical)
         self._perf.full_plan_built = self._full_plan is not None
@@ -1294,14 +1825,19 @@ class SigmaPoolAnalyzer:
                 self._maybe_adaptive_prebuild(exp)
             if self._full_plan is None:
                 self._evict_interval_plans_for_key(0)
-                self._full_plan = build_prime_block_plan(
-                    self.primes,
-                    block_size=self.block_size,
-                    superblock_fanout=self.superblock_fanout,
-                    eligible_primes=None,
-                    build_superblocks=self._use_superblocks,
-                    pool_perf=self._perf,
-                )
+                if self._plan_cache is not None:
+                    self._full_plan = self._disk_unfiltered_plan(
+                        source_start=0,
+                    )
+                else:
+                    self._full_plan = build_prime_block_plan(
+                        self.primes,
+                        block_size=self.block_size,
+                        superblock_fanout=self.superblock_fanout,
+                        eligible_primes=None,
+                        build_superblocks=self._use_superblocks,
+                        pool_perf=self._perf,
+                    )
             return self._full_plan
 
         radical = squarefree_kernel(n)
@@ -1315,21 +1851,27 @@ class SigmaPoolAnalyzer:
             return cached
 
         self._evict_interval_plans_for_key(radical)
-        filtered = build_filtered_prime_pools_vectorized(
-            self.primes,
-            [radical],
-            chunk_primes=self.plan_chunk_primes,
-            pool_perf=self._perf,
-        )[radical]
+        if self._plan_cache is not None:
+            plan = self._disk_filtered_plans(
+                [radical],
+                source_start=0,
+            )[radical]
+        else:
+            filtered = build_filtered_prime_pools_vectorized(
+                self.primes,
+                [radical],
+                chunk_primes=self.plan_chunk_primes,
+                pool_perf=self._perf,
+            )[radical]
 
-        plan = build_prime_block_plan(
-            self.primes,
-            block_size=self.block_size,
-            superblock_fanout=self.superblock_fanout,
-            eligible_primes=filtered,
-            build_superblocks=self._use_superblocks,
-            pool_perf=self._perf,
-        )
+            plan = build_prime_block_plan(
+                self.primes,
+                block_size=self.block_size,
+                superblock_fanout=self.superblock_fanout,
+                eligible_primes=filtered,
+                build_superblocks=self._use_superblocks,
+                pool_perf=self._perf,
+            )
 
         self._plans_by_radical[radical] = plan
         self._perf.filtered_plan_count = len(self._plans_by_radical)
@@ -1355,14 +1897,27 @@ class SigmaPoolAnalyzer:
 
         interval = self._prime_view[start:]
         if radical == 0:
+            if self._plan_cache is not None:
+                plan = self._disk_unfiltered_plan(
+                    source_start=start,
+                )
+                self._interval_plans[key] = plan
+                return plan
             eligible = interval
         else:
+            if self._plan_cache is not None:
+                plan = self._disk_filtered_plans(
+                    [radical],
+                    source_start=start,
+                )[radical]
+                self._interval_plans[key] = plan
+                return plan
             eligible = build_filtered_prime_pools_vectorized(
-                interval,
-                [radical],
-                chunk_primes=self.plan_chunk_primes,
-                pool_perf=self._perf,
-            )[radical]
+                    interval,
+                    [radical],
+                    chunk_primes=self.plan_chunk_primes,
+                    pool_perf=self._perf,
+                )[radical]
 
         plan = build_prime_block_plan(
             interval,

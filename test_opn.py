@@ -98,6 +98,7 @@ from opn_search import (
 )
 from opn_metrics import RunMetrics, PoolPerformance, StructureMetrics
 from opn_sigma_db import SigmaAnalysisDatabase
+from opn_plan_cache import PersistentPlanCache
 
 from opn_state import (
     ChainState,
@@ -1032,6 +1033,10 @@ class TestSearchEngine:
                 sigma_database_path=str(
                     tmp_path / "baseline.sqlite3"
                 ),
+                pool_plan_cache_dir=str(
+                    tmp_path / "baseline-plans"
+                ),
+                pool_plan_cache_minimum_free_bytes=0,
                 pool_plan_build_policy="adaptive",
             )
         )
@@ -1061,6 +1066,10 @@ class TestSearchEngine:
                     sigma_database_path=str(
                         tmp_path / "resumed.sqlite3"
                     ),
+                    pool_plan_cache_dir=str(
+                        tmp_path / "resumed-plans"
+                    ),
+                    pool_plan_cache_minimum_free_bytes=0,
                     pool_plan_build_policy="adaptive",
                 ):
                 partial.append(result)
@@ -1106,6 +1115,10 @@ class TestSearchEngine:
                 sigma_database_path=str(
                     tmp_path / "resumed.sqlite3"
                 ),
+                pool_plan_cache_dir=str(
+                    tmp_path / "resumed-plans"
+                ),
+                pool_plan_cache_minimum_free_bytes=0,
                 pool_plan_build_policy="adaptive",
             )
         )
@@ -1335,6 +1348,10 @@ class TestBoundedStructureMetrics:
             "persistent_hits",
             "persistent_misses",
             "persistent_invalid",
+            "disk_plan_hits",
+            "disk_plan_misses",
+            "disk_plan_invalid",
+            "disk_plan_writes",
         ):
             pool_state.pop(name)
         pool_state["leaf_blocks_avoided_after_hit_exhaustion"] = 17
@@ -1357,6 +1374,10 @@ class TestBoundedStructureMetrics:
         assert restored.performance.pool.persistent_hits == 0
         assert restored.performance.pool.persistent_misses == 0
         assert restored.performance.pool.persistent_invalid == 0
+        assert restored.performance.pool.disk_plan_hits == 0
+        assert restored.performance.pool.disk_plan_misses == 0
+        assert restored.performance.pool.disk_plan_invalid == 0
+        assert restored.performance.pool.disk_plan_writes == 0
         assert not hasattr(
             restored.performance.pool,
             "leaf_blocks_avoided_after_hit_exhaustion",
@@ -2714,3 +2735,227 @@ class TestPersistentSigmaDatabase:
         ).fetchone()[0]
         connection.close()
         assert count > 0
+
+
+class TestPersistentPlanCache:
+    """Cold, warm, corruption, and interruption guarantees."""
+
+    @staticmethod
+    def _products(plan):
+        return tuple(int(block.product) for block in plan.superblocks)
+
+    @staticmethod
+    def _analyzer(primes, cache_dir, **kwargs):
+        return SigmaPoolAnalyzer(
+            primes,
+            block_size=16,
+            superblock_fanout=4,
+            gcd_mode="hierarchical",
+            plan_cache_dir=str(cache_dir),
+            plan_cache_minimum_free_bytes=0,
+            plan_build_policy="after_db_miss",
+            **kwargs,
+        )
+
+    def test_filtered_plan_cold_build_and_warm_mmap_match_memory(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(10_000)
+        cache_dir = tmp_path / "plans"
+
+        reference_analyzer = SigmaPoolAnalyzer(
+            primes,
+            block_size=16,
+            superblock_fanout=4,
+            gcd_mode="hierarchical",
+            plan_build_policy="after_db_miss",
+        )
+        reference = reference_analyzer.plan_for_exp(2)
+        expected_primes = np.asarray(reference.primes).copy()
+        expected_products = self._products(reference)
+
+        cold = self._analyzer(primes, cache_dir)
+        cold_plan = cold.plan_for_exp(2)
+        assert isinstance(cold_plan.primes, np.memmap)
+        assert not cold_plan.primes.flags.writeable
+        assert np.array_equal(cold_plan.primes, expected_primes)
+        assert self._products(cold_plan) == expected_products
+        assert cold._perf.disk_plan_misses == 1
+        assert cold._perf.disk_plan_writes == 1
+        cold.close()
+
+        warm = self._analyzer(primes, cache_dir)
+        warm_plan = warm.plan_for_exp(2)
+        assert isinstance(warm_plan.primes, np.memmap)
+        assert not warm_plan.primes.flags.writeable
+        assert np.array_equal(warm_plan.primes, expected_primes)
+        assert self._products(warm_plan) == expected_products
+        assert warm._perf.disk_plan_hits == 1
+        assert warm._perf.disk_plan_misses == 0
+        assert warm._perf.disk_plan_writes == 0
+        assert warm._perf.plans_built == 0
+        warm.close()
+        reference_analyzer.close()
+
+    def test_unfiltered_plan_persists_products_without_prime_copy(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(5_000)
+        cache_dir = tmp_path / "plans"
+        cold = self._analyzer(primes, cache_dir)
+        cold_plan = cold.plan_for_exp(1)
+        products = self._products(cold_plan)
+        key = cold._disk_plan_key(0, source_start=0)
+        entry = cold._plan_cache.entry_path(key)
+        assert entry.is_dir()
+        assert not (entry / "primes.bin").exists()
+        cold.close()
+
+        warm = self._analyzer(primes, cache_dir)
+        warm_plan = warm.plan_for_exp(1)
+        assert warm_plan.primes is primes
+        assert self._products(warm_plan) == products
+        assert warm._perf.disk_plan_hits == 1
+        assert warm._perf.plans_built == 0
+        warm.close()
+
+    def test_corrupt_prime_array_is_rebuilt_and_not_used(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(8_000)
+        cache_dir = tmp_path / "plans"
+        cold = self._analyzer(primes, cache_dir)
+        expected = cold.plan_for_exp(2)
+        expected_primes = np.asarray(expected.primes).copy()
+        expected_products = self._products(expected)
+        key = cold._disk_plan_key(3, source_start=0)
+        entry = cold._plan_cache.entry_path(key)
+        cold.close()
+
+        primes_path = entry / "primes.bin"
+        with primes_path.open("r+b") as handle:
+            first = handle.read(1)
+            handle.seek(0)
+            handle.write(bytes([first[0] ^ 0xFF]))
+
+        rebuilt = self._analyzer(primes, cache_dir)
+        plan = rebuilt.plan_for_exp(2)
+        assert rebuilt._perf.disk_plan_invalid == 1
+        assert rebuilt._perf.disk_plan_writes == 1
+        assert np.array_equal(plan.primes, expected_primes)
+        assert self._products(plan) == expected_products
+        rebuilt.close()
+
+    def test_corrupt_products_are_rebuilt_and_not_used(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(8_000)
+        cache_dir = tmp_path / "plans"
+        cold = self._analyzer(primes, cache_dir)
+        expected = cold.plan_for_exp(1)
+        expected_products = self._products(expected)
+        key = cold._disk_plan_key(0, source_start=0)
+        entry = cold._plan_cache.entry_path(key)
+        cold.close()
+
+        products_path = entry / "products.bin"
+        with products_path.open("ab") as handle:
+            handle.write(b"\0")
+
+        rebuilt = self._analyzer(primes, cache_dir)
+        plan = rebuilt.plan_for_exp(1)
+        assert rebuilt._perf.disk_plan_invalid == 1
+        assert rebuilt._perf.disk_plan_writes == 1
+        assert self._products(plan) == expected_products
+        rebuilt.close()
+
+    def test_interval_and_full_window_have_isolated_cache_keys(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(10_000)
+        cache_dir = tmp_path / "plans"
+        analyzer = self._analyzer(primes, cache_dir)
+
+        interval = analyzer._interval_plan_for_exp(
+            2,
+            lower_limit=7_000,
+        )
+        full = analyzer.plan_for_exp(2)
+        assert len(interval.primes) < len(full.primes)
+        assert all(int(q) > 7_000 for q in interval.primes)
+        assert analyzer._perf.disk_plan_misses == 2
+        assert analyzer._perf.disk_plan_writes == 2
+
+        final_entries = [
+            path
+            for path in cache_dir.iterdir()
+            if path.is_dir() and ".tmp-" not in path.name
+        ]
+        assert len(final_entries) == 2
+        analyzer.close()
+
+    def test_insufficient_space_falls_back_to_memory_plan(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(5_000)
+        analyzer = SigmaPoolAnalyzer(
+            primes,
+            block_size=16,
+            superblock_fanout=4,
+            gcd_mode="hierarchical",
+            plan_cache_dir=str(tmp_path / "plans"),
+            plan_cache_minimum_free_bytes=10**30,
+            plan_build_policy="after_db_miss",
+        )
+        plan = analyzer.plan_for_exp(2)
+        assert not isinstance(plan.primes, np.memmap)
+        assert analyzer.plan_cache_error is not None
+        assert analyzer._perf.disk_plan_writes == 0
+        analyzer.close()
+
+    def test_aborted_transaction_is_invisible_and_lock_reusable(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(2_000)
+        analyzer = self._analyzer(primes, tmp_path / "plans")
+        key = analyzer._disk_plan_key(3, source_start=0)
+        cache = PersistentPlanCache(
+            tmp_path / "plans",
+            minimum_free_bytes=0,
+        )
+
+        build = cache.begin(key)
+        mapping = build.allocate_primes(3)
+        mapping[:] = np.asarray([7, 13, 19], dtype=mapping.dtype)
+        mapping.flush()
+        mapping._mmap.close()
+        build.abort()
+
+        assert not cache.entry_path(key).exists()
+        assert not list(cache.root.glob(f"{key.slug}.tmp-*"))
+        second = cache.begin(key)
+        second.abort()
+        analyzer.close()
+
+    def test_close_releases_mmap_file_on_windows(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(3_000)
+        cache_dir = tmp_path / "plans"
+        analyzer = self._analyzer(primes, cache_dir)
+        analyzer.plan_for_exp(2)
+        analyzer.close()
+
+        # Recursive removal fails on Windows if a mapped file is still open.
+        import shutil
+
+        shutil.rmtree(cache_dir)
+        assert not cache_dir.exists()

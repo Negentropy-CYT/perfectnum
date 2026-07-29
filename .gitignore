@@ -14,6 +14,7 @@ checkpoint*.pkl
 solutions*.txt
 sigma_pool*.sqlite3
 sigma_pool*.sqlite3-*
+plan_cache/
 *.tmp
 
 # Per-run output directory

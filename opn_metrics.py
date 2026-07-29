@@ -218,6 +218,13 @@ class PoolPerformance:
     persistent_misses: int = 0
     persistent_invalid: int = 0
 
+    # Persistent plan-cache health. These remain deliberately compact:
+    # plan products are always resident before the GCD hot path begins.
+    disk_plan_hits: int = 0
+    disk_plan_misses: int = 0
+    disk_plan_invalid: int = 0
+    disk_plan_writes: int = 0
+
     candidate_leaf_blocks: int = 0
     superblocks_tested: int = 0
     positive_superblocks: int = 0

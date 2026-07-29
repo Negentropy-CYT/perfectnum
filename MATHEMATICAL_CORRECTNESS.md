@@ -75,6 +75,17 @@ configured odd-prime pool.  Five correctness invariants hold:
    necessary condition.  Any invalid or incompatible record is ignored and
    the ordinary full-window analysis is used.
 
+6. Persistent pool plans do not change the set of eligible primes or any GCD
+   identity. Filtered prime arrays are the output of the same two-pass
+   necessary-order filter and are consumed read-only through `numpy.memmap`.
+   Superblock products are stored with length framing and SHA-256 checksums,
+   then fully reconstructed as `mpz` objects before scanning. The cache key
+   binds the complete pool-prefix digest, source interval, integer dtype,
+   radical, block size, fanout, schema, and plan-semantics version. Missing,
+   incompatible, truncated, oversized, or checksum-invalid entries are rebuilt
+   or fall back to the ordinary in-memory path. Thus disk persistence changes
+   representation and lifetime only; it introduces no additional prune.
+
 ## Exponent Filter Correctness
 
 For an odd prime q ≠ p dividing σ(p^a), let n = a+1.  We have

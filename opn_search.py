@@ -24,6 +24,7 @@ from opn_core import (
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
     POOL_GCD_MODE,
+    POOL_PLAN_DISK_MIN_FREE_BYTES,
     POOL_PLAN_CHUNK_PRIMES,
     POOL_SUPERBLOCK_FANOUT,
     SEARCH_MODE,
@@ -151,6 +152,9 @@ def search_opn(
     stop_requested=None,
     use_cache: bool = False,
     sigma_database_path: str | None = None,
+    pool_plan_cache_dir: str | None = None,
+    pool_plan_cache_minimum_free_bytes: int =
+    POOL_PLAN_DISK_MIN_FREE_BYTES,
     pool_plan_build_policy: str = "eager",
 ):
     """Generator yielding State objects for each candidate found.
@@ -178,6 +182,10 @@ def search_opn(
             pool_perf=metrics.performance.pool,
             structure=metrics.structure,
             database_path=sigma_database_path,
+            plan_cache_dir=pool_plan_cache_dir,
+            plan_cache_minimum_free_bytes=(
+                pool_plan_cache_minimum_free_bytes
+            ),
             plan_build_policy=pool_plan_build_policy,
         )
         if sigma_pool_analyzer.database_error is not None:
@@ -185,6 +193,13 @@ def search_opn(
                 "[init] sigma database unavailable; "
                 "falling back to pool scans: "
                 f"{sigma_pool_analyzer.database_error}",
+                flush=True,
+            )
+        if sigma_pool_analyzer.plan_cache_error is not None:
+            print(
+                "[init] persistent plan cache unavailable; "
+                "falling back to memory plans: "
+                f"{sigma_pool_analyzer.plan_cache_error}",
                 flush=True,
             )
 

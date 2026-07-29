@@ -432,6 +432,10 @@ def _performance_lines(
     w(f"  persistent hits:    {pool.persistent_hits:>12,}")
     w(f"  persistent misses:  {pool.persistent_misses:>12,}")
     w(f"  persistent invalid: {pool.persistent_invalid:>12,}")
+    w(f"  disk-plan hits:     {pool.disk_plan_hits:>12,}")
+    w(f"  disk-plan misses:   {pool.disk_plan_misses:>12,}")
+    w(f"  disk-plan invalid:  {pool.disk_plan_invalid:>12,}")
+    w(f"  disk-plan writes:   {pool.disk_plan_writes:>12,}")
 
     # ── GCD block workload ──
     w("\n## GCD block workload")
@@ -557,6 +561,10 @@ def write_performance_json(
             "persistent_hits": pool.persistent_hits,
             "persistent_misses": pool.persistent_misses,
             "persistent_invalid": pool.persistent_invalid,
+            "disk_plan_hits": pool.disk_plan_hits,
+            "disk_plan_misses": pool.disk_plan_misses,
+            "disk_plan_invalid": pool.disk_plan_invalid,
+            "disk_plan_writes": pool.disk_plan_writes,
             "candidate_leaf_blocks": pool.candidate_leaf_blocks,
             "superblocks_tested": pool.superblocks_tested,
             "positive_superblocks": pool.positive_superblocks,

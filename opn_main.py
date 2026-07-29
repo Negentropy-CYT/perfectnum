@@ -27,6 +27,9 @@ from opn_core import (
     MAX_EXP,
     PROPAGATE,
     POOL_GCD_MODE,
+    POOL_PLAN_DISK_CACHE_DIR,
+    POOL_PLAN_DISK_CACHE_ENABLED,
+    POOL_PLAN_DISK_MIN_FREE_BYTES,
     POOL_PLAN_BUILD_POLICY,
     POOL_SUPERBLOCK_FANOUT,
     SEARCH_MODE,
@@ -233,6 +236,14 @@ def main() -> None:
                 if SIGMA_DATABASE_ENABLED
                 else None
             ),
+            pool_plan_cache_dir=(
+                POOL_PLAN_DISK_CACHE_DIR
+                if POOL_PLAN_DISK_CACHE_ENABLED
+                else None
+            ),
+            pool_plan_cache_minimum_free_bytes=(
+                POOL_PLAN_DISK_MIN_FREE_BYTES
+            ),
             pool_plan_build_policy=POOL_PLAN_BUILD_POLICY,
         ):
             if st.spoof:
@@ -292,6 +303,14 @@ def main() -> None:
             "pool_gcd_mode": POOL_GCD_MODE,
             "pool_fanout": POOL_SUPERBLOCK_FANOUT,
             "pool_plan_build_policy": POOL_PLAN_BUILD_POLICY,
+            "pool_plan_disk_cache_enabled": (
+                POOL_PLAN_DISK_CACHE_ENABLED
+            ),
+            "pool_plan_disk_cache_dir": (
+                POOL_PLAN_DISK_CACHE_DIR
+                if POOL_PLAN_DISK_CACHE_ENABLED
+                else None
+            ),
             "sigma_database_enabled": SIGMA_DATABASE_ENABLED,
         }
         environment = {

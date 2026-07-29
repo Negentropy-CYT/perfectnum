@@ -20,6 +20,7 @@ from gmpy2 import mpz
 
 from opn_core import (
     CHECKPOINT_INTERVAL_SECONDS,
+    DOMAIN_RATIO_MODE,
     ENABLE_FERMAT_DEBT,
     EXCLUDE_EXP_4,
     EXP4_FILTER_HITS,
@@ -45,12 +46,204 @@ from opn_core import (
     valid_euler_exponents,
     valid_even_exponents,
 )
+from dataclasses import dataclass
+
 from opn_metrics import (
     CloneEffect,
     PruneMechanism,
     PruneReason,
     RunMetrics,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PendingExponentDomain:
+    """Deterministic exponent choices for one pending prime."""
+    lower_bound: int
+    even_exponents: tuple[int, ...]
+    euler_exponents: tuple[int, ...]
+
+    @property
+    def size(self) -> int:
+        return len(self.even_exponents) + len(self.euler_exponents)
+
+    @property
+    def empty(self) -> bool:
+        return self.size == 0
+
+    @property
+    def forced_euler(self) -> bool:
+        return not self.even_exponents and bool(self.euler_exponents)
+
+
+def _pending_lower_bound(st: "ChainState", q: int) -> int:
+    return max(
+        st.required_v.get(q, 0)
+        - _target_valuation_offset(q)
+        - st.current_v.get(q, 0),
+        1,
+    )
+
+
+def _build_pending_domain(
+    st: "ChainState",
+    q: int,
+    *,
+    max_exp: int,
+    apply_maximum_capacity: bool,
+) -> PendingExponentDomain:
+    lower = _pending_lower_bound(st, q)
+    even = tuple(valid_even_exponents(lower, max_exp))
+    euler: tuple[int, ...] = ()
+    if (
+        st.euler_prime is None
+        and q % 4 == 1
+        and SEARCH_MODE.require_euler
+    ):
+        euler = tuple(valid_euler_exponents(lower, max_exp))
+    if apply_maximum_capacity:
+        raw_capacity = max_prime_capacity(q)
+        even_limit = even_max_exp_capacity(raw_capacity)
+        euler_limit = euler_max_exp_capacity(raw_capacity)
+        even = tuple(e for e in even if e <= even_limit)
+        euler = tuple(e for e in euler if e <= euler_limit)
+    return PendingExponentDomain(
+        lower_bound=lower,
+        even_exponents=even,
+        euler_exponents=euler,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MandatoryRatioResult:
+    possible: bool
+    numerator: mpz
+    denominator: mpz
+    reason: str = ""
+
+
+def _first_even_exponent(lower: int, max_exp: int) -> int | None:
+    """Smallest valid even exponent ≥ *lower*, or None."""
+    exp = max(lower, 2)
+    if exp % 2:
+        exp += 1
+    return exp if exp <= max_exp else None
+
+
+def _first_euler_exponent(lower: int, max_exp: int) -> int | None:
+    """Smallest valid Euler exponent ≥ *lower*, or None."""
+    exp = max(lower, 1)
+    exp += (1 - exp) % 4
+    return exp if exp <= max_exp else None
+
+
+def _component_ratio(p: int, exp: int) -> tuple[mpz, mpz]:
+    return (mpz(sigma_prime_power(p, exp)), mpz(power_pa(p, exp)))
+
+
+def _domain_ratio_lower_bound(
+    st: "ChainState",
+    live_pending: set[int],
+    *,
+    max_exp: int,
+) -> MandatoryRatioResult:
+    """Compute a relaxed but safe mandatory-ratio lower bound.
+
+    Every pending prime must receive at least its minimum admissible
+    exponent (even or Euler, whichever is available).  The product of
+    their best-possible σ/ratio multipliers is a lower bound on the
+    final ratio — if it already exceeds the target, no completion exists.
+    """
+    from opn_core import valid_euler_exponents, valid_even_exponents
+
+    entries: list[tuple[int, int | None, int | None]] = []
+    forced_euler: int | None = None
+
+    for q in sorted(live_pending):
+        lower = _pending_lower_bound(st, q)
+        even_exp = _first_even_exponent(lower, max_exp)
+
+        euler_exp = None
+        if (
+            SEARCH_MODE.require_euler
+            and st.euler_prime is None
+            and q % 4 == 1
+        ):
+            euler_exp = _first_euler_exponent(lower, max_exp)
+
+        if even_exp is None:
+            if euler_exp is None:
+                return MandatoryRatioResult(
+                    False, mpz(0), mpz(1), "empty_domain",
+                )
+            if forced_euler is not None:
+                return MandatoryRatioResult(
+                    False, mpz(0), mpz(1), "multiple_forced_euler",
+                )
+            forced_euler = q
+
+        entries.append((q, even_exp, euler_exp))
+
+    # Euler prime already fixed: everything must be even.
+    if st.euler_prime is not None:
+        num = mpz(st.ratio_num)
+        den = mpz(st.ratio_den)
+        for _q, ev_exp, _eu_exp in entries:
+            if ev_exp is None:
+                return MandatoryRatioResult(
+                    False, mpz(0), mpz(1), "empty_even_domain",
+                )
+            c_num, c_den = _component_ratio(_q, ev_exp)
+            num *= c_num
+            den *= c_den
+        return MandatoryRatioResult(True, num, den)
+
+    # Exactly one prime is forced to be Euler.
+    if forced_euler is not None:
+        num = mpz(st.ratio_num)
+        den = mpz(st.ratio_den)
+        for _q, ev_exp, eu_exp in entries:
+            chosen = eu_exp if _q == forced_euler else ev_exp
+            if chosen is None:
+                return MandatoryRatioResult(
+                    False, mpz(0), mpz(1), "incompatible_forced_euler",
+                )
+            c_num, c_den = _component_ratio(_q, chosen)
+            num *= c_num
+            den *= c_den
+        return MandatoryRatioResult(True, num, den)
+
+    # All-even assignment is feasible.  Euler may be supplied later by
+    # an optional prime, so the all-even case is one valid relaxed
+    # lower bound.  We also try giving each candidate the Euler role
+    # in turn, keeping the smallest (i.e. hardest-to-exceed) ratio.
+    all_even_num = mpz(st.ratio_num)
+    all_even_den = mpz(st.ratio_den)
+    cache: dict[int, tuple[int, int | None, mpz, mpz]] = {}
+
+    for _q, ev_exp, eu_exp in entries:
+        assert ev_exp is not None
+        e_num, e_den = _component_ratio(_q, ev_exp)
+        cache[_q] = (ev_exp, eu_exp, e_num, e_den)
+        all_even_num *= e_num
+        all_even_den *= e_den
+
+    best_num = all_even_num
+    best_den = all_even_den
+
+    for _q, (ev_exp, eu_exp, e_num, e_den) in cache.items():
+        if eu_exp is None:
+            continue
+        eu_num, eu_den = _component_ratio(_q, eu_exp)
+        candidate_num = all_even_num * eu_num * e_den
+        candidate_den = all_even_den * eu_den * e_num
+        if candidate_num * best_den < best_num * candidate_den:
+            best_num = candidate_num
+            best_den = candidate_den
+
+    return MandatoryRatioResult(True, best_num, best_den)
+
+
 from opn_state import (
     ChainState,
     DFSState,
@@ -468,6 +661,43 @@ def search_opn(
             if lb_num * SEARCH_MODE.target_den > SEARCH_MODE.target_num * lb_den:
                 continue
 
+            if (
+                use_heap
+                and live_pending
+                and DOMAIN_RATIO_MODE != "off"
+            ):
+                domain_bound = _domain_ratio_lower_bound(
+                    st,
+                    live_pending,
+                    max_exp=max_exp,
+                )
+                if not domain_bound.possible:
+                    reason = (
+                        PruneReason.EULER_FORM
+                        if domain_bound.reason == "multiple_forced_euler"
+                        else PruneReason.VALUATION_CONTRADICTION
+                    )
+                    if DOMAIN_RATIO_MODE == "enforce":
+                        metrics.record_prune(
+                            reason=reason,
+                            mechanism=PruneMechanism.MANDATORY_RATIO_BOUND,
+                            clone_effect=CloneEffect.AVOIDED,
+                        )
+                        continue
+                    metrics.performance.domain_ratio_would_prune += 1
+                elif (
+                    domain_bound.numerator * SEARCH_MODE.target_den
+                    > SEARCH_MODE.target_num * domain_bound.denominator
+                ):
+                    if DOMAIN_RATIO_MODE == "enforce":
+                        metrics.record_prune(
+                            reason=PruneReason.RATIO_OVERSHOOT,
+                            mechanism=PruneMechanism.MANDATORY_RATIO_BOUND,
+                            clone_effect=CloneEffect.AVOIDED,
+                        )
+                        continue
+                    metrics.performance.domain_ratio_would_prune += 1
+
             _t0 = time.perf_counter_ns()
             ub_num, ub_den = ratio_upper_bound(
                 st.ratio_num, st.ratio_den,
@@ -713,7 +943,7 @@ def _assign(
 # ── pending processing (chain mode) ──────────────────────────
 
 def _drain_and_process_pending(
-    st: ChainState, heap, primes, max_exp: int, _push, k_remain: int,
+    st: "ChainState", heap, primes, max_exp: int, _push, k_remain: int,
     *,
     sigma_pool_analyzer=None,
     metrics: RunMetrics,
@@ -740,12 +970,6 @@ def _drain_and_process_pending(
 
     q = st.pending.popleft()
     st.pending_set.discard(q)
-    lb = max(
-        st.required_v.get(q, 0)
-        - _target_valuation_offset(q)
-        - st.current_v.get(q, 0),
-        1,
-    )
 
     capacity_enabled = (
         SEARCH_MODE.require_euler
@@ -759,47 +983,35 @@ def _drain_and_process_pending(
         and all(q >= p for p in st.pending)
     )
 
-    if st.euler_prime is None and q % 4 == 1:
-        for e in reversed(valid_euler_exponents(lb, max_exp)):
-            if is_max_in_pending and e > euler_max_exp_capacity(
-                max_prime_capacity(q)
-            ):
-                metrics.record_prune(
-                    reason=PruneReason.CAPACITY_BOUND,
-                    mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
-                    clone_effect=CloneEffect.AVOIDED,
-                )
-                continue
-            if _terminal_prune(st, q, e, k_remain, metrics):
-                continue
-            if sigma_pool_analyzer is not None and sigma_pool_analyzer.is_known_outside(q, e):
-                metrics.record_prune(
-                    reason=PruneReason.OUTSIDE_WINDOW,
-                    mechanism=PruneMechanism.KNOWN_OUTSIDE_CACHE,
-                    clone_effect=CloneEffect.AVOIDED,
-                )
-                continue
-            ns = assign_prime_chain(
-                st, q, e,
-                metrics=metrics,
-                propagate=True,
-                max_exp=max_exp,
-                prime_limit=primes[-1],
-                sigma_pool_analyzer=sigma_pool_analyzer,
-            )
-            if ns is not None:
-                _push(heap, ns)
+    domain = _build_pending_domain(
+        st,
+        q,
+        max_exp=max_exp,
+        apply_maximum_capacity=is_max_in_pending,
+    )
 
-    for e in reversed(valid_even_exponents(lb, max_exp)):
-        if is_max_in_pending and e > even_max_exp_capacity(
-            max_prime_capacity(q)
-        ):
+    for e in reversed(domain.euler_exponents):
+        if _terminal_prune(st, q, e, k_remain, metrics):
+            continue
+        if sigma_pool_analyzer is not None and sigma_pool_analyzer.is_known_outside(q, e):
             metrics.record_prune(
-                reason=PruneReason.CAPACITY_BOUND,
-                mechanism=PruneMechanism.DIRECT_DOMAIN_CHECK,
+                reason=PruneReason.OUTSIDE_WINDOW,
+                mechanism=PruneMechanism.KNOWN_OUTSIDE_CACHE,
                 clone_effect=CloneEffect.AVOIDED,
             )
             continue
+        ns = assign_prime_chain(
+            st, q, e,
+            metrics=metrics,
+            propagate=True,
+            max_exp=max_exp,
+            prime_limit=primes[-1],
+            sigma_pool_analyzer=sigma_pool_analyzer,
+        )
+        if ns is not None:
+            _push(heap, ns)
+
+    for e in reversed(domain.even_exponents):
         if _terminal_prune(st, q, e, k_remain, metrics):
             continue
         if sigma_pool_analyzer is not None and sigma_pool_analyzer.is_known_outside(q, e):

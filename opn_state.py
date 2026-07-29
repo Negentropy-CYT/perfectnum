@@ -21,6 +21,7 @@ from gmpy2 import mpz
 
 from opn_core import (
     FERMAT_PRIMES,
+    Q3_PREPOOL_MODE,
     SEARCH_MODE,
     _SIG_FACTORS,
     MAX_EXP,
@@ -31,6 +32,7 @@ from opn_core import (
     PRIORITY_DEPTH_W,
     check_touchard,
     power_pa,
+    sigma_v3_valuation,
     sigma_valuation_map,
     sigma_valuation_from_order,
     sigma_prime_power,
@@ -48,6 +50,94 @@ from opn_metrics import (
     VALUATION_BUDGET,
     VALUATION_KIND_COUNT,
 )
+
+
+# ── centralized valuation contradiction recorder ─────────────
+
+def _record_valuation_contradiction(
+    metrics: RunMetrics,
+    *,
+    q: int,
+    source_exp: int,
+    kind: int,
+    phase: str,
+) -> None:
+    """Record one valuation contradiction with both attribution and
+    per-exponent structural counters in a single call site."""
+    if kind == VALUATION_EXCLUDED:
+        reason_name = f"excluded_{phase}"
+    elif kind == VALUATION_OVERRUN:
+        reason_name = f"overrun_{phase}"
+    elif kind == VALUATION_BUDGET:
+        reason_name = f"budget_{phase}"
+    else:
+        raise ValueError(
+            f"unknown valuation contradiction kind: {kind}"
+        )
+
+    structure = metrics.structure
+    structure.contradiction_attribution[
+        (q, reason_name)
+    ] += 1
+
+    if source_exp < len(structure.valuation_contradictions_by_exp):
+        structure.valuation_contradictions_by_exp[source_exp][kind] += 1
+        if q == 3:
+            structure.valuation_q3_by_exp[source_exp] += 1
+
+
+def _valuation_conflict_kind(
+    st: "ChainState",
+    *,
+    q: int,
+    incoming: int,
+    max_exp: int,
+) -> int | None:
+    """Return the contradiction kind if *q* owes an unpayable valuation debt."""
+    if incoming <= 0:
+        return None
+
+    offset = _target_valuation_offset(q)
+    new_required = st.required_v.get(q, 0) + incoming
+
+    if q in st.excluded and new_required > offset:
+        return VALUATION_EXCLUDED
+
+    if q in st.assigned:
+        if new_required > st.current_v[q] + offset:
+            return VALUATION_OVERRUN
+        return None
+
+    maximum = _max_possible_valuation(
+        q,
+        st.euler_prime,
+        max_exp,
+    )
+
+    if new_required > maximum + offset:
+        return VALUATION_BUDGET
+
+    return None
+
+
+def _q3_prepool_conflict(
+    st: "ChainState",
+    *,
+    p: int,
+    exp: int,
+    max_exp: int,
+) -> tuple[int, int] | None:
+    """Return (kind, incoming) if the q=3 LTE valuation is contradictory."""
+    incoming = sigma_v3_valuation(p, exp)
+    kind = _valuation_conflict_kind(
+        st,
+        q=3,
+        incoming=incoming,
+        max_exp=max_exp,
+    )
+    if kind is None:
+        return None
+    return kind, incoming
 
 
 # ── priority helper ──────────────────────────────────────────
@@ -440,11 +530,72 @@ def assign_prime_chain(
             clone_effect=CloneEffect.AVOIDED,
         )
 
+    # ── q=3 prepool valuation (LTE, O(1), before the pool analyser) ──
+    q3_shadow = None
+    if (
+        propagate
+        and SEARCH_MODE.target_num == 2
+        and SEARCH_MODE.target_den == 1
+        and SEARCH_MODE.require_euler
+        and Q3_PREPOOL_MODE != "off"
+    ):
+        q3_shadow = _q3_prepool_conflict(
+            st,
+            p=p,
+            exp=exp,
+            max_exp=max_exp,
+        )
+
+        if q3_shadow is not None:
+            kind, _incoming = q3_shadow
+
+            if Q3_PREPOOL_MODE == "enforce":
+                _record_valuation_contradiction(
+                    metrics,
+                    q=3,
+                    source_exp=exp,
+                    kind=kind,
+                    phase="pre",
+                )
+                metrics.performance.q3_prepool_prunes += 1
+                if exp < len(metrics.performance.q3_prepool_prunes_by_exp):
+                    metrics.performance.q3_prepool_prunes_by_exp[exp] += 1
+                return _reject(
+                    metrics,
+                    reason=PruneReason.VALUATION_CONTRADICTION,
+                    mechanism=PruneMechanism.ORDER_LTE_PRECHECK,
+                    clone_effect=CloneEffect.AVOIDED,
+                )
+
+            metrics.performance.q3_prepool_shadow_hits += 1
+
     # ── pre-clone valuation check (populates the exact map lazily) ──
     pre_vals = None
     if propagate:
         if sigma_pool_analyzer is not None:
             analysis = sigma_pool_analyzer.analyze(p, exp)
+
+            # ── q=3 shadow verification ──
+            if q3_shadow is not None:
+                predicted_kind, predicted_incoming = q3_shadow
+                observed_incoming = analysis.valuations.get(3, 0)
+                observed_kind = _valuation_conflict_kind(
+                    st,
+                    q=3,
+                    incoming=observed_incoming,
+                    max_exp=max_exp,
+                )
+                perf = metrics.performance
+                if (
+                    observed_incoming != predicted_incoming
+                    or observed_kind != predicted_kind
+                ):
+                    perf.q3_prepool_shadow_mismatches += 1
+                elif analysis.exact:
+                    perf.q3_prepool_shadow_exact += 1
+                else:
+                    perf.q3_prepool_shadow_outside += 1
+
             if not analysis.exact:
                 return _reject(
                     metrics,
@@ -475,15 +626,13 @@ def assign_prime_chain(
                 )
 
             if q in st.excluded and new_req > offset:
-                metrics.structure.contradiction_attribution[
-                    (q, "excluded_pre")
-                ] += 1
-                if exp < len(metrics.structure.valuation_contradictions_by_exp):
-                    metrics.structure.valuation_contradictions_by_exp[exp][
-                        VALUATION_EXCLUDED
-                    ] += 1
-                    if q == 3:
-                        metrics.structure.valuation_q3_by_exp[exp] += 1
+                _record_valuation_contradiction(
+                    metrics,
+                    q=q,
+                    source_exp=exp,
+                    kind=VALUATION_EXCLUDED,
+                    phase="pre",
+                )
                 return _reject(
                     metrics,
                     reason=PruneReason.VALUATION_CONTRADICTION,
@@ -492,15 +641,13 @@ def assign_prime_chain(
                 )
             if q in st.assigned:
                 if new_req > st.current_v[q] + offset:
-                    metrics.structure.contradiction_attribution[
-                        (q, "overrun_pre")
-                    ] += 1
-                    if exp < len(metrics.structure.valuation_contradictions_by_exp):
-                        metrics.structure.valuation_contradictions_by_exp[exp][
-                            VALUATION_OVERRUN
-                        ] += 1
-                        if q == 3:
-                            metrics.structure.valuation_q3_by_exp[exp] += 1
+                    _record_valuation_contradiction(
+                        metrics,
+                        q=q,
+                        source_exp=exp,
+                        kind=VALUATION_OVERRUN,
+                        phase="pre",
+                    )
                     return _reject(
                         metrics,
                         reason=PruneReason.VALUATION_CONTRADICTION,
@@ -513,15 +660,13 @@ def assign_prime_chain(
                     > _max_possible_valuation(q, st.euler_prime, max_exp)
                     + offset
                 ):
-                    metrics.structure.contradiction_attribution[
-                        (q, "budget_pre")
-                    ] += 1
-                    if exp < len(metrics.structure.valuation_contradictions_by_exp):
-                        metrics.structure.valuation_contradictions_by_exp[exp][
-                            VALUATION_BUDGET
-                        ] += 1
-                        if q == 3:
-                            metrics.structure.valuation_q3_by_exp[exp] += 1
+                    _record_valuation_contradiction(
+                        metrics,
+                        q=q,
+                        source_exp=exp,
+                        kind=VALUATION_BUDGET,
+                        phase="pre",
+                    )
                     return _reject(
                         metrics,
                         reason=PruneReason.VALUATION_CONTRADICTION,
@@ -581,15 +726,13 @@ def assign_prime_chain(
         offset = _target_valuation_offset(q)
         new_req = ns.required_v.get(q, 0) + incoming
         if q in ns.excluded and new_req > offset:
-            metrics.structure.contradiction_attribution[
-                (q, "excluded_post")
-            ] += 1
-            if exp < len(metrics.structure.valuation_contradictions_by_exp):
-                metrics.structure.valuation_contradictions_by_exp[exp][
-                    VALUATION_EXCLUDED
-                ] += 1
-                if q == 3:
-                    metrics.structure.valuation_q3_by_exp[exp] += 1
+            _record_valuation_contradiction(
+                metrics,
+                q=q,
+                source_exp=exp,
+                kind=VALUATION_EXCLUDED,
+                phase="post",
+            )
             return _reject(
                 metrics,
                 reason=PruneReason.VALUATION_CONTRADICTION,
@@ -601,15 +744,13 @@ def assign_prime_chain(
 
         if q in ns.assigned:
             if ns.required_v[q] > ns.current_v[q] + offset:
-                metrics.structure.contradiction_attribution[
-                    (q, "overrun_post")
-                ] += 1
-                if exp < len(metrics.structure.valuation_contradictions_by_exp):
-                    metrics.structure.valuation_contradictions_by_exp[exp][
-                        VALUATION_OVERRUN
-                    ] += 1
-                    if q == 3:
-                        metrics.structure.valuation_q3_by_exp[exp] += 1
+                _record_valuation_contradiction(
+                    metrics,
+                    q=q,
+                    source_exp=exp,
+                    kind=VALUATION_OVERRUN,
+                    phase="post",
+                )
                 return _reject(
                     metrics,
                     reason=PruneReason.VALUATION_CONTRADICTION,
@@ -622,15 +763,13 @@ def assign_prime_chain(
                 > _max_possible_valuation(q, ns.euler_prime, max_exp)
                 + offset
             ):
-                metrics.structure.contradiction_attribution[
-                    (q, "budget_post")
-                ] += 1
-                if exp < len(metrics.structure.valuation_contradictions_by_exp):
-                    metrics.structure.valuation_contradictions_by_exp[exp][
-                        VALUATION_BUDGET
-                    ] += 1
-                    if q == 3:
-                        metrics.structure.valuation_q3_by_exp[exp] += 1
+                _record_valuation_contradiction(
+                    metrics,
+                    q=q,
+                    source_exp=exp,
+                    kind=VALUATION_BUDGET,
+                    phase="post",
+                )
                 return _reject(
                     metrics,
                     reason=PruneReason.VALUATION_CONTRADICTION,

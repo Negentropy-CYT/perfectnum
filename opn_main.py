@@ -32,7 +32,10 @@ from opn_core import (
     POOL_PLAN_DISK_MIN_FREE_BYTES,
     POOL_PLAN_BUILD_POLICY,
     POOL_SUPERBLOCK_FANOUT,
+    DOMAIN_RATIO_MODE,
+    PENDING_SELECTION,
     PRUNING_POLICY,
+    Q3_PREPOOL_MODE,
     SEARCH_MODE,
     TELEMETRY_SCHEMA_VERSION,
     SIGMA_DATABASE_ENABLED,
@@ -63,6 +66,17 @@ def _git_commit() -> str:
         ).strip()
     except Exception:
         return "unknown"
+
+
+def _git_dirty() -> bool | None:
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            text=True,
+        )
+        return bool(output.strip())
+    except Exception:
+        return None
 
 
 def _make_run_id(max_prime: int, max_factors: int, max_exp: int) -> str:
@@ -116,6 +130,7 @@ def main() -> None:
 
     started_at = datetime.now(timezone.utc)
     git_commit = _git_commit()
+    git_dirty = _git_dirty()
     run_dir = prepare_run_directory(run_id)
 
     # Create sampler before prime generation so the phase is recorded
@@ -314,16 +329,16 @@ def main() -> None:
                 else None
             ),
             "sigma_database_enabled": SIGMA_DATABASE_ENABLED,
+            "q3_prepool_mode": Q3_PREPOOL_MODE,
+            "domain_ratio_mode": DOMAIN_RATIO_MODE,
+            "pending_selection": PENDING_SELECTION,
+            "git_dirty": git_dirty,
         }
-        environment = {
-            "git_commit": git_commit,
-            "run_id": run_id,
-        }
-
         write_all_reports(
             run_dir=run_dir,
             run_id=run_id,
             git_commit=git_commit,
+            git_dirty=git_dirty,
             status=status,
             started_at=started_at.isoformat(),
             config=config,

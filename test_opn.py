@@ -80,6 +80,7 @@ from opn_core import (
     ratio_lower_bound,
     ratio_upper_bound,
     residue_class_count,
+    sigma_v3_valuation,
     sigma_valuation_map,
     sigma_valuation_from_order,
     sigma_prime_power,
@@ -90,9 +91,16 @@ from opn_core import (
     validate_prime_pool_vectorized,
 )
 from opn_search import (
+    MandatoryRatioResult,
+    PendingExponentDomain,
     SearchStopped,
+    _build_pending_domain,
     _check_spoof,
+    _domain_ratio_lower_bound,
+    _first_even_exponent,
+    _first_euler_exponent,
     _heap_snapshot,
+    _pending_lower_bound,
     _verify_solution,
     search_opn,
 )
@@ -2959,3 +2967,255 @@ class TestPersistentPlanCache:
 
         shutil.rmtree(cache_dir)
         assert not cache_dir.exists()
+
+
+class TestSigmaV3Valuation:
+    """Exact LTE formula for v_3(sigma(p^exp))."""
+
+    @pytest.mark.parametrize(
+        ("p", "exp", "expected"),
+        [
+            (3, 1, 0),
+            (3, 35, 0),
+            (7, 2, 1),
+            (13, 2, 1),
+            (5, 1, 1),
+            (5, 2, 0),
+            (7, 4, 0),
+            (13, 8, 2),
+            (19, 2, 1),
+            (7, 1, 0),
+        ],
+    )
+    def test_boundary_cases(self, p, exp, expected):
+        assert sigma_v3_valuation(p, exp) == expected
+
+    def test_matches_direct_factorisation(self):
+        """Exhaustive: all odd primes <= 2000, all exp 1..60."""
+        from opn_core import _valuation
+        primes = generate_odd_primes(2000)
+        for p_val in primes:
+            p_int = int(p_val)
+            for exp in range(1, 61):
+                expected = _valuation(
+                    int(sigma_prime_power(p_int, exp)),
+                    3,
+                )
+                actual = sigma_v3_valuation(p_int, exp)
+                assert actual == expected, (
+                    f"p={p_int} exp={exp}: expected={expected} actual={actual}"
+                )
+
+
+class TestPendingExponentDomain:
+    """Deterministic exponent domain construction (refactoring Phase 5)."""
+
+    @staticmethod
+    def _make_st(required=None, assigned=None, excluded=None,
+                 euler_prime=None):
+        st = ChainState()
+        if required:
+            st.required_v.update(required)
+        if assigned:
+            st.assigned.update(assigned)
+            st.current_v.update(assigned)
+        if excluded:
+            st.excluded.update(excluded)
+        if euler_prime is not None:
+            st.euler_prime = euler_prime
+        return st
+
+    def test_q_mod4_3_has_no_euler(self):
+        domain = _build_pending_domain(
+            ChainState(), 7, max_exp=6, apply_maximum_capacity=False,
+        )
+        assert not domain.euler_exponents
+        assert domain.even_exponents
+        assert not domain.forced_euler
+
+    def test_q_mod4_1_has_both_roles(self):
+        domain = _build_pending_domain(
+            ChainState(), 5, max_exp=6, apply_maximum_capacity=False,
+        )
+        assert domain.even_exponents
+        assert domain.euler_exponents
+        assert not domain.forced_euler
+
+    def test_euler_already_selected_suppresses_euler(self):
+        st = self._make_st(euler_prime=5)
+        domain = _build_pending_domain(
+            st, 13, max_exp=6, apply_maximum_capacity=False,
+        )
+        assert not domain.euler_exponents
+
+    def test_lower_bound_respected(self):
+        st = self._make_st(required={7: 4}, assigned={7: 1})
+        # current_v[7]=1, required_v[7]=4, target offset for q=7 is 0
+        # lower = max(4 - 0 - 1, 1) = 3
+        domain = _build_pending_domain(
+            st, 7, max_exp=6, apply_maximum_capacity=False,
+        )
+        # exp >= 3 even → exponents 4, 6
+        assert domain.lower_bound == 3
+        assert 2 not in domain.even_exponents
+        assert 4 in domain.even_exponents
+
+    def test_maximum_capacity_respected(self):
+        from opn_core import max_prime_capacity, even_max_exp_capacity
+        domain = _build_pending_domain(
+            ChainState(), 9973, max_exp=35, apply_maximum_capacity=True,
+        )
+        raw_cap = max_prime_capacity(9973)
+        limit = even_max_exp_capacity(raw_cap)
+        for e in domain.even_exponents:
+            assert e <= limit
+
+    def test_forced_euler_when_even_domain_empty(self):
+        st = self._make_st(required={5: 5})
+        domain = _build_pending_domain(
+            st, 5, max_exp=5, apply_maximum_capacity=False,
+        )
+        # lower = max(5-0-0, 1) = 5 → even >= 5, none ≤ max_exp=5 → forced Euler
+        assert domain.lower_bound == 5
+        assert domain.even_exponents == ()
+        assert domain.euler_exponents == (5,)
+        assert domain.forced_euler
+
+    def test_empty_domain_when_no_valid_exponents(self):
+        st = self._make_st(required={7: 100}, assigned={7: 90})
+        domain = _build_pending_domain(
+            st, 7, max_exp=6, apply_maximum_capacity=False,
+        )
+        # lower = max(100 - 0 - 90, 1) = 10 → even >= 10, no exponent ≤ max_exp=6
+        assert domain.empty
+
+    def test_pending_lower_bound_minimum_one(self):
+        st = ChainState()
+        assert _pending_lower_bound(st, 7) == 1
+
+    def test_even_exponent_boundary(self):
+        assert _first_even_exponent(1, 6) == 2
+        assert _first_even_exponent(2, 6) == 2
+        assert _first_even_exponent(3, 6) == 4
+        assert _first_even_exponent(6, 6) == 6
+        assert _first_even_exponent(7, 6) is None
+
+    def test_euler_exponent_boundary(self):
+        assert _first_euler_exponent(1, 5) == 1
+        assert _first_euler_exponent(2, 5) == 5
+        assert _first_euler_exponent(5, 5) == 5
+        assert _first_euler_exponent(6, 5) is None
+
+
+class TestDomainAwareRatio:
+    """Domain-aware mandatory ratio lower bound (Phase 6)."""
+
+    def test_single_pending_exact_ratio(self):
+        st = ChainState()
+        st.ratio_num = mpz(1)
+        st.ratio_den = mpz(1)
+        st.required_v[7] = 1
+        r = _domain_ratio_lower_bound(st, {7}, max_exp=6)
+        assert r.possible
+        # sigma(7^2)/7^2 = 57/49
+        assert r.numerator == mpz(57)
+        assert r.denominator == mpz(49)
+
+    def test_multiple_pending_all_even(self):
+        st = ChainState()
+        st.ratio_num = mpz(1)
+        st.ratio_den = mpz(1)
+        st.required_v[3] = 2
+        st.required_v[7] = 1
+        r = _domain_ratio_lower_bound(st, {3, 7}, max_exp=6)
+        assert r.possible
+
+    def test_empty_domain_returns_impossible(self):
+        st = ChainState()
+        st.ratio_num = mpz(1)
+        st.ratio_den = mpz(1)
+        st.required_v[7] = 100
+        r = _domain_ratio_lower_bound(st, {7}, max_exp=6)
+        assert not r.possible
+        assert r.reason == "empty_domain"
+
+    def test_strict_inequality_does_not_prune_exact_target(self):
+        target_num = SEARCH_MODE.target_num
+        target_den = SEARCH_MODE.target_den
+        assert not (target_num * target_den > target_num * target_den)
+
+    def test_euler_fixed_all_pending_even(self):
+        st = ChainState()
+        st.ratio_num = mpz(1)
+        st.ratio_den = mpz(1)
+        st.euler_prime = 5
+        st.required_v[7] = 1
+        r = _domain_ratio_lower_bound(st, {7}, max_exp=6)
+        assert r.possible
+        # 7^2 only (even), no Euler role available
+        assert r.numerator == mpz(57)
+        assert r.denominator == mpz(49)
+
+    def test_multiple_forced_euler_is_impossible(self):
+        st = ChainState()
+        st.ratio_num = mpz(1)
+        st.ratio_den = mpz(1)
+        st.required_v[5] = 5
+        st.required_v[13] = 5
+        r = _domain_ratio_lower_bound(st, {5, 13}, max_exp=5)
+        assert not r.possible
+        assert r.reason == "multiple_forced_euler"
+
+    def test_domain_ratio_bound_is_safe_for_all_completions(self):
+        """Brute-force: no flagged state has a valid completion, and the
+        computed lower bound is always <= any legal completion ratio."""
+        from itertools import combinations, product
+        primes = [3, 5, 7, 11, 13]
+        for pending_size in [1, 2, 3]:
+            for pending_qs in combinations(primes, pending_size):
+                st = ChainState()
+                st.ratio_num = mpz(1)
+                st.ratio_den = mpz(1)
+                for q in pending_qs:
+                    st.required_v[q] = 1
+                r = _domain_ratio_lower_bound(
+                    st, set(pending_qs), max_exp=10,
+                )
+                ranges = []
+                for q in pending_qs:
+                    evens = [e for e in range(2, 11, 2)]
+                    eulers = [e for e in [1, 5, 9] if q % 4 == 1]
+                    ranges.append(evens + eulers)
+                legal_completions = []
+                for combo in product(*ranges):
+                    # Only one Euler prime is valid in OPN form.
+                    euler_count = sum(
+                        1 for q, e in zip(pending_qs, combo) if e % 2 == 1
+                    )
+                    if euler_count > 1:
+                        continue
+                    num = mpz(1); den = mpz(1)
+                    for q, e in zip(pending_qs, combo):
+                        num *= mpz(sigma_prime_power(q, e))
+                        den *= mpz(power_pa(q, e))
+                    if (num * SEARCH_MODE.target_den
+                            <= SEARCH_MODE.target_num * den):
+                        legal_completions.append((num, den))
+                if not r.possible:
+                    assert not legal_completions, (
+                        f"false positive: {pending_qs}"
+                    )
+                else:
+                    for actual_num, actual_den in legal_completions:
+                        assert (r.numerator * actual_den
+                                <= actual_num * r.denominator), (
+                            f"bound violation: {pending_qs}"
+                        )
+                    if (r.numerator * SEARCH_MODE.target_den
+                            > SEARCH_MODE.target_num * r.denominator):
+                        assert all(
+                            actual_num * SEARCH_MODE.target_den
+                            > SEARCH_MODE.target_num * actual_den
+                            for actual_num, actual_den
+                            in legal_completions
+                        )

@@ -48,6 +48,8 @@ class PruneMechanism(str, Enum):
     INTERVAL_BOUND = "interval_bound"
     DIRECT_DOMAIN_CHECK = "direct_domain_check"
     TERMINAL_CHECK = "terminal_check"
+    ORDER_LTE_PRECHECK = "order_lte_precheck"
+    MANDATORY_RATIO_BOUND = "mandatory_ratio_bound"
 
 
 class CloneEffect(str, Enum):
@@ -361,6 +363,16 @@ class PerformanceMetrics:
     sigma_map_misses: int = 0
     sigma_map_factor_seconds: float = 0.0
 
+    q3_prepool_shadow_hits: int = 0
+    q3_prepool_shadow_exact: int = 0
+    q3_prepool_shadow_outside: int = 0
+    q3_prepool_shadow_mismatches: int = 0
+
+    q3_prepool_prunes: int = 0
+    q3_prepool_prunes_by_exp: list[int] = field(default_factory=list)
+
+    domain_ratio_would_prune: int = 0
+
     cache_sizes: dict[str, int] = field(default_factory=dict)
     memory_phases: dict[str, dict[str, int]] = field(default_factory=dict)
 
@@ -403,6 +415,8 @@ class RunMetrics:
         _extend(p.pool_misses_by_exp)
         _extend(p.cold_scans_by_exp)
         _extend(p.cold_scan_ns_by_exp)
+
+        _extend(self.performance.q3_prepool_prunes_by_exp)
 
     def record_prune(
         self,

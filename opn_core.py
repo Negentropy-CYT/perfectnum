@@ -40,10 +40,23 @@ CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 TELEMETRY_FILE   = "telemetry.txt"
 
-MAX_PRIME         = 10000000     # largest odd prime considered
-MAX_FACTORS       = 60         # max distinct prime factors in N
-MAX_EXP           = 35         # max exponent (2 = a_i=1 restriction)
-PROPAGATE         = True     # False = Descartes-spoof DFS; True = true OPN chain
+import os
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+MAX_PRIME  = _env_int("OPN_MAX_PRIME", 10_000_000)
+MAX_FACTORS = _env_int("OPN_MAX_FACTORS", 60)
+MAX_EXP    = _env_int("OPN_MAX_EXP", 35)
+PROPAGATE  = True     # False = Descartes-spoof DFS; True = true OPN chain
 PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
 ENABLE_FERMAT_DEBT = False
@@ -58,8 +71,26 @@ POOL_PLAN_DISK_CACHE_ENABLED = True
 POOL_PLAN_DISK_CACHE_DIR = "plan_cache"
 POOL_PLAN_DISK_MIN_FREE_BYTES = 2 * 1024**3
 
-PRUNING_POLICY = "baseline-v0"
 TELEMETRY_SCHEMA_VERSION = 3
+
+Q3_PREPOOL_MODE = os.getenv("OPN_Q3_PREPOOL_MODE", "enforce")
+DOMAIN_RATIO_MODE = os.getenv("OPN_DOMAIN_RATIO_MODE", "off")
+
+PENDING_SELECTION = "fifo"
+
+PRUNING_POLICY = (
+    f"q3-{Q3_PREPOOL_MODE}"
+    f"__domain-{DOMAIN_RATIO_MODE}"
+    "__pending-fifo"
+)
+
+# ── config validation (fail fast on typos) ─────────────────────
+if Q3_PREPOOL_MODE not in {"off", "shadow", "enforce"}:
+    raise ValueError(f"invalid Q3_PREPOOL_MODE: {Q3_PREPOOL_MODE!r}")
+if DOMAIN_RATIO_MODE not in {"off", "shadow", "enforce"}:
+    raise ValueError(
+        f"invalid DOMAIN_RATIO_MODE: {DOMAIN_RATIO_MODE!r}"
+    )
 POOL_ADAPTIVE_BUILD_THRESHOLD = 3
 # Incremental plans are worthwhile only when the persisted prefix represents
 # a substantial part of the current pool.  Otherwise one reusable full plan
@@ -2321,6 +2352,39 @@ def _valuation(n: int, q: int) -> int:
         value //= q
         exponent += 1
     return exponent
+
+
+def sigma_v3_valuation(p: int, exp: int) -> int:
+    """Return the exact v_3(sigma(p^exp)) for prime p via LTE.
+
+    This is an O(1) closed form; no sigma computation or factorisation.
+    """
+    if exp < 0:
+        raise ValueError("exponent must be non-negative")
+    if p < 2:
+        raise ValueError("p must be at least 2")
+
+    if p == 3:
+        return 0
+
+    n = exp + 1
+    residue = p % 3
+
+    if residue == 0:
+        # Only p == 3 can have residue 0 for prime p.
+        return 0
+
+    if residue == 1:
+        # p ≡ 1 mod 3  ⇒  v_3(σ(p^a)) = v_3(n)
+        return _valuation(n, 3)
+
+    # p ≡ -1 mod 3
+    if n % 2 == 1:
+        # n terms alternating ±1 → sum ≡ 1 (mod 3), so v_3 = 0.
+        return 0
+
+    # p ≡ -1 mod 3, n even:  v_3(σ(p^a)) = v_3(p+1) + v_3(n/2)
+    return _valuation(p + 1, 3) + _valuation(n // 2, 3)
 
 
 def _power_minus_one_valuation(p: int, d: int, q: int) -> int:

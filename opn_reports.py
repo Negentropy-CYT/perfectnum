@@ -29,6 +29,7 @@ def write_manifest(
     *,
     run_id: str,
     git_commit: str,
+    git_dirty: bool | None = None,
     started_at: str,
     config: dict,
     pruning_policy: str = "",
@@ -41,6 +42,7 @@ def write_manifest(
         "pruning_policy": pruning_policy,
         "run_id": run_id,
         "git_commit": git_commit,
+        "git_dirty": git_dirty,
         "started_at": started_at,
         "configuration": {
             "max_prime": config["max_prime"],
@@ -52,6 +54,18 @@ def write_manifest(
             "propagate": config["propagate"],
             "pool_gcd_mode": config["pool_gcd_mode"],
             "pool_fanout": config["pool_fanout"],
+            "q3_prepool_mode": config.get("q3_prepool_mode"),
+            "domain_ratio_mode": config.get("domain_ratio_mode"),
+            "pending_selection": config.get("pending_selection"),
+            "sigma_database_enabled": config.get(
+                "sigma_database_enabled"
+            ),
+            "pool_plan_build_policy": config.get(
+                "pool_plan_build_policy"
+            ),
+            "pool_plan_disk_cache_enabled": config.get(
+                "pool_plan_disk_cache_enabled"
+            ),
         },
     }
     with (run_dir / "manifest.json").open("w", encoding="utf-8") as f:
@@ -678,6 +692,13 @@ def write_performance_json(
         "ratio_upper_ns": perf.ratio_upper_ns,
         "fermat_debt_calls": perf.fermat_debt_calls,
         "fermat_debt_ns": perf.fermat_debt_ns,
+        "q3_prepool_shadow_hits": perf.q3_prepool_shadow_hits,
+        "q3_prepool_shadow_mismatches": perf.q3_prepool_shadow_mismatches,
+        "q3_prepool_shadow_exact": perf.q3_prepool_shadow_exact,
+        "q3_prepool_shadow_outside": perf.q3_prepool_shadow_outside,
+        "q3_prepool_prunes": perf.q3_prepool_prunes,
+        "q3_prepool_prunes_by_exp": list(perf.q3_prepool_prunes_by_exp),
+        "domain_ratio_would_prune": perf.domain_ratio_would_prune,
         "memory_phases": perf.memory_phases,
     }
 
@@ -732,6 +753,7 @@ def write_all_reports(
     run_dir: Path,
     run_id: str,
     git_commit: str,
+    git_dirty: bool | None = None,
     status: str,
     started_at: str = "",
     config: dict,
@@ -748,6 +770,7 @@ def write_all_reports(
         run_dir,
         run_id=run_id,
         git_commit=git_commit,
+        git_dirty=git_dirty,
         started_at=started_at,
         config=config,
         pruning_policy=pruning_policy,

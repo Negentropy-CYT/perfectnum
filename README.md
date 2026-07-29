@@ -12,11 +12,11 @@ $$\sigma(N) = 2N \qquad\text{(perfect number condition)}$$
 
 ## Quick Start
 
-> **Note:** The checked-in configuration is **experimental**
-> (`MAX_PRIME=9e9`, `MAX_FACTORS=60`, `MAX_EXP=25`).  For a first run,
-> set `MAX_PRIME = 100_000`, `MAX_FACTORS = 12`, and `MAX_EXP = 6`
-> at the top of `opn_core.py`.  See
-> [Configuration](#configuration) for safe defaults.
+> **Note:** The checked-in default search box is
+> `MAX_PRIME=10,000,000`, `MAX_FACTORS=60`, `MAX_EXP=35`.
+> Parameters can be overridden with the environment variables
+> `OPN_MAX_PRIME`, `OPN_MAX_FACTORS`, and `OPN_MAX_EXP`.
+> For a short demonstration, use `P=100,000`, `F=12`, `E=6`.
 
 ```bash
 python -m pip install -r requirements.txt
@@ -24,8 +24,6 @@ python opn_main.py
 ```
 
 **Requirements:** Python 3.10+, gmpy2, numpy, psutil.
-
-The finite search box is configured at the top of `opn_core.py`.
 See [MATHEMATICAL_CORRECTNESS.md](MATHEMATICAL_CORRECTNESS.md) before
 interpreting an exhausted search.  Exhaustion proves only that no candidate
 exists inside the configured finite box; it is not a proof that odd perfect
@@ -266,31 +264,26 @@ python opn_main.py
 
 ### Configuration
 
-Edit the constants at the top of `opn_core.py`.
-
-**Safe demonstration** (completes in seconds):
-```python
-MAX_PRIME  = 100_000; MAX_FACTORS = 12; MAX_EXP = 6
-```
-
-**Regression-validated** (observed identical search-tree and classification
-counters across implementation changes):
-```python
-MAX_PRIME  = 1_000_000_000; MAX_FACTORS = 60; MAX_EXP = 18
-```
-
-**Experimental** (large-pool feasibility only):
-```python
-MAX_PRIME  = 9_000_000_000  # requires ~4 GiB prime storage
-```
-
-The checked-in local configuration is currently:
+The checked-in defaults are:
 
 ```python
-MAX_PRIME = 9_000_000_000
+MAX_PRIME  = 10_000_000
 MAX_FACTORS = 60
-MAX_EXP = 25
+MAX_EXP    = 35
 ```
+
+They can be overridden without modifying the source:
+
+```powershell
+$env:OPN_MAX_PRIME="100000"
+$env:OPN_MAX_FACTORS="12"
+$env:OPN_MAX_EXP="6"
+python opn_main.py
+```
+
+**Safe demonstration** (completes in seconds): `P=100K F=12 E=6`.
+**Regression-validated**: `P=1B F=60 E=18`.
+**Experimental**: `P=9B F=60 E=35` (~4 GiB prime storage).
 
 `PROPAGATE=True` enables factor-chain (true-OPN) search;
 `PROPAGATE=False` runs Descartes-spoof DFS.
@@ -307,9 +300,25 @@ POOL_PLAN_DISK_CACHE_DIR = "plan_cache"
 POOL_PLAN_DISK_MIN_FREE_BYTES = 2 * 1024**3
 ENABLE_FERMAT_DEBT = False      # conservative debt-capacity bound (off)
 CHECKPOINT_INTERVAL_SECONDS = 300.0
-PRUNING_POLICY = "baseline-v0"  # identity tag in manifest.json
-TELEMETRY_SCHEMA_VERSION = 3    # per-exponent breakdowns active
+PRUNING_POLICY = (auto-generated)        # identity tag in manifest.json
+TELEMETRY_SCHEMA_VERSION = 3             # per-exponent breakdowns active
+Q3_PREPOOL_MODE = "enforce"              # off / shadow / enforce (default on)
+DOMAIN_RATIO_MODE = "off"                # off / shadow / enforce (default off)
 ```
+
+### Pruning benchmark (P=100M, F=60, E=35, cold cache, median of 3)
+
+| Strategy | Elapsed | productive_states | pool misses |
+|---|---:|---:|---:|
+| No new pruning | 32.38 s | 53,884 | 5,109 |
+| q=3 prepool (default) | 29.01 s | 53,884 | 4,634 |
+| q=3 + domain ratio | 29.32 s | 49,174 | 4,578 |
+
+q=3 reduces cold scan time ~17% and total time ~10% with identical
+search tree.  Domain ratio reduces productive states by about 9% at P=100M, but did
+not improve median wall-clock time in the current benchmark. It is
+therefore retained as an optional, default-off pruning mode, enabled
+via `OPN_DOMAIN_RATIO_MODE=enforce`.
 
 In `hierarchical` mode, plans retain only exact superblock products.  Leaf
 products are rebuilt from the immutable eligible-prime array after a positive
@@ -557,6 +566,36 @@ than relying on a separately precomputed exponent-4 table.
 `EXCLUDE_EXP_4` and its helper functions remain in `opn_core.py` for
 compatibility and focused tests, but the current production search does not
 populate or consult that specialised table.
+
+### q=3 Prepool Pruning (LTE Closed Form)
+
+Before the σ-pool analyser is invoked, the engine computes the exact
+3-adic valuation of σ(p^a) via LTE:
+
+- `p = 3` → `v_3 = 0`
+- `p ≡ 1 (mod 3)` → `v_3(a+1)`
+- `p ≡ −1 (mod 3)`, n even → `v_3(p+1) + v_3(n/2)`
+- `p ≡ −1 (mod 3)`, n odd → `v_3 = 0`
+
+If the resulting q=3 valuation debt cannot be satisfied by the current
+state (excluded, overrun, or budget), the branch is rejected in O(1)
+before any pool scan or persistent-cache lookup.  Exhaustively verified
+against direct factorisation (70,000 cases, 0 mismatches).  Enabled via
+`Q3_PREPOOL_MODE = "enforce"`; a `"shadow"` mode records would-prune
+counts without rejecting branches.
+
+q=3 counters account for ~89.8% of all valuation contradictions at the
+P=10M benchmark scale.
+
+### Domain-Aware Mandatory Ratio Lower Bound
+
+When pending primes form a non-empty obligation set, each prime must
+receive at least its minimum admissible exponent (even or Euler,
+whichever is available).  The product of their best-possible σ/p^k
+multipliers is a safe ratio lower bound.  If this bound already exceeds
+the target, no completion can exist and the branch is pruned before the
+expensive `ratio_upper_bound` check.  Enabled via
+`DOMAIN_RATIO_MODE = "enforce"`; `"shadow"` records would-prune counts.
 
 ### Precise Next-Prime Interval Bounds (Nielsen Prop. 3)
 

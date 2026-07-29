@@ -47,6 +47,7 @@ from opn_core import (
     _TOTIENT_CACHE,
     _CAPACITY_CACHE,
     _build_dynamic_leaf_product,
+    _product_prime_range,
     _typed_searchsorted_right,
     FRIEND_10_MODE,
     OPN_MODE,
@@ -55,7 +56,7 @@ from opn_core import (
     _remove_all,
     _scan_blocks_flat,
     _scan_blocks_hierarchical,
-    build_filtered_prime_pools_vectorized,
+    build_component_prime_pools_vectorized,
     build_compact_superblocks,
     build_prime_block_plan,
     build_prime_blocks,
@@ -65,6 +66,8 @@ from opn_core import (
     mpz,
     squarefree_kernel,
     check_touchard,
+    component_filter_accepts,
+    cyclotomic_sigma_components,
     euler_max_exp_capacity,
     even_max_exp_capacity,
     exp4_forced_outside_window,
@@ -810,6 +813,26 @@ class TestEarlyRatioPrune:
 # ══════════════════════════════════════════════════════════════
 
 class TestDescartesSpoof:
+    def test_spoof_dfs_does_not_apply_opn_max_prime_capacity(
+        self, small_primes, monkeypatch,
+    ):
+        def invalid_in_spoof_mode(_p):
+            raise AssertionError(
+                "OPN maximum-prime capacity used in spoof DFS"
+            )
+
+        monkeypatch.setattr(
+            "opn_search.max_prime_capacity",
+            invalid_in_spoof_mode,
+        )
+        list(search_opn(
+            small_primes,
+            max_factors=5,
+            max_exp=2,
+            metrics=RunMetrics(),
+            propagate=False,
+        ))
+
     def test_descartes_spoof_found_dfs(self, small_primes):
         """Known spoof must be found in DFS mode."""
         found = None
@@ -1603,6 +1626,218 @@ class TestCheckpoint:
         assert opn_io.load_checkpoint() is None
         assert checkpoint.exists()
 
+    @pytest.mark.parametrize(
+        "missing_key",
+        [
+            "run_id",
+            "metrics",
+            "solutions",
+            "prime_typecode",
+            "first_prime",
+            "last_prime",
+        ],
+    )
+    def test_checkpoint_rejects_fields_required_by_main(
+        self,
+        missing_key,
+        small_primes,
+        tmp_path,
+        monkeypatch,
+    ):
+        import opn_io
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        holder = {
+            "primes": small_primes,
+            "max_factors": 5,
+            "max_exp": 2,
+            "heap": [],
+            "heap_counter": 0,
+            "total_states": 1,
+            "elapsed": 0.1,
+            "use_heap": opn_io.PROPAGATE,
+        }
+        opn_io.save_checkpoint(
+            holder,
+            [],
+            run_id="test-run",
+            metrics=RunMetrics(),
+        )
+        with checkpoint.open("rb") as stream:
+            payload = pickle.load(stream)
+        payload.pop(missing_key)
+        with checkpoint.open("wb") as stream:
+            pickle.dump(payload, stream, pickle.HIGHEST_PROTOCOL)
+        before = checkpoint.read_bytes()
+
+        assert opn_io.load_checkpoint() is None
+        assert checkpoint.read_bytes() == before
+
+    def test_checkpoint_rejects_malformed_solution_entries(
+        self,
+        small_primes,
+        tmp_path,
+        monkeypatch,
+    ):
+        import opn_io
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        holder = {
+            "primes": small_primes,
+            "max_factors": 5,
+            "max_exp": 2,
+            "heap": [],
+            "heap_counter": 0,
+            "total_states": 1,
+            "elapsed": 0.1,
+            "use_heap": opn_io.PROPAGATE,
+        }
+        opn_io.save_checkpoint(
+            holder,
+            [("not-an-assignment", None, False)],
+            run_id="test-run",
+            metrics=RunMetrics(),
+        )
+
+        assert opn_io.load_checkpoint() is None
+
+    def test_main_does_not_overwrite_an_invalid_checkpoint(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+    ):
+        import opn_io
+        import opn_main
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        checkpoint.write_bytes(b"not a pickle")
+        before = checkpoint.read_bytes()
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        monkeypatch.setattr(opn_main, "CHECKPOINT_FILE", str(checkpoint))
+
+        def unexpected_prime_generation(_limit):
+            raise AssertionError("a new search must not start")
+
+        monkeypatch.setattr(
+            opn_main,
+            "generate_odd_primes",
+            unexpected_prime_generation,
+        )
+
+        opn_main.main()
+
+        assert checkpoint.read_bytes() == before
+        assert "不会启动新搜索或覆盖原文件" in capsys.readouterr().out
+
+    def test_main_resume_reports_cumulative_solutions_and_elapsed(
+        self,
+        small_primes,
+        tmp_path,
+        monkeypatch,
+    ):
+        import opn_io
+        import opn_main
+
+        checkpoint = tmp_path / "checkpoint.pkl"
+        monkeypatch.setattr(opn_io, "CHECKPOINT_FILE", str(checkpoint))
+        monkeypatch.setattr(opn_main, "CHECKPOINT_FILE", str(checkpoint))
+
+        previous_solutions = [
+            ({3: 2, 7: 2}, None, True),
+            ({5: 1, 13: 2}, 5, False),
+        ]
+        holder = {
+            "primes": small_primes,
+            "max_factors": 5,
+            "max_exp": 2,
+            "heap": [(0.0, 0, ChainState())],
+            "heap_counter": 1,
+            "states_started": 10,
+            "states_completed": 10,
+            "total_states": 10,
+            "elapsed": 120.0,
+            "use_heap": True,
+            "snapshot_id": 1,
+        }
+        opn_io.save_checkpoint(
+            holder,
+            previous_solutions,
+            run_id="resume-report-test",
+            metrics=RunMetrics(),
+        )
+
+        class FakeSampler:
+            sampled_peak_rss = 123
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def set_phase(self, _phase):
+                pass
+
+            def capture_memory_phase(self, phases, phase):
+                phases[phase] = self.capture_memory()
+
+            def capture_memory(self):
+                return {
+                    "rss_bytes": 1,
+                    "vms_bytes": 1,
+                    "sampled_peak_rss_bytes": self.sampled_peak_rss,
+                    "system_available_bytes": 1,
+                }
+
+        def fake_search(
+            _primes,
+            _max_factors,
+            _max_exp,
+            *,
+            state_holder,
+            resume_state,
+            **_kwargs,
+        ):
+            assert resume_state is not None
+            state_holder.update({
+                "total_states": resume_state["total_states"],
+                "frontier_size": 0,
+            })
+            if False:
+                yield None
+
+        captured_report = {}
+        monkeypatch.setattr(
+            opn_main,
+            "generate_odd_primes",
+            lambda _limit: small_primes,
+        )
+        monkeypatch.setattr(opn_main, "RuntimeSampler", FakeSampler)
+        monkeypatch.setattr(opn_main, "search_opn", fake_search)
+        monkeypatch.setattr(
+            opn_main,
+            "prepare_run_directory",
+            lambda _run_id: tmp_path,
+        )
+        monkeypatch.setattr(
+            opn_main,
+            "write_all_reports",
+            lambda **kwargs: captured_report.update(kwargs),
+        )
+        monkeypatch.setattr(opn_main, "_git_commit", lambda: "test")
+        monkeypatch.setattr(opn_main, "_git_dirty", lambda: False)
+
+        opn_main.main()
+
+        assert captured_report["solutions_found"] == 2
+        assert captured_report["elapsed_seconds"] >= 120.0
+
 
 # ══════════════════════════════════════════════════════════════
 # Friend-of-10 mode verification
@@ -1772,38 +2007,18 @@ class TestPoolAnalyzer:
         assert pool_perf.misses == 1
         assert pool_perf.analysis_ns > 0
 
-    def test_blocks_for_exp_matches_full_blocks(self):
-        """Filtered blocks produce identical results to full-pool analysis."""
-        from opn_core import build_prime_block_plan, _scan_blocks_flat
-
-        primes = generate_odd_primes(1000)
-        full_plan = build_prime_block_plan(
-            primes, block_size=16, superblock_fanout=4,
-            eligible_primes=list(primes), build_superblocks=False,
-        )
-        a = SigmaPoolAnalyzer(primes, block_size=16, superblock_fanout=4,
-                              gcd_mode="flat")
-        for p in generate_odd_primes(200):
-            for exp in [2, 4, 6, 8, 10, 12, 14, 16, 18]:
-                filtered_plan = a.plan_for_exp(exp)
-                # Compare full vs filtered using the flat scanner
-                r_full = analyze_with_plan(p, exp, full_plan, _scan_blocks_flat)
-                r_filt = analyze_with_plan(p, exp, filtered_plan, _scan_blocks_flat)
-                assert r_full[0] == r_filt[0]
-                assert r_full[1] == r_filt[1]
-
-    def test_even_n_reuses_single_full_plan(self):
-        """All even n share the same full-pool plan object."""
+    def test_order_two_reuses_single_full_plan(self):
+        """Every exponent with d=2 shares the master-pool component plan."""
         a = SigmaPoolAnalyzer(generate_odd_primes(500), gcd_mode="hierarchical")
-        p1 = a.plan_for_exp(1)   # n=2
-        p5 = a.plan_for_exp(5)   # n=6
-        p9 = a.plan_for_exp(9)   # n=10
+        p1 = a._plans_for_exp(1, lower_limit=None)[2]
+        p5 = a._plans_for_exp(5, lower_limit=None)[2]
+        p9 = a._plans_for_exp(9, lower_limit=None)[2]
         assert p1 is p5 is p9
 
     def test_flat_plan_does_not_build_superblocks(self):
         """Flat mode must not construct superblocks."""
         a = SigmaPoolAnalyzer(generate_odd_primes(500), gcd_mode="flat")
-        plan = a.plan_for_exp(2)  # even n → full plan
+        plan = a._plans_for_exp(2, lower_limit=None)[3]
         assert plan.superblocks == ()
 
     def test_prime_blocks_cover_compact_pool_exactly(self):
@@ -1823,7 +2038,7 @@ class TestPoolAnalyzer:
         primes = generate_odd_primes(10_000)
         a = SigmaPoolAnalyzer(primes, block_size=16, superblock_fanout=4,
                               gcd_mode="hierarchical")
-        plan = a.plan_for_exp(2)  # n=3, odd → filtered
+        plan = a._plans_for_exp(2, lower_limit=None)[3]
         # ponytail: vectorized plans use np.ndarray; the legacy path uses
         # array.array.  Both are compact (not list); int(primes[idx]) works.
         assert not isinstance(plan.primes, list)
@@ -1832,8 +2047,8 @@ class TestPoolAnalyzer:
     def test_full_plan_reuses_master_prime_array(self):
         primes = generate_odd_primes(10_000)
         a = SigmaPoolAnalyzer(primes, gcd_mode="hierarchical")
-        p1 = a.plan_for_exp(1)  # even n → full plan
-        p5 = a.plan_for_exp(5)  # even n → same full plan
+        p1 = a._plans_for_exp(1, lower_limit=None)[2]
+        p5 = a._plans_for_exp(5, lower_limit=None)[2]
         assert p1 is p5
         assert p1.primes is primes
 
@@ -1842,7 +2057,180 @@ class TestPoolAnalyzer:
 # Superblock two-level GCD screening
 # ══════════════════════════════════════════════════════════════
 
+class TestCyclotomicComponents:
+    def test_sigma_identity_for_all_small_primes_and_exponents(self):
+        primes = generate_odd_primes(2_000)
+        for p in primes:
+            for exp in range(1, 36):
+                product = mpz(1)
+                for _order, component in cyclotomic_sigma_components(
+                    int(p),
+                    exp,
+                ):
+                    product *= component
+                assert product == sigma_prime_power(int(p), exp)
+
+    def test_component_pool_matches_complete_predicate_through_100k(self):
+        primes = generate_odd_primes(100_000)
+        pools = build_component_prime_pools_vectorized(
+            primes,
+            range(2, 36),
+            chunk_primes=5_000,
+        )
+        for order in range(2, 36):
+            expected = [
+                int(q)
+                for q in primes
+                if component_filter_accepts(int(q), order)
+            ]
+            assert pools[order].tolist() == expected
+
+    @staticmethod
+    def _scalar_oracle(p, exp, primes):
+        residual = mpz(sigma_prime_power(p, exp))
+        residual, _v2 = _remove_all(residual, 2)
+        valuations = {}
+        for raw_q in primes:
+            q = int(raw_q)
+            residual, exponent = _remove_all(residual, q)
+            if exponent:
+                valuations[q] = exponent
+        return (
+            residual == 1,
+            valuations,
+            residual,
+        )
+
+    @pytest.mark.parametrize("limit", [50, 500, 5_000])
+    def test_component_scan_matches_scalar_oracle_across_windows(
+        self,
+        limit,
+    ):
+        pool = generate_odd_primes(limit)
+        analyzer = SigmaPoolAnalyzer(
+            pool,
+            gcd_mode="hierarchical",
+            plan_build_policy="after_db_miss",
+        )
+        for p in generate_odd_primes(200):
+            for exp in range(1, 36):
+                key = (int(p), exp)
+                _SIG_VALUATIONS.pop(key, None)
+                _SIG_FACTORS.pop(key, None)
+                actual = analyzer.analyze(int(p), exp)
+                expected = self._scalar_oracle(
+                    int(p),
+                    exp,
+                    pool,
+                )
+                assert actual.exact == expected[0]
+                assert actual.valuations == expected[1]
+                assert actual.residual == expected[2]
+
+    def test_shared_component_prime_valuations_are_added(self):
+        pool = generate_odd_primes(50)
+        analyzer = SigmaPoolAnalyzer(
+            pool,
+            gcd_mode="hierarchical",
+            plan_build_policy="after_db_miss",
+        )
+        _SIG_VALUATIONS.pop((5, 5), None)
+        _SIG_FACTORS.pop((5, 5), None)
+        result = analyzer.analyze(5, 5)
+        assert result.exact
+        assert result.valuations[3] == 2
+        assert result.valuations == {3: 2, 7: 1, 31: 1}
+
+    def test_100k_complete_search_is_deterministic(self):
+        snapshots = []
+        for _iteration in range(2):
+            SIGMA_CACHE.clear()
+            POWER_CACHE.clear()
+            FACTOR_CACHE.clear()
+            _SIG_VALUATIONS.clear()
+            _SIG_FACTORS.clear()
+            metrics = RunMetrics()
+            found = list(
+                search_opn(
+                    generate_odd_primes(100_000),
+                    max_factors=60,
+                    max_exp=35,
+                    metrics=metrics,
+                    propagate=True,
+                    checkpoint_interval_seconds=None,
+                    pool_plan_build_policy="eager",
+                )
+            )
+            snapshots.append(
+                (
+                    [repr(solution) for solution in found],
+                    pickle.dumps(metrics.structure, protocol=5),
+                )
+            )
+        assert snapshots[0] == snapshots[1]
+
+
 class TestSuperblockGCD:
+    @pytest.mark.parametrize("typecode", ["I", "Q"])
+    def test_product_prime_range_specializes_internal_arrays(self, typecode):
+        primes = array(typecode, [3, 5, 7, 11, 13])
+        assert _product_prime_range(primes, 1, 4) == mpz(5 * 7 * 11)
+        assert _product_prime_range(primes, 2, 2) == 1
+
+    @pytest.mark.parametrize("storage", ["ndarray32", "ndarray64", "memmap"])
+    def test_product_prime_range_preserves_numpy_conversion_path(
+        self,
+        storage,
+        tmp_path,
+    ):
+        values = [3, 5, 7, 11, 13]
+        if storage == "ndarray32":
+            primes = np.asarray(values, dtype=np.uint32)
+        elif storage == "ndarray64":
+            primes = np.asarray(values, dtype=np.uint64)
+        else:
+            path = tmp_path / "primes.u4"
+            primes = np.memmap(
+                path,
+                dtype=np.uint32,
+                mode="w+",
+                shape=(len(values),),
+            )
+            primes[:] = values
+            primes.flush()
+
+        assert _product_prime_range(primes, 1, 4) == mpz(5 * 7 * 11)
+        assert _product_prime_range(primes, 3, 3) == 1
+
+    @pytest.mark.parametrize("typecode", ["I", "Q"])
+    def test_compact_superblock_products_match_generic_sequence(
+        self,
+        typecode,
+    ):
+        values = [3, 5, 7, 11, 13, 17, 19, 23, 29, 31]
+        typed = array(typecode, values)
+        typed_result = build_compact_superblocks(
+            typed,
+            block_size=3,
+            superblock_fanout=2,
+        )
+        generic_result = build_compact_superblocks(
+            list(values),
+            block_size=3,
+            superblock_fanout=2,
+        )
+
+        typed_products = tuple(
+            (sb.start_leaf, sb.stop_leaf, int(sb.product))
+            for sb in typed_result[0]
+        )
+        generic_products = tuple(
+            (sb.start_leaf, sb.stop_leaf, int(sb.product))
+            for sb in generic_result[0]
+        )
+        assert typed_products == generic_products
+        assert typed_result[1] == generic_result[1]
+
     def test_superblocks_cover_every_leaf_once(self):
         primes = generate_odd_primes(1000)
         blocks = build_prime_blocks(primes, block_size=7)
@@ -2125,7 +2513,7 @@ class TestSuperblockGCD:
             superblock_fanout=4,
             gcd_mode="hierarchical",
         )
-        plan = analyzer.plan_for_exp(2)
+        plan = analyzer._plans_for_exp(2, lower_limit=None)[3]
 
         analyzer.analyze(3, 2)
 
@@ -2173,7 +2561,7 @@ class TestSuperblockGCD:
 
 
 class TestVectorizedPrimePlans:
-    """Tests for radical-shared, vectorized prime pool plans."""
+    """Tests for vectorized cyclotomic component prime plans."""
 
     @pytest.mark.parametrize(
         ("value", "expected"),
@@ -2192,42 +2580,27 @@ class TestVectorizedPrimePlans:
         assert squarefree_kernel(value) == expected
 
     @staticmethod
-    def _scalar_eligible(primes, n):
+    def _scalar_eligible(primes, order):
         return [
             int(q)
             for q in primes
-            if (
-                n % int(q) == 0
-                or math.gcd(int(q) - 1, n) > 1
-            )
+            if component_filter_accepts(int(q), order)
         ]
 
     @pytest.mark.parametrize("limit", [100, 1_000, 10_000, 100_000])
     def test_vectorized_filter_matches_scalar(self, limit):
         primes = generate_odd_primes(limit)
 
-        exponents = [
-            2, 4, 6, 8, 10,
-            12, 14, 16, 18,
-        ]
-
-        radicals = sorted({
-            squarefree_kernel(exp + 1)
-            for exp in exponents
-        })
-
-        outputs = build_filtered_prime_pools_vectorized(
+        orders = list(range(2, 36))
+        outputs = build_component_prime_pools_vectorized(
             primes,
-            radicals,
+            orders,
             chunk_primes=17,
         )
 
-        for exp in exponents:
-            n = exp + 1
-            radical = squarefree_kernel(n)
-
-            assert list(outputs[radical]) == (
-                self._scalar_eligible(primes, n)
+        for order in orders:
+            assert list(outputs[order]) == (
+                self._scalar_eligible(primes, order)
             )
 
     def test_exp_2_and_exp_8_share_plan(self):
@@ -2244,11 +2617,10 @@ class TestVectorizedPrimePlans:
         analyzer.prebuild_plans([2, 8])
 
         assert (
-            analyzer.plan_for_exp(2)
-            is analyzer.plan_for_exp(8)
+            analyzer._plans_for_exp(2, lower_limit=None)[3]
+            is analyzer._plans_for_exp(8, lower_limit=None)[3]
         )
-
-        assert len(analyzer._plans_by_radical) == 1
+        assert set(analyzer._component_plans) == {3, 9}
 
     def test_all_odd_exponents_share_full_plan(self):
         primes = generate_odd_primes(10_000)
@@ -2264,63 +2636,11 @@ class TestVectorizedPrimePlans:
         analyzer.prebuild_plans([1, 5, 9, 13, 17])
 
         plans = [
-            analyzer.plan_for_exp(exp)
+            analyzer._plans_for_exp(exp, lower_limit=None)[2]
             for exp in [1, 5, 9, 13, 17]
         ]
 
         assert all(plan is plans[0] for plan in plans)
-
-    def test_vectorized_filtered_plan_matches_full_plan(self):
-        primes = generate_odd_primes(20_000)
-
-        full_plan = build_prime_block_plan(
-            primes,
-            block_size=13,
-            superblock_fanout=4,
-            build_superblocks=False,
-        )
-
-        analyzer = SigmaPoolAnalyzer(
-            primes,
-            block_size=13,
-            superblock_fanout=4,
-            gcd_mode="hierarchical",
-            plan_chunk_primes=37,
-        )
-
-        exponents = [
-            1, 2, 4, 5, 6,
-            8, 9, 10, 12,
-            13, 14, 16, 17, 18,
-        ]
-
-        analyzer.prebuild_plans(exponents)
-
-        for p in list(primes)[:30]:
-            for exp in exponents:
-                expected_residual, expected_values = (
-                    analyze_with_plan(
-                        int(p),
-                        exp,
-                        full_plan,
-                        _scan_blocks_flat,
-                    )
-                )
-
-                filtered_plan = analyzer.plan_for_exp(exp)
-
-                actual_residual, actual_values = (
-                    analyze_with_plan(
-                        int(p),
-                        exp,
-                        filtered_plan,
-                        _scan_blocks_hierarchical,
-                    )
-                )
-
-                assert actual_residual == expected_residual
-                assert actual_values == expected_values
-
 
 class TestPersistentSigmaDatabase:
     @staticmethod
@@ -2359,7 +2679,11 @@ class TestPersistentSigmaDatabase:
         def forbidden_plan(*_args, **_kwargs):
             raise AssertionError("persistent hit attempted to build a plan")
 
-        monkeypatch.setattr(warm, "plan_for_exp", forbidden_plan)
+        monkeypatch.setattr(
+            warm,
+            "_plans_for_exp",
+            forbidden_plan,
+        )
         actual = warm.analyze(5, 9)
         warm.close()
 
@@ -2371,6 +2695,98 @@ class TestPersistentSigmaDatabase:
         assert warm._perf.plans_built == 0
         assert warm_structure.sigma_outside == 1
         assert warm_structure.sigma_exact == 0
+
+    def test_aggregate_partial_expands_with_cyclotomic_components(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        old_pool = generate_odd_primes(50)
+        sigma_odd = mpz(sigma_prime_power(5, 9))
+        sigma_odd, _v2 = _remove_all(sigma_odd, 2)
+        database = SigmaAnalysisDatabase(path)
+        database.store(
+            p=5,
+            exp=9,
+            exact=False,
+            scanned_limit=47,
+            pool_digest=prime_pool_prefix_digest(old_pool),
+            valuations={3: 1, 11: 1},
+            residual=mpz(71) * 521,
+            sigma_odd=sigma_odd,
+        )
+        database.close()
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        expanded_analyzer = SigmaPoolAnalyzer(
+            generate_odd_primes(100),
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        expanded = expanded_analyzer.analyze(5, 9)
+        expanded_analyzer.close()
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        fresh = SigmaPoolAnalyzer(
+            generate_odd_primes(100),
+            gcd_mode="hierarchical",
+        ).analyze(5, 9)
+        assert expanded.exact == fresh.exact
+        assert expanded.valuations == fresh.valuations
+        assert expanded.residual == fresh.residual == 521
+        assert expanded_analyzer._perf.persistent_hits == 1
+
+        _SIG_VALUATIONS.clear()
+        _SIG_FACTORS.clear()
+        warm = SigmaPoolAnalyzer(
+            generate_odd_primes(100),
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        warm_result = warm.analyze(5, 9)
+        assert warm_result.valuations == expanded.valuations
+        assert warm_result.residual == expanded.residual
+        assert warm._perf.plans_built == 0
+        warm.close()
+
+    def test_inconsistent_partial_component_restore_becomes_fresh_scan(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        sigma_odd = mpz(sigma_prime_power(5, 5))
+        sigma_odd, _v2 = _remove_all(sigma_odd, 2)
+        database = SigmaAnalysisDatabase(path)
+        database.store(
+            p=5,
+            exp=5,
+            exact=False,
+            scanned_limit=47,
+            pool_digest=prime_pool_prefix_digest(
+                generate_odd_primes(50)
+            ),
+            valuations={3: 1},
+            residual=sigma_odd // 3,
+            sigma_odd=sigma_odd,
+        )
+        database.close()
+
+        analyzer = SigmaPoolAnalyzer(
+            generate_odd_primes(100),
+            gcd_mode="hierarchical",
+            database_path=str(path),
+            plan_build_policy="after_db_miss",
+        )
+        result = analyzer.analyze(5, 5)
+        assert result.exact
+        assert result.valuations == {3: 2, 7: 1, 31: 1}
+        assert analyzer._perf.persistent_hits == 1
+        assert analyzer._perf.cold_scans == 1
+        analyzer.close()
 
     def test_exact_record_is_window_independent(
         self,
@@ -2397,7 +2813,11 @@ class TestPersistentSigmaDatabase:
         def forbidden_plan(*_args, **_kwargs):
             raise AssertionError("exact persistent hit built a plan")
 
-        monkeypatch.setattr(small, "plan_for_exp", forbidden_plan)
+        monkeypatch.setattr(
+            small,
+            "_plans_for_exp",
+            forbidden_plan,
+        )
         result = small.analyze(3, 2)
         small.close()
 
@@ -2446,9 +2866,13 @@ class TestPersistentSigmaDatabase:
         assert incremental.residual == fresh.residual == 521
         assert incremental.valuations == {3: 1, 11: 1, 71: 1}
         assert expanded._perf.persistent_hits == 1
-        assert expanded._perf.plans_built == 1
-        interval_plan = next(iter(expanded._interval_plans.values()))
-        assert int(interval_plan.primes[0]) > 47
+        assert expanded._perf.plans_built == 3
+        assert expanded._component_interval_plans
+        assert all(
+            int(plan.primes[0]) > 47
+            for plan in expanded._component_interval_plans.values()
+            if len(plan.primes)
+        )
 
     def test_full_plan_supersedes_resident_interval_plan(
         self,
@@ -2471,14 +2895,14 @@ class TestPersistentSigmaDatabase:
             plan_build_policy="after_db_miss",
         )
         expanded.analyze(5, 9)
-        assert expanded._interval_plans
+        assert expanded._component_interval_plans
 
         # This key is absent from the database and needs the same full plan.
         expanded.analyze(7, 9)
         expanded.close()
 
-        assert expanded._full_plan is not None
-        assert not expanded._interval_plans
+        assert {2, 5, 10}.issubset(expanded._component_plans)
+        assert not expanded._component_interval_plans
 
     def test_persisted_residual_uses_suffix_of_cached_full_plan(
         self,
@@ -2505,14 +2929,15 @@ class TestPersistentSigmaDatabase:
             database_path=str(path),
             plan_build_policy="after_db_miss",
         )
-        full_plan = expanded.plan_for_exp(9)
-        assert full_plan is expanded._full_plan
+        full_plan = expanded._plans_for_exp(
+            9,
+            lower_limit=None,
+        )[2]
 
         actual = expanded.analyze(5, 9)
         old_limit = 47
-        start_leaf = expanded._scan_start_leaf(
+        start_leaf = expanded._component_scan_start_leaf(
             full_plan,
-            9,
             old_limit,
         )
         expanded.close()
@@ -2525,7 +2950,7 @@ class TestPersistentSigmaDatabase:
         ).analyze(5, 9)
 
         assert start_leaf > 0
-        assert not expanded._interval_plans
+        assert not expanded._component_interval_plans
         assert (
             expanded._perf.candidate_leaf_blocks
             < full_plan.leaf_block_count
@@ -2555,8 +2980,8 @@ class TestPersistentSigmaDatabase:
         expanded.analyze(5, 9)
         expanded.close()
 
-        assert expanded._full_plan is not None
-        assert not expanded._interval_plans
+        assert {2, 5, 10}.issubset(expanded._component_plans)
+        assert not expanded._component_interval_plans
 
     @pytest.mark.parametrize(
         ("p", "exp"),
@@ -2645,7 +3070,7 @@ class TestPersistentSigmaDatabase:
         assert actual.residual == expected.residual
         assert warm._perf.persistent_invalid == 1
         assert warm._perf.persistent_misses == 1
-        assert warm._perf.plans_built == 1
+        assert warm._perf.plans_built == 3
 
     def test_pool_digest_mismatch_is_a_normal_miss(
         self,
@@ -2676,7 +3101,7 @@ class TestPersistentSigmaDatabase:
         assert incompatible._perf.persistent_hits == 0
         assert incompatible._perf.persistent_misses == 1
         assert incompatible._perf.persistent_invalid == 0
-        assert incompatible._perf.plans_built == 1
+        assert incompatible._perf.plans_built == 3
 
     def test_database_store_rejects_wrong_arithmetic(
         self,
@@ -2707,16 +3132,11 @@ class TestPersistentSigmaDatabase:
         )
         analyzer.configure_plan_build([1, 2, 4, 5])
 
-        analyzer.plan_for_exp(1)
-        assert analyzer._full_plan is not None
-        assert len(analyzer._plans_by_radical) == 0
+        analyzer._plans_for_exp(1, lower_limit=None)
+        assert set(analyzer._component_plans) == {2}
 
-        analyzer.plan_for_exp(2)
-        required_radicals = {
-            squarefree_kernel(exp + 1)
-            for exp in [2, 4]
-        }
-        assert set(analyzer._plans_by_radical) == required_radicals
+        analyzer._plans_for_exp(2, lower_limit=None)
+        assert set(analyzer._component_plans) == {2, 3, 5, 6}
 
     def test_search_stable_boundary_flushes_database(
         self,
@@ -2743,6 +3163,27 @@ class TestPersistentSigmaDatabase:
         ).fetchone()[0]
         connection.close()
         assert count > 0
+
+    def test_completed_search_releases_sigma_database_file(
+        self,
+        tmp_path,
+    ):
+        path = self._database_path(tmp_path)
+        list(
+            search_opn(
+                generate_odd_primes(50),
+                max_factors=5,
+                max_exp=2,
+                metrics=RunMetrics(),
+                propagate=True,
+                checkpoint_interval_seconds=None,
+                sigma_database_path=str(path),
+                pool_plan_build_policy="after_db_miss",
+            )
+        )
+        moved = path.with_suffix(".moved")
+        path.rename(moved)
+        moved.rename(path)
 
 
 class TestPersistentPlanCache:
@@ -2779,12 +3220,15 @@ class TestPersistentPlanCache:
             gcd_mode="hierarchical",
             plan_build_policy="after_db_miss",
         )
-        reference = reference_analyzer.plan_for_exp(2)
+        reference = reference_analyzer._plans_for_exp(
+            2,
+            lower_limit=None,
+        )[3]
         expected_primes = np.asarray(reference.primes).copy()
         expected_products = self._products(reference)
 
         cold = self._analyzer(primes, cache_dir)
-        cold_plan = cold.plan_for_exp(2)
+        cold_plan = cold._plans_for_exp(2, lower_limit=None)[3]
         assert isinstance(cold_plan.primes, np.memmap)
         assert not cold_plan.primes.flags.writeable
         assert np.array_equal(cold_plan.primes, expected_primes)
@@ -2794,7 +3238,7 @@ class TestPersistentPlanCache:
         cold.close()
 
         warm = self._analyzer(primes, cache_dir)
-        warm_plan = warm.plan_for_exp(2)
+        warm_plan = warm._plans_for_exp(2, lower_limit=None)[3]
         assert isinstance(warm_plan.primes, np.memmap)
         assert not warm_plan.primes.flags.writeable
         assert np.array_equal(warm_plan.primes, expected_primes)
@@ -2813,16 +3257,16 @@ class TestPersistentPlanCache:
         primes = generate_odd_primes(5_000)
         cache_dir = tmp_path / "plans"
         cold = self._analyzer(primes, cache_dir)
-        cold_plan = cold.plan_for_exp(1)
+        cold_plan = cold._plans_for_exp(1, lower_limit=None)[2]
         products = self._products(cold_plan)
-        key = cold._disk_plan_key(0, source_start=0)
+        key = cold._disk_plan_key(2, source_start=0)
         entry = cold._plan_cache.entry_path(key)
         assert entry.is_dir()
         assert not (entry / "primes.bin").exists()
         cold.close()
 
         warm = self._analyzer(primes, cache_dir)
-        warm_plan = warm.plan_for_exp(1)
+        warm_plan = warm._plans_for_exp(1, lower_limit=None)[2]
         assert warm_plan.primes is primes
         assert self._products(warm_plan) == products
         assert warm._perf.disk_plan_hits == 1
@@ -2836,7 +3280,7 @@ class TestPersistentPlanCache:
         primes = generate_odd_primes(8_000)
         cache_dir = tmp_path / "plans"
         cold = self._analyzer(primes, cache_dir)
-        expected = cold.plan_for_exp(2)
+        expected = cold._plans_for_exp(2, lower_limit=None)[3]
         expected_primes = np.asarray(expected.primes).copy()
         expected_products = self._products(expected)
         key = cold._disk_plan_key(3, source_start=0)
@@ -2850,7 +3294,7 @@ class TestPersistentPlanCache:
             handle.write(bytes([first[0] ^ 0xFF]))
 
         rebuilt = self._analyzer(primes, cache_dir)
-        plan = rebuilt.plan_for_exp(2)
+        plan = rebuilt._plans_for_exp(2, lower_limit=None)[3]
         assert rebuilt._perf.disk_plan_invalid == 1
         assert rebuilt._perf.disk_plan_writes == 1
         assert np.array_equal(plan.primes, expected_primes)
@@ -2864,9 +3308,9 @@ class TestPersistentPlanCache:
         primes = generate_odd_primes(8_000)
         cache_dir = tmp_path / "plans"
         cold = self._analyzer(primes, cache_dir)
-        expected = cold.plan_for_exp(1)
+        expected = cold._plans_for_exp(1, lower_limit=None)[2]
         expected_products = self._products(expected)
-        key = cold._disk_plan_key(0, source_start=0)
+        key = cold._disk_plan_key(2, source_start=0)
         entry = cold._plan_cache.entry_path(key)
         cold.close()
 
@@ -2875,7 +3319,7 @@ class TestPersistentPlanCache:
             handle.write(b"\0")
 
         rebuilt = self._analyzer(primes, cache_dir)
-        plan = rebuilt.plan_for_exp(1)
+        plan = rebuilt._plans_for_exp(1, lower_limit=None)[2]
         assert rebuilt._perf.disk_plan_invalid == 1
         assert rebuilt._perf.disk_plan_writes == 1
         assert self._products(plan) == expected_products
@@ -2889,13 +3333,14 @@ class TestPersistentPlanCache:
         cache_dir = tmp_path / "plans"
         analyzer = self._analyzer(primes, cache_dir)
 
-        interval = analyzer._interval_plan_for_exp(
+        interval = analyzer._plans_for_exp(
             2,
             lower_limit=7_000,
-        )
-        full = analyzer.plan_for_exp(2)
-        assert len(interval.primes) < len(full.primes)
+        )[3]
+        interval_count = len(interval.primes)
         assert all(int(q) > 7_000 for q in interval.primes)
+        full = analyzer._plans_for_exp(2, lower_limit=None)[3]
+        assert interval_count < len(full.primes)
         assert analyzer._perf.disk_plan_misses == 2
         assert analyzer._perf.disk_plan_writes == 2
 
@@ -2921,7 +3366,7 @@ class TestPersistentPlanCache:
             plan_cache_minimum_free_bytes=10**30,
             plan_build_policy="after_db_miss",
         )
-        plan = analyzer.plan_for_exp(2)
+        plan = analyzer._plans_for_exp(2, lower_limit=None)[3]
         assert not isinstance(plan.primes, np.memmap)
         assert analyzer.plan_cache_error is not None
         assert analyzer._perf.disk_plan_writes == 0
@@ -2959,7 +3404,7 @@ class TestPersistentPlanCache:
         primes = generate_odd_primes(3_000)
         cache_dir = tmp_path / "plans"
         analyzer = self._analyzer(primes, cache_dir)
-        analyzer.plan_for_exp(2)
+        analyzer._plans_for_exp(2, lower_limit=None)
         analyzer.close()
 
         # Recursive removal fails on Windows if a mapped file is still open.
@@ -2967,6 +3412,159 @@ class TestPersistentPlanCache:
 
         shutil.rmtree(cache_dir)
         assert not cache_dir.exists()
+
+    def test_component_plans_cold_build_warm_load_and_key_isolation(
+        self,
+        tmp_path,
+    ):
+        primes = generate_odd_primes(10_000)
+        cache_dir = tmp_path / "component-plans"
+        cold = self._analyzer(
+            primes,
+            cache_dir,
+        )
+        cold.configure_plan_build([5])
+        cold_plans = cold._plans_for_exp(
+            5,
+            lower_limit=None,
+        )
+        expected = {
+            order: (
+                np.asarray(plan.primes).copy(),
+                self._products(plan),
+            )
+            for order, plan in cold_plans.items()
+        }
+        assert set(cold_plans) == {2, 3, 6}
+        assert isinstance(cold_plans[3].primes, np.memmap)
+        component_key = cold._disk_plan_key(
+            3,
+            source_start=0,
+        )
+        assert component_key.filter_kind == "component"
+        assert component_key.filter_order == 3
+        cold.close()
+
+        warm = self._analyzer(
+            primes,
+            cache_dir,
+        )
+        warm.configure_plan_build([5])
+        warm_plans = warm._plans_for_exp(
+            5,
+            lower_limit=None,
+        )
+        assert warm._perf.disk_plan_hits == 3
+        assert warm._perf.disk_plan_writes == 0
+        assert warm._perf.plans_built == 0
+        for order, plan in warm_plans.items():
+            expected_primes, expected_products = expected[order]
+            assert np.array_equal(plan.primes, expected_primes)
+            assert self._products(plan) == expected_products
+        warm.close()
+
+    def test_corrupt_component_plan_is_rebuilt(self, tmp_path):
+        primes = generate_odd_primes(8_000)
+        cache_dir = tmp_path / "component-plans"
+        cold = self._analyzer(
+            primes,
+            cache_dir,
+        )
+        plans = cold._plans_for_exp(
+            5,
+            lower_limit=None,
+        )
+        expected = np.asarray(plans[3].primes).copy()
+        key = cold._disk_plan_key(
+            3,
+            source_start=0,
+        )
+        entry = cold._plan_cache.entry_path(key)
+        cold.close()
+
+        with (entry / "primes.bin").open("r+b") as handle:
+            first = handle.read(1)
+            handle.seek(0)
+            handle.write(bytes([first[0] ^ 0xFF]))
+
+        rebuilt = self._analyzer(
+            primes,
+            cache_dir,
+        )
+        rebuilt_plans = rebuilt._plans_for_exp(
+            5,
+            lower_limit=None,
+        )
+        assert rebuilt._perf.disk_plan_invalid == 1
+        assert np.array_equal(rebuilt_plans[3].primes, expected)
+        rebuilt.close()
+
+    def test_component_disk_space_failure_uses_memory(self, tmp_path):
+        analyzer = SigmaPoolAnalyzer(
+            generate_odd_primes(5_000),
+            block_size=16,
+            superblock_fanout=4,
+            gcd_mode="hierarchical",
+            plan_cache_dir=str(tmp_path / "plans"),
+            plan_cache_minimum_free_bytes=10**30,
+            plan_build_policy="after_db_miss",
+        )
+        plans = analyzer._plans_for_exp(
+            5,
+            lower_limit=None,
+        )
+        assert not isinstance(plans[3].primes, np.memmap)
+        assert analyzer.plan_cache_error is not None
+        analyzer.close()
+
+    def test_interrupted_component_build_leaves_no_visible_entry(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import opn_core
+
+        primes = generate_odd_primes(5_000)
+        cache_dir = tmp_path / "plans"
+        analyzer = self._analyzer(
+            primes,
+            cache_dir,
+        )
+        original = (
+            opn_core.build_component_prime_pools_vectorized_memmap
+        )
+
+        def interrupted(*_args, **_kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            opn_core,
+            "build_component_prime_pools_vectorized_memmap",
+            interrupted,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            analyzer._plans_for_exp(
+                5,
+                lower_limit=None,
+            )
+        assert not list(cache_dir.glob("*.tmp-*"))
+        analyzer.close()
+
+        monkeypatch.setattr(
+            opn_core,
+            "build_component_prime_pools_vectorized_memmap",
+            original,
+        )
+        retry = self._analyzer(
+            primes,
+            cache_dir,
+        )
+        plans = retry._plans_for_exp(
+            5,
+            lower_limit=None,
+        )
+        assert set(plans) == {2, 3, 6}
+        retry.close()
 
 
 class TestSigmaV3Valuation:

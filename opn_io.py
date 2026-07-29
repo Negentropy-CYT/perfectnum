@@ -10,16 +10,13 @@ import json
 import math
 import os
 import pickle
-import sys
-import time
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
 
-from gmpy2 import is_prime, mpz
+from gmpy2 import mpz
 
 from opn_core import (
     CHECKPOINT_FILE,
-    MAX_PRIME,
     PROPAGATE,
     SEARCH_MODE,
     SOLUTIONS_FILE,
@@ -29,15 +26,15 @@ from opn_core import (
     power_pa,
     sigma_prime_power,
 )
-from opn_state import ChainState, DFSState, validate_chain_state
+from opn_state import ChainState, validate_chain_state
 
 
-CHECKPOINT_FORMAT_VERSION = 4  # observability refactor: RunMetrics payload
+CHECKPOINT_FORMAT_VERSION = 4
 
 
 # ── display ───────────────────────────────────────────────────
 def display_solution(st, sol_num: int, elapsed: float) -> None:
-    """Print a single candidate (true OPN or Descartes spoof) to stdout."""
+    """Print one Euler-form or restricted Descartes-type candidate."""
     if st.spoof:
         _display_spoof(st, sol_num, elapsed)
     else:
@@ -60,7 +57,7 @@ def display_solution(st, sol_num: int, elapsed: float) -> None:
 
 
 def _display_spoof(st, sol_num: int, elapsed: float) -> None:
-    """Print a Descartes spoof with its composite r-factor."""
+    """Print a restricted Descartes-type candidate and its derived r-factor."""
     denom = 2 * st.ratio_den - st.ratio_num
     r = st.ratio_num // denom
     n_val = mpz(r)
@@ -70,12 +67,12 @@ def _display_spoof(st, sol_num: int, elapsed: float) -> None:
     r_str = " × ".join(f"{q}^{e}" for q, e in r_facs)
 
     print(f"\n{'=' * 60}")
-    print(f"*** Descartes Spoof  #{sol_num} ***")
+    print(f"*** Descartes-Type Candidate  #{sol_num} ***")
     print(f"  N              = {n_val}")
     print(f"  log10(N)       = {math.log10(int(n_val)):.1f}")
     print(f"  digits         = {len(str(n_val))}")
     print(f"  |factors|      = {len(st.assigned)} + r")
-    print(f"  r (composite)  = {r}  =  {r_str}")
+    print(f"  r (derived)    = {r}  =  {r_str}")
     print(f"  r ≡ 1 mod 4    = {r % 4 == 1}")
     res = getattr(st, 'resonance', 0.0)
     print(f"  resonance      = {res:+.2f}")
@@ -142,7 +139,7 @@ def save_checkpoint(
     run_id: str = "",
     metrics = None,
 ) -> None:
-    """Atomically persist search state + solutions + RunMetrics to disk (v4)."""
+    """Atomically persist search state, solutions, and metrics."""
     primes = state_holder.get("primes", [])
     chk = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -206,7 +203,6 @@ def load_checkpoint() -> Optional[dict]:
     return chk
 
 
-# ── factor graph export ───────────────────────────────────────
 # ── factor graph export ───────────────────────────────────────
 
 def export_factor_graph(st, path: str = "factor_graph") -> None:
@@ -298,7 +294,9 @@ def validate_checkpoint(chk: dict) -> List[str]:
     issues: List[str] = []
 
     required_keys = [
-        "format_version", "search_mode", "prime_limit", "prime_count",
+        "format_version", "run_id", "search_mode", "metrics", "solutions",
+        "prime_limit", "prime_count", "prime_typecode",
+        "first_prime", "last_prime",
         "max_factors", "max_exp",
         "heap", "total_states", "elapsed", "use_heap",
     ]
@@ -308,6 +306,22 @@ def validate_checkpoint(chk: dict) -> List[str]:
 
     if issues:
         return issues  # structural damage, stop early
+
+    if not isinstance(chk["run_id"], str):
+        issues.append("run_id must be a string")
+    if not isinstance(chk["metrics"], dict):
+        issues.append("metrics must be a dictionary")
+    solutions = chk["solutions"]
+    if not isinstance(solutions, list):
+        issues.append("solutions must be a list")
+    elif any(
+        not isinstance(item, (list, tuple))
+        or len(item) != 3
+        or not isinstance(item[0], dict)
+        or not isinstance(item[2], bool)
+        for item in solutions
+    ):
+        issues.append("solutions contains a malformed entry")
 
     if chk["format_version"] != CHECKPOINT_FORMAT_VERSION:
         issues.append(
@@ -319,7 +333,7 @@ def validate_checkpoint(chk: dict) -> List[str]:
     if bool(chk["use_heap"]) != bool(PROPAGATE):
         issues.append("PROPAGATE mode differs from the saved search strategy")
 
-    # v4: prime fingerprint validation (no full array in checkpoint)
+    # The prime array is regenerated and checked from saved metadata.
     if chk.get("prime_limit", 0) < 3:
         issues.append("prime_limit must be >= 3")
     if chk.get("prime_count", 0) <= 0:

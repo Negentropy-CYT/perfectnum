@@ -38,26 +38,11 @@ if TYPE_CHECKING:
 # ── configuration ─────────────────────────────────────────────
 CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
-TELEMETRY_FILE   = "telemetry.txt"
 
-import os
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = int(raw)
-    if value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-MAX_PRIME  = _env_int("OPN_MAX_PRIME", 10_000_000)
-MAX_FACTORS = _env_int("OPN_MAX_FACTORS", 60)
-MAX_EXP    = _env_int("OPN_MAX_EXP", 35)
+MAX_PRIME         = 20_000_000_000  # largest odd prime considered
+MAX_FACTORS       = 61          # max distinct prime factors in N
+MAX_EXP           = 35          # max exponent
 PROPAGATE  = True     # False = Descartes-spoof DFS; True = true OPN chain
-PROGRESS_INTERVAL = 1_000
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
 ENABLE_FERMAT_DEBT = False
 POOL_GCD_MODE = "hierarchical"          # "flat" or "hierarchical"
@@ -73,8 +58,8 @@ POOL_PLAN_DISK_MIN_FREE_BYTES = 2 * 1024**3
 
 TELEMETRY_SCHEMA_VERSION = 3
 
-Q3_PREPOOL_MODE = os.getenv("OPN_Q3_PREPOOL_MODE", "enforce")
-DOMAIN_RATIO_MODE = os.getenv("OPN_DOMAIN_RATIO_MODE", "off")
+Q3_PREPOOL_MODE = "enforce"
+DOMAIN_RATIO_MODE = "off"
 
 PENDING_SELECTION = "fifo"
 
@@ -269,6 +254,94 @@ def squarefree_kernel(value: int) -> int:
     return result
 
 
+@lru_cache(maxsize=None)
+def divisors(value: int) -> Tuple[int, ...]:
+    """Return the positive divisors of *value* in increasing order."""
+    if value < 1:
+        raise ValueError("value must be positive")
+    lower = []
+    upper = []
+    for candidate in range(1, math.isqrt(value) + 1):
+        if value % candidate:
+            continue
+        lower.append(candidate)
+        partner = value // candidate
+        if partner != candidate:
+            upper.append(partner)
+    return tuple(lower + list(reversed(upper)))
+
+
+def cyclotomic_sigma_components(
+    p: int,
+    exp: int,
+) -> Tuple[Tuple[int, mpz], ...]:
+    """Return exact ``(d, Phi_d(p))`` factors of ``sigma(p**exp)``.
+
+    Values are computed by the divisor recurrence
+    ``p**d - 1 = product(Phi_c(p), c | d)``.  Every division is checked and
+    the final product is checked against the existing sigma implementation.
+    """
+    if p < 2:
+        raise ValueError("p must be at least 2")
+    if exp < 1:
+        raise ValueError("exponent must be positive")
+
+    n = exp + 1
+    values: Dict[int, mpz] = {}
+    for order in divisors(n):
+        value = mpz(p) ** order - 1
+        for proper in divisors(order):
+            if proper == order:
+                break
+            factor = values[proper]
+            quotient, remainder = divmod(value, factor)
+            if remainder:
+                raise ArithmeticError(
+                    "cyclotomic recurrence produced a non-exact division"
+                )
+            value = quotient
+        if value < 1:
+            raise ArithmeticError(
+                "cyclotomic recurrence produced a non-positive value"
+            )
+        values[order] = value
+
+    components = tuple(
+        (order, values[order])
+        for order in divisors(n)
+        if order > 1
+    )
+    reconstructed = mpz(1)
+    for _order, value in components:
+        reconstructed *= value
+    if reconstructed != sigma_prime_power(p, exp):
+        raise ArithmeticError(
+            "cyclotomic components do not reconstruct sigma"
+        )
+    return components
+
+
+def _odd_cyclotomic_sigma_components(
+    p: int,
+    exp: int,
+) -> Tuple[Tuple[int, mpz], ...]:
+    """Return cyclotomic components with each component's 2-part removed."""
+    result = []
+    for order, value in cyclotomic_sigma_components(p, exp):
+        odd, _v2 = _remove_all(mpz(value), 2)
+        result.append((order, odd))
+    return tuple(result)
+
+
+def component_filter_accepts(q: int, order: int) -> bool:
+    """Return whether *q* is in the complete necessary pool for Phi_order."""
+    if q < 3 or q % 2 == 0:
+        raise ValueError("q must be an odd integer at least 3")
+    if order < 2:
+        raise ValueError("cyclotomic order must be at least 2")
+    return (q - 1) % order == 0 or order % q == 0
+
+
 def _numpy_prime_view(
     primes: Sequence[int],
 ) -> Tuple[np.ndarray, np.dtype]:
@@ -458,312 +531,157 @@ def prime_pool_prefix_digest(
     return digest.digest()
 
 
-def _factor_masks_for_chunk(
+def _component_mask_for_chunk(
     prime_chunk: np.ndarray,
-    factors: Tuple[int, ...],
-) -> Dict[int, np.ndarray]:
-    """Build the necessary-order mask for each small factor.
-
-    For one factor ell, the mask represents:
-
-        q == ell  or  q ≡ 1 (mod ell)
-
-    The first case covers q | n; the second covers ell | gcd(q-1, n).
-    """
-    q_minus_one = np.empty_like(prime_chunk)
-    np.subtract(prime_chunk, 1, out=q_minus_one)
-
+    order: int,
+) -> np.ndarray:
+    """Return ``q == prime divisor of d or q == 1 (mod d)`` for one order."""
     remainders = np.empty_like(prime_chunk)
-    temporary = np.empty(prime_chunk.shape, dtype=np.bool_)
-
-    masks: Dict[int, np.ndarray] = {}
-
-    for factor in factors:
-        mask = np.empty(prime_chunk.shape, dtype=np.bool_)
-
-        # q divides n. Since q is prime, q must equal one of rad(n)'s factors.
-        np.equal(prime_chunk, factor, out=mask)
-
-        # factor divides q - 1.
-        np.remainder(
-            q_minus_one,
-            factor,
-            out=remainders,
-        )
-        np.equal(
-            remainders,
-            0,
-            out=temporary,
-        )
+    np.remainder(prime_chunk, order, out=remainders)
+    mask = np.equal(remainders, 1)
+    for exception in distinct_prime_factors(order):
+        if exception == 2:
+            continue
         np.logical_or(
             mask,
-            temporary,
+            np.equal(prime_chunk, exception),
             out=mask,
         )
-
-        masks[factor] = mask
-
-    return masks
+    return mask
 
 
-def _mask_for_factors(
-    factor_masks: Dict[int, np.ndarray],
-    factors: Tuple[int, ...],
-) -> np.ndarray:
-    """Combine factor masks for one radical's prime factors."""
-    if len(factors) == 1:
-        return factor_masks[factors[0]]
-
-    result = factor_masks[factors[0]].copy()
-
-    for factor in factors[1:]:
-        np.logical_or(
-            result,
-            factor_masks[factor],
-            out=result,
-        )
-
-    return result
-
-
-def build_filtered_prime_pools_vectorized(
+def build_component_prime_pools_vectorized(
     primes: Sequence[int],
-    radicals: Sequence[int],
+    orders: Sequence[int],
     *,
     chunk_primes: int = POOL_PLAN_CHUNK_PRIMES,
     pool_perf: "PoolPerformance | None" = None,
 ) -> Dict[int, np.ndarray]:
-    """Build every requested radical-filtered pool in two chunked passes.
-
-    Pass 1 counts exact output lengths.
-    Pass 2 fills preallocated arrays.
-
-    No repeated np.concatenate() is used, so output construction is linear
-    and temporary memory depends on chunk_primes rather than MAX_PRIME.
-    """
+    """Build exact necessary-order pools for cyclotomic components."""
     if chunk_primes <= 0:
         raise ValueError("chunk_primes must be positive")
-
-    radical_keys = tuple(
-        sorted(set(int(value) for value in radicals))
-    )
-
-    if not radical_keys:
+    order_keys = tuple(sorted(set(int(order) for order in orders)))
+    if any(order < 2 for order in order_keys):
+        raise ValueError("cyclotomic orders must be at least 2")
+    if not order_keys:
         return {}
-
-    factors_by_radical = {
-        radical: distinct_prime_factors(radical)
-        for radical in radical_keys
-    }
-
-    all_factors = tuple(
-        sorted({
-            factor
-            for factors in factors_by_radical.values()
-            for factor in factors
-        })
-    )
 
     prime_view, dtype = _numpy_prime_view(primes)
     source_count = len(prime_view)
+    counts = {order: 0 for order in order_keys}
 
-    counts = {
-        radical: 0
-        for radical in radical_keys
-    }
-
-    # ── pass 1: count exact output lengths ────────────────────
     count_started = time.perf_counter_ns()
-
     for start in range(0, source_count, chunk_primes):
         stop = min(start + chunk_primes, source_count)
         chunk = prime_view[start:stop]
-
-        factor_masks = _factor_masks_for_chunk(
-            chunk,
-            all_factors,
-        )
-
-        for radical in radical_keys:
-            factors = factors_by_radical[radical]
-            mask = _mask_for_factors(
-                factor_masks,
-                factors,
+        for order in order_keys:
+            counts[order] += int(
+                np.count_nonzero(
+                    _component_mask_for_chunk(chunk, order)
+                )
             )
-
-            counts[radical] += int(
-                np.count_nonzero(mask)
-            )
-
     count_ns = time.perf_counter_ns() - count_started
 
-    # Allocate final arrays exactly once.
     outputs = {
-        radical: np.empty(
-            counts[radical],
-            dtype=dtype,
-        )
-        for radical in radical_keys
+        order: np.empty(counts[order], dtype=dtype)
+        for order in order_keys
     }
-
-    positions = {
-        radical: 0
-        for radical in radical_keys
-    }
-
-    # ── pass 2: fill exact-size outputs ───────────────────────
+    positions = {order: 0 for order in order_keys}
     fill_started = time.perf_counter_ns()
-
     for start in range(0, source_count, chunk_primes):
         stop = min(start + chunk_primes, source_count)
         chunk = prime_view[start:stop]
-
-        factor_masks = _factor_masks_for_chunk(
-            chunk,
-            all_factors,
-        )
-
-        for radical in radical_keys:
-            factors = factors_by_radical[radical]
-            mask = _mask_for_factors(
-                factor_masks,
-                factors,
-            )
-
-            selected = chunk[mask]
-            selected_count = len(selected)
-
-            destination_start = positions[radical]
-            destination_stop = (
-                destination_start + selected_count
-            )
-
-            outputs[radical][
-                destination_start:destination_stop
-            ] = selected
-
-            positions[radical] = destination_stop
-
+        for order in order_keys:
+            selected = chunk[
+                _component_mask_for_chunk(chunk, order)
+            ]
+            destination_start = positions[order]
+            destination_stop = destination_start + len(selected)
+            outputs[order][destination_start:destination_stop] = selected
+            positions[order] = destination_stop
     fill_ns = time.perf_counter_ns() - fill_started
 
-    for radical in radical_keys:
-        if positions[radical] != counts[radical]:
+    for order in order_keys:
+        if positions[order] != counts[order]:
             raise RuntimeError(
-                f"filtered-plan fill mismatch for rad={radical}: "
-                f"{positions[radical]} != {counts[radical]}"
+                f"component-plan fill mismatch for order={order}: "
+                f"{positions[order]} != {counts[order]}"
             )
 
     if pool_perf is not None:
         pool_perf.plan_filter_count_ns += count_ns
         pool_perf.plan_filter_fill_ns += fill_ns
         pool_perf.plan_filter_ns += count_ns + fill_ns
-
-        pool_perf.plan_filter_source_values += (
-            2 * source_count
-        )
-        pool_perf.filtered_prime_values += sum(
-            counts.values()
-        )
+        pool_perf.plan_filter_source_values += 2 * source_count
+        pool_perf.filtered_prime_values += sum(counts.values())
         pool_perf.filtered_prime_bytes += sum(
-            output.nbytes
-            for output in outputs.values()
+            output.nbytes for output in outputs.values()
         )
-
     return outputs
 
 
-def build_filtered_prime_pools_vectorized_memmap(
+def build_component_prime_pools_vectorized_memmap(
     primes: Sequence[int],
     builds: Dict[int, PlanCacheBuild],
     *,
     chunk_primes: int = POOL_PLAN_CHUNK_PRIMES,
     pool_perf: "PoolPerformance | None" = None,
 ) -> Dict[int, int]:
-    """Filter several radical pools directly into cache-owned mmap files.
-
-    This is the same two-pass necessary-order filter as
-    :func:`build_filtered_prime_pools_vectorized`, but the exact-sized outputs
-    are disk-backed from their creation.  All radicals still share both source
-    passes, avoiding one full traversal per exponent class.
-    """
+    """Build component pools directly into cache-owned mmap arrays."""
     if chunk_primes <= 0:
         raise ValueError("chunk_primes must be positive")
-    radical_keys = tuple(sorted(builds))
-    if not radical_keys:
+    order_keys = tuple(sorted(builds))
+    if any(order < 3 for order in order_keys):
+        raise ValueError("mmap component filters require order >= 3")
+    if not order_keys:
         return {}
 
-    factors_by_radical = {
-        radical: distinct_prime_factors(radical)
-        for radical in radical_keys
-    }
-    all_factors = tuple(
-        sorted({
-            factor
-            for factors in factors_by_radical.values()
-            for factor in factors
-        })
-    )
     prime_view, _dtype = _numpy_prime_view(primes)
     source_count = len(prime_view)
-    counts = {radical: 0 for radical in radical_keys}
-
+    counts = {order: 0 for order in order_keys}
     count_started = time.perf_counter_ns()
     for start in range(0, source_count, chunk_primes):
         stop = min(start + chunk_primes, source_count)
         chunk = prime_view[start:stop]
-        factor_masks = _factor_masks_for_chunk(
-            chunk,
-            all_factors,
-        )
-        for radical in radical_keys:
-            mask = _mask_for_factors(
-                factor_masks,
-                factors_by_radical[radical],
+        for order in order_keys:
+            counts[order] += int(
+                np.count_nonzero(
+                    _component_mask_for_chunk(chunk, order)
+                )
             )
-            counts[radical] += int(np.count_nonzero(mask))
     count_ns = time.perf_counter_ns() - count_started
 
     outputs: Dict[int, np.ndarray] = {}
     try:
         outputs = {
-            radical: builds[radical].allocate_primes(
-                counts[radical]
-            )
-            for radical in radical_keys
+            order: builds[order].allocate_primes(counts[order])
+            for order in order_keys
         }
-        positions = {radical: 0 for radical in radical_keys}
-
+        positions = {order: 0 for order in order_keys}
         fill_started = time.perf_counter_ns()
         for start in range(0, source_count, chunk_primes):
             stop = min(start + chunk_primes, source_count)
             chunk = prime_view[start:stop]
-            factor_masks = _factor_masks_for_chunk(
-                chunk,
-                all_factors,
-            )
-            for radical in radical_keys:
-                mask = _mask_for_factors(
-                    factor_masks,
-                    factors_by_radical[radical],
-                )
-                selected = chunk[mask]
-                destination_start = positions[radical]
+            for order in order_keys:
+                selected = chunk[
+                    _component_mask_for_chunk(chunk, order)
+                ]
+                destination_start = positions[order]
                 destination_stop = (
                     destination_start + len(selected)
                 )
-                outputs[radical][
+                outputs[order][
                     destination_start:destination_stop
                 ] = selected
-                positions[radical] = destination_stop
+                positions[order] = destination_stop
         fill_ns = time.perf_counter_ns() - fill_started
 
-        for radical in radical_keys:
-            if positions[radical] != counts[radical]:
+        for order in order_keys:
+            if positions[order] != counts[order]:
                 raise RuntimeError(
-                    f"disk-plan fill mismatch for rad={radical}: "
-                    f"{positions[radical]} != {counts[radical]}"
+                    f"disk component-plan fill mismatch for order={order}"
                 )
-            mapping = outputs[radical]
+            mapping = outputs[order]
             if isinstance(mapping, np.memmap):
                 mapping.flush()
                 mapping._mmap.close()
@@ -782,7 +700,6 @@ def build_filtered_prime_pools_vectorized_memmap(
         pool_perf.plan_filter_ns += count_ns + fill_ns
         pool_perf.plan_filter_source_values += 2 * source_count
         pool_perf.filtered_prime_values += sum(counts.values())
-
     return counts
 
 
@@ -793,6 +710,10 @@ def _product_prime_range(
 ) -> mpz:
     """Return the exact product of ``primes[start:stop]``."""
     product = mpz(1)
+    if isinstance(primes, array) and primes.typecode in ("I", "Q"):
+        for idx in range(start, stop):
+            product *= primes[idx]
+        return product
     for idx in range(start, stop):
         product *= int(primes[idx])
     return product
@@ -1163,21 +1084,19 @@ class SigmaPoolAnalyzer:
         self._scan = _scan_blocks_hierarchical if gcd_mode == "hierarchical" else _scan_blocks_flat
         self._use_superblocks = (gcd_mode == "hierarchical")
 
-        # Single shared full-pool plan for even n (no filter benefit)
-        self._full_plan: PrimeBlockPlan | None = None
-        # Plans are keyed by rad(exp + 1), not exp + 1 itself.
-        self._plans_by_radical: Dict[int, PrimeBlockPlan] = {}
-        # Incremental plans are keyed by (prefix stop, 0-or-radical).
-        self._interval_plans: Dict[Tuple[int, int], PrimeBlockPlan] = {}
+        self._component_plans: Dict[int, PrimeBlockPlan] = {}
+        self._component_interval_plans: Dict[
+            Tuple[int, int],
+            PrimeBlockPlan,
+        ] = {}
+        self._component_miss_exponents: set[int] = set()
         self._required_exponents: Tuple[int, ...] = ()
-        self._normal_plan_miss_keys: set[int] = set()
 
         self._cache: Dict[Tuple[int, int], SigmaPoolAnalysis] = {}
         self._perf: "PoolPerformance" = pool_perf if pool_perf is not None else PoolPerformance()
         self._structure: "StructureMetrics | None" = structure
         self._pool_digest_cache: Dict[int, bytes] = {}
         self._prime_prefix_stop_cache: Dict[int, int] = {}
-        self._normal_plan_scan_leaf_cache: Dict[Tuple[int, int], int] = {}
         self._database: SigmaAnalysisDatabase | None = None
         self.database_error: str | None = None
         if database_path is not None:
@@ -1209,48 +1128,6 @@ class SigmaPoolAnalyzer:
         if self.plan_build_policy == "eager":
             self.prebuild_plans(self._required_exponents)
 
-    @staticmethod
-    def _normal_plan_key(exp: int) -> int:
-        n = exp + 1
-        return 0 if n % 2 == 0 else squarefree_kernel(n)
-
-    def _cached_normal_plan(
-        self,
-        exp: int,
-    ) -> PrimeBlockPlan | None:
-        key = self._normal_plan_key(exp)
-        if key == 0:
-            return self._full_plan
-        return self._plans_by_radical.get(key)
-
-    def _evict_interval_plans_for_key(self, key: int) -> None:
-        stale = [
-            interval_key
-            for interval_key in self._interval_plans
-            if interval_key[1] == key
-        ]
-        for interval_key in stale:
-            del self._interval_plans[interval_key]
-
-    def _maybe_adaptive_prebuild(self, exp: int) -> None:
-        if (
-            self.plan_build_policy != "adaptive"
-            or not self._required_exponents
-        ):
-            return
-        self._normal_plan_miss_keys.add(
-            self._normal_plan_key(exp)
-        )
-        if (
-            len(self._normal_plan_miss_keys)
-            >= self.adaptive_build_threshold
-        ):
-            # Full-window plans supersede incremental plans.  Release the
-            # latter before bulk construction so both layers never define
-            # the steady-state memory footprint.
-            self._interval_plans.clear()
-            self.prebuild_plans(self._required_exponents)
-
     def _pool_digest_for_limit(
         self,
         limit: int,
@@ -1279,7 +1156,7 @@ class SigmaPoolAnalyzer:
 
     def _disk_plan_key(
         self,
-        radical: int,
+        order: int,
         *,
         source_start: int,
     ) -> PlanCacheKey:
@@ -1295,7 +1172,8 @@ class SigmaPoolAnalyzer:
             prime_limit=self.prime_limit,
             source_start=int(source_start),
             source_count=len(self._prime_view) - source_start,
-            radical=int(radical),
+            filter_kind="component",
+            filter_order=int(order),
             dtype=self._prime_view.dtype.str,
             block_size=self.block_size,
             superblock_fanout=self.superblock_fanout,
@@ -1312,7 +1190,7 @@ class SigmaPoolAnalyzer:
         loaded,
     ) -> PrimeBlockPlan:
         source = self._source_primes(key.source_start)
-        if key.radical == 0:
+        if key.filter_order == 2:
             if loaded.prime_count != len(source):
                 raise PlanCacheValidationError(
                     "unfiltered disk plan prime count mismatch"
@@ -1352,7 +1230,7 @@ class SigmaPoolAnalyzer:
 
     def _load_disk_plan(
         self,
-        radical: int,
+        order: int,
         *,
         source_start: int,
     ) -> tuple[PrimeBlockPlan | None, PlanCacheKey | None]:
@@ -1360,7 +1238,7 @@ class SigmaPoolAnalyzer:
         if cache is None:
             return None, None
         key = self._disk_plan_key(
-            radical,
+            order,
             source_start=source_start,
         )
         try:
@@ -1416,7 +1294,7 @@ class SigmaPoolAnalyzer:
         source_start: int,
     ) -> PrimeBlockPlan:
         loaded, key = self._load_disk_plan(
-            0,
+            2,
             source_start=source_start,
         )
         if loaded is not None:
@@ -1469,60 +1347,66 @@ class SigmaPoolAnalyzer:
             pool_perf=self._perf,
         )
 
-    def _disk_filtered_plans(
+    def _disk_component_plans(
         self,
-        radicals: Sequence[int],
+        orders: Sequence[int],
         *,
         source_start: int,
     ) -> Dict[int, PrimeBlockPlan]:
-        """Load or build filtered plans with mmap-backed prime arrays."""
-        radical_keys = tuple(sorted(set(int(r) for r in radicals)))
+        """Load or transactionally build cyclotomic component plans."""
+        order_keys = tuple(sorted(set(int(order) for order in orders)))
         results: Dict[int, PrimeBlockPlan] = {}
+        if 2 in order_keys:
+            results[2] = self._disk_unfiltered_plan(
+                source_start=source_start,
+            )
+
+        filtered = tuple(order for order in order_keys if order != 2)
         keys: Dict[int, PlanCacheKey] = {}
         missing = []
-
-        for radical in radical_keys:
+        for order in filtered:
             loaded, key = self._load_disk_plan(
-                radical,
+                order,
                 source_start=source_start,
             )
             if loaded is not None:
-                results[radical] = loaded
+                results[order] = loaded
             else:
-                missing.append(radical)
+                missing.append(order)
                 if key is not None:
-                    keys[radical] = key
-
+                    keys[order] = key
         if not missing:
             return results
+
         cache = self._plan_cache
         if cache is None:
-            return self._memory_filtered_plans(
+            self._build_memory_component_plans(
                 missing,
                 source_start=source_start,
                 destination=results,
             )
+            return results
 
         builds: Dict[int, PlanCacheBuild] = {}
         fallback = []
-        for radical in missing:
-            key = keys.get(radical)
+        for order in missing:
+            key = keys.get(order)
             if key is None:
-                fallback.append(radical)
+                fallback.append(order)
                 continue
             try:
-                builds[radical] = cache.begin(key)
+                builds[order] = cache.begin(key)
             except PlanCacheBusyError:
-                fallback.append(radical)
+                fallback.append(order)
             except (OSError, PlanCacheError, ValueError) as exc:
                 self.plan_cache_error = str(exc)
-                fallback.append(radical)
+                fallback.append(order)
 
         source = self._source_primes(source_start)
         if builds:
             try:
                 counts = (
-                    build_filtered_prime_pools_vectorized_memmap(
+                    build_component_prime_pools_vectorized_memmap(
                         source,
                         builds,
                         chunk_primes=self.plan_chunk_primes,
@@ -1539,12 +1423,12 @@ class SigmaPoolAnalyzer:
                 builds = {}
                 counts = {}
 
-            for radical, build in tuple(builds.items()):
+            for order, build in tuple(builds.items()):
                 mapping = None
                 plan = None
                 try:
                     mapping = build.open_staging_primes(
-                        counts[radical]
+                        counts[order]
                     )
                     plan = build_prime_block_plan(
                         source,
@@ -1555,12 +1439,12 @@ class SigmaPoolAnalyzer:
                         pool_perf=self._perf,
                     )
                     prime_count = len(mapping)
-                    if prime_count:
-                        first_prime = int(mapping[0])
-                        last_prime = int(mapping[-1])
-                    else:
-                        first_prime = 0
-                        last_prime = 0
+                    first_prime = (
+                        int(mapping[0]) if prime_count else 0
+                    )
+                    last_prime = (
+                        int(mapping[-1]) if prime_count else 0
+                    )
                     if isinstance(mapping, np.memmap):
                         mapping._mmap.close()
                     mapping = None
@@ -1572,7 +1456,7 @@ class SigmaPoolAnalyzer:
                         last_prime=last_prime,
                     )
                     assert committed_mapping is not None
-                    results[radical] = PrimeBlockPlan(
+                    results[order] = PrimeBlockPlan(
                         primes=committed_mapping,
                         block_size=plan.block_size,
                         superblock_fanout=(
@@ -1590,47 +1474,18 @@ class SigmaPoolAnalyzer:
                             pass
                     build.abort()
                     if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                        for other_radical, other in builds.items():
-                            if other_radical != radical:
+                        for other_order, other in builds.items():
+                            if other_order != order:
                                 other.abort()
                         raise
                     self.plan_cache_error = str(exc)
-                    fallback.append(radical)
+                    fallback.append(order)
 
         if fallback:
-            self._memory_filtered_plans(
+            self._build_memory_component_plans(
                 fallback,
                 source_start=source_start,
                 destination=results,
-            )
-        return results
-
-    def _memory_filtered_plans(
-        self,
-        radicals: Sequence[int],
-        *,
-        source_start: int,
-        destination: Dict[int, PrimeBlockPlan] | None = None,
-    ) -> Dict[int, PrimeBlockPlan]:
-        results = destination if destination is not None else {}
-        radical_keys = tuple(sorted(set(int(r) for r in radicals)))
-        if not radical_keys:
-            return results
-        source = self._source_primes(source_start)
-        pools = build_filtered_prime_pools_vectorized(
-            source,
-            radical_keys,
-            chunk_primes=self.plan_chunk_primes,
-            pool_perf=self._perf,
-        )
-        for radical in radical_keys:
-            results[radical] = build_prime_block_plan(
-                source,
-                block_size=self.block_size,
-                superblock_fanout=self.superblock_fanout,
-                eligible_primes=pools[radical],
-                build_superblocks=self._use_superblocks,
-                pool_perf=self._perf,
             )
         return results
 
@@ -1643,46 +1498,6 @@ class SigmaPoolAnalyzer:
         stop = _typed_searchsorted_right(self._prime_view, limit)
         self._prime_prefix_stop_cache[limit] = stop
         return stop
-
-    def _scan_start_leaf(
-        self,
-        plan: PrimeBlockPlan,
-        exp: int,
-        lower_limit: int | None,
-    ) -> int:
-        """Locate a certified prefix boundary in a shared normal plan.
-
-        An interval plan already begins above ``lower_limit`` and scans from
-        leaf zero.  A normal plan can be reused without rescanning the certified
-        prefix by starting at the leaf containing its first eligible prime
-        above the persisted limit.
-        """
-        if lower_limit is None:
-            return 0
-
-        normal = self._cached_normal_plan(exp)
-        if plan is not normal:
-            return 0
-
-        cache_key = (
-            self._normal_plan_key(exp),
-            int(lower_limit),
-        )
-        cached = self._normal_plan_scan_leaf_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        plan_view, _dtype = _numpy_prime_view(plan.primes)
-        first_new_index = _typed_searchsorted_right(
-            plan_view,
-            int(lower_limit),
-        )
-        if first_new_index >= len(plan_view):
-            start_leaf = plan.leaf_block_count
-        else:
-            start_leaf = first_new_index // plan.block_size
-        self._normal_plan_scan_leaf_cache[cache_key] = start_leaf
-        return start_leaf
 
     def _candidate_leaf_count(
         self,
@@ -1733,10 +1548,8 @@ class SigmaPoolAnalyzer:
 
     def close(self) -> None:
         seen_mappings: set[int] = set()
-        plans = list(self._plans_by_radical.values())
-        plans.extend(self._interval_plans.values())
-        if self._full_plan is not None:
-            plans.append(self._full_plan)
+        plans = list(self._component_plans.values())
+        plans.extend(self._component_interval_plans.values())
         for plan in plans:
             mapping = plan.primes
             if (
@@ -1754,219 +1567,209 @@ class SigmaPoolAnalyzer:
             self._database.close()
             self._database = None
 
-    def prebuild_plans(
-        self,
+    @staticmethod
+    def _component_orders(
         exponents: Sequence[int],
+    ) -> Tuple[int, ...]:
+        return tuple(sorted({
+            order
+            for exp in exponents
+            for order in divisors(int(exp) + 1)
+            if order > 1
+        }))
+
+    def _build_memory_component_plans(
+        self,
+        orders: Sequence[int],
+        *,
+        source_start: int,
+        destination: Dict[int, PrimeBlockPlan],
     ) -> None:
-        """Prebuild every plan required by the configured exponent set."""
-        started = time.perf_counter_ns()
-
-        unique_exponents = tuple(
-            sorted(set(int(exp) for exp in exponents))
-        )
-
-        need_full_plan = any(
-            (exp + 1) % 2 == 0
-            for exp in unique_exponents
-        )
-
-        radical_keys = tuple(
+        missing = tuple(
             sorted({
-                squarefree_kernel(exp + 1)
-                for exp in unique_exponents
-                if (exp + 1) % 2 == 1
+                int(order)
+                for order in orders
+                if int(order) not in destination
             })
         )
-
-        missing_radicals = tuple(
-            radical
-            for radical in radical_keys
-            if radical not in self._plans_by_radical
+        if not missing:
+            return
+        source = self._source_primes(source_start)
+        filtered_orders = tuple(
+            order for order in missing if order != 2
         )
-
-        if missing_radicals:
-            for radical in missing_radicals:
-                self._evict_interval_plans_for_key(radical)
-            if self._plan_cache is not None:
-                built_plans = self._disk_filtered_plans(
-                    missing_radicals,
-                    source_start=0,
-                )
-                self._plans_by_radical.update(built_plans)
-            else:
-                filtered_pools = (
-                    build_filtered_prime_pools_vectorized(
-                        self.primes,
-                        missing_radicals,
-                        chunk_primes=self.plan_chunk_primes,
-                        pool_perf=self._perf,
-                    )
-                )
-
-                for radical in missing_radicals:
-                    self._plans_by_radical[radical] = (
-                        build_prime_block_plan(
-                            self.primes,
-                            block_size=self.block_size,
-                            superblock_fanout=self.superblock_fanout,
-                            eligible_primes=filtered_pools[radical],
-                            build_superblocks=self._use_superblocks,
-                            pool_perf=self._perf,
-                        )
-                    )
-
-        if need_full_plan and self._full_plan is None:
-            self._evict_interval_plans_for_key(0)
-            if self._plan_cache is not None:
-                self._full_plan = self._disk_unfiltered_plan(
-                    source_start=0,
-                )
-            else:
-                self._full_plan = build_prime_block_plan(
-                    self.primes,
-                    block_size=self.block_size,
-                    superblock_fanout=self.superblock_fanout,
-                    eligible_primes=None,
-                    build_superblocks=self._use_superblocks,
-                    pool_perf=self._perf,
-                )
-
-        self._perf.filtered_plan_count = len(self._plans_by_radical)
-        self._perf.full_plan_built = self._full_plan is not None
-        self._perf.plan_prebuild_ns += (time.perf_counter_ns() - started)
-
-    def plan_for_exp(
-        self,
-        exp: int,
-        *,
-        lower_limit: int | None = None,
-    ) -> PrimeBlockPlan:
-        """Return a full-window or incremental necessary-order plan."""
-        if lower_limit is not None and lower_limit >= 3:
-            normal = self._cached_normal_plan(exp)
-            if normal is not None:
-                return normal
-            prefix_stop = self._prime_prefix_stop(lower_limit)
-            if (
-                prefix_stop / len(self._prime_view)
-                >= POOL_INCREMENTAL_MIN_PREFIX_FRACTION
-            ):
-                return self._interval_plan_for_exp(
-                    exp,
-                    lower_limit=int(lower_limit),
-                )
-
-        n = exp + 1
-
-        if n % 2 == 0:
-            if self._full_plan is None:
-                self._maybe_adaptive_prebuild(exp)
-            if self._full_plan is None:
-                self._evict_interval_plans_for_key(0)
-                if self._plan_cache is not None:
-                    self._full_plan = self._disk_unfiltered_plan(
-                        source_start=0,
-                    )
-                else:
-                    self._full_plan = build_prime_block_plan(
-                        self.primes,
-                        block_size=self.block_size,
-                        superblock_fanout=self.superblock_fanout,
-                        eligible_primes=None,
-                        build_superblocks=self._use_superblocks,
-                        pool_perf=self._perf,
-                    )
-            return self._full_plan
-
-        radical = squarefree_kernel(n)
-        cached = self._plans_by_radical.get(radical)
-        if cached is not None:
-            return cached
-
-        self._maybe_adaptive_prebuild(exp)
-        cached = self._plans_by_radical.get(radical)
-        if cached is not None:
-            return cached
-
-        self._evict_interval_plans_for_key(radical)
-        if self._plan_cache is not None:
-            plan = self._disk_filtered_plans(
-                [radical],
-                source_start=0,
-            )[radical]
-        else:
-            filtered = build_filtered_prime_pools_vectorized(
-                self.primes,
-                [radical],
-                chunk_primes=self.plan_chunk_primes,
-                pool_perf=self._perf,
-            )[radical]
-
-            plan = build_prime_block_plan(
-                self.primes,
+        pools = build_component_prime_pools_vectorized(
+            source,
+            filtered_orders,
+            chunk_primes=self.plan_chunk_primes,
+            pool_perf=self._perf,
+        )
+        for order in missing:
+            eligible = source if order == 2 else pools[order]
+            destination[order] = build_prime_block_plan(
+                source,
                 block_size=self.block_size,
                 superblock_fanout=self.superblock_fanout,
-                eligible_primes=filtered,
+                eligible_primes=eligible,
                 build_superblocks=self._use_superblocks,
                 pool_perf=self._perf,
             )
 
-        self._plans_by_radical[radical] = plan
-        self._perf.filtered_plan_count = len(self._plans_by_radical)
-        return plan
+    def _release_component_interval_plans(
+        self,
+        orders: Sequence[int] | None = None,
+    ) -> None:
+        selected = None if orders is None else set(map(int, orders))
+        stale = [
+            key
+            for key in self._component_interval_plans
+            if selected is None or key[1] in selected
+        ]
+        seen_mappings: set[int] = set()
+        for key in stale:
+            plan = self._component_interval_plans.pop(key)
+            mapping = plan.primes
+            if (
+                isinstance(mapping, np.memmap)
+                and id(mapping) not in seen_mappings
+            ):
+                seen_mappings.add(id(mapping))
+                mmap_object = getattr(mapping, "_mmap", None)
+                if mmap_object is not None:
+                    try:
+                        mmap_object.close()
+                    except (BufferError, OSError):
+                        pass
 
-    def _interval_plan_for_exp(
+    def prebuild_plans(
+        self,
+        exponents: Sequence[int],
+    ) -> None:
+        """Build every cyclotomic component plan needed by *exponents*."""
+        started = time.perf_counter_ns()
+        orders = self._component_orders(exponents)
+        self._release_component_interval_plans()
+        missing = tuple(
+            order
+            for order in orders
+            if order not in self._component_plans
+        )
+        if self._plan_cache is not None:
+            self._component_plans.update(
+                self._disk_component_plans(
+                    missing,
+                    source_start=0,
+                )
+            )
+        else:
+            self._build_memory_component_plans(
+                missing,
+                source_start=0,
+                destination=self._component_plans,
+            )
+        self._perf.filtered_plan_count = sum(
+            order != 2 for order in self._component_plans
+        )
+        self._perf.full_plan_built = 2 in self._component_plans
+        self._perf.plan_prebuild_ns += (
+            time.perf_counter_ns() - started
+        )
+
+    def _plans_for_exp(
         self,
         exp: int,
         *,
-        lower_limit: int,
-    ) -> PrimeBlockPlan:
-        """Build a shared plan over primes in ``(lower_limit, P]``."""
-        start = self._prime_prefix_stop(lower_limit)
-        if start >= len(self._prime_view):
-            raise ValueError("incremental prime interval is empty")
-
-        n = exp + 1
-        radical = 0 if n % 2 == 0 else squarefree_kernel(n)
-        key = (start, radical)
-        cached = self._interval_plans.get(key)
-        if cached is not None:
-            return cached
-
-        interval = self._prime_view[start:]
-        if radical == 0:
-            if self._plan_cache is not None:
-                plan = self._disk_unfiltered_plan(
-                    source_start=start,
-                )
-                self._interval_plans[key] = plan
-                return plan
-            eligible = interval
-        else:
-            if self._plan_cache is not None:
-                plan = self._disk_filtered_plans(
-                    [radical],
-                    source_start=start,
-                )[radical]
-                self._interval_plans[key] = plan
-                return plan
-            eligible = build_filtered_prime_pools_vectorized(
-                    interval,
-                    [radical],
-                    chunk_primes=self.plan_chunk_primes,
-                    pool_perf=self._perf,
-                )[radical]
-
-        plan = build_prime_block_plan(
-            interval,
-            block_size=self.block_size,
-            superblock_fanout=self.superblock_fanout,
-            eligible_primes=eligible,
-            build_superblocks=self._use_superblocks,
-            pool_perf=self._perf,
+        lower_limit: int | None,
+    ) -> Dict[int, PrimeBlockPlan]:
+        orders = tuple(
+            order
+            for order in divisors(exp + 1)
+            if order > 1
         )
-        self._interval_plans[key] = plan
-        return plan
+        if (
+            self.plan_build_policy == "adaptive"
+            and self._required_exponents
+        ):
+            self._component_miss_exponents.add(int(exp))
+            if (
+                len(self._component_miss_exponents)
+                >= self.adaptive_build_threshold
+            ):
+                self.prebuild_plans(
+                    self._required_exponents
+                )
+
+        if lower_limit is not None and lower_limit >= 3:
+            if all(
+                order in self._component_plans
+                for order in orders
+            ):
+                return {
+                    order: self._component_plans[order]
+                    for order in orders
+                }
+            prefix_stop = self._prime_prefix_stop(lower_limit)
+            if (
+                prefix_stop / len(self._prime_view)
+                >= POOL_INCREMENTAL_MIN_PREFIX_FRACTION
+                and prefix_stop < len(self._prime_view)
+            ):
+                destination = {
+                    order: plan
+                    for (start, order), plan
+                    in self._component_interval_plans.items()
+                    if start == prefix_stop
+                }
+                missing = tuple(
+                    order
+                    for order in orders
+                    if order not in destination
+                )
+                if self._plan_cache is not None:
+                    destination.update(
+                        self._disk_component_plans(
+                            missing,
+                            source_start=prefix_stop,
+                        )
+                    )
+                else:
+                    self._build_memory_component_plans(
+                        missing,
+                        source_start=prefix_stop,
+                        destination=destination,
+                    )
+                for order, plan in destination.items():
+                    self._component_interval_plans[
+                        (prefix_stop, order)
+                    ] = plan
+                return {
+                    order: destination[order]
+                    for order in orders
+                }
+
+        missing = tuple(
+            order
+            for order in orders
+            if order not in self._component_plans
+        )
+        self._release_component_interval_plans(missing)
+        if self._plan_cache is not None:
+            self._component_plans.update(
+                self._disk_component_plans(
+                    missing,
+                    source_start=0,
+                )
+            )
+        else:
+            self._build_memory_component_plans(
+                missing,
+                source_start=0,
+                destination=self._component_plans,
+            )
+        return {
+            order: self._component_plans[order]
+            for order in orders
+        }
 
     def _analysis_from_exact(
         self,
@@ -2093,7 +1896,55 @@ class SigmaPoolAnalyzer:
             self._perf.persistent_invalid += 1
             self._disable_database(exc)
 
-    def analyze(self, p: int, exp: int) -> SigmaPoolAnalysis:
+    @staticmethod
+    def _restore_component_residuals(
+        components: Sequence[Tuple[int, mpz]],
+        persisted: PersistedSigmaRecord,
+    ) -> Tuple[Tuple[int, mpz], ...] | None:
+        """Apply a validated partial row to exact component values."""
+        residuals = [
+            [int(order), mpz(value)]
+            for order, value in components
+        ]
+        for q, expected_exponent in persisted.valuations.items():
+            removed = 0
+            for row in residuals:
+                row[1], exponent = _remove_all(row[1], q)
+                removed += exponent
+            if removed != expected_exponent:
+                return None
+
+        reconstructed = mpz(1)
+        for _order, residual in residuals:
+            reconstructed *= residual
+        if reconstructed != persisted.residual:
+            return None
+        return tuple(
+            (int(order), mpz(residual))
+            for order, residual in residuals
+        )
+
+    def _component_scan_start_leaf(
+        self,
+        plan: PrimeBlockPlan,
+        lower_limit: int | None,
+    ) -> int:
+        if lower_limit is None:
+            return 0
+        plan_view, _dtype = _numpy_prime_view(plan.primes)
+        first_new_index = _typed_searchsorted_right(
+            plan_view,
+            int(lower_limit),
+        )
+        if first_new_index >= len(plan_view):
+            return plan.leaf_block_count
+        return first_new_index // plan.block_size
+
+    def analyze(
+        self,
+        p: int,
+        exp: int,
+    ) -> SigmaPoolAnalysis:
         key = (p, exp)
         cached = self._cache.get(key)
         if cached is not None:
@@ -2105,7 +1956,6 @@ class SigmaPoolAnalyzer:
             self._perf.pool_misses_by_exp[exp] += 1
         started = time.perf_counter()
 
-        # Fast path: a globally exact factorisation already exists
         exact_cached = _SIG_VALUATIONS.get(key)
         if exact_cached is not None:
             result = self._analysis_from_exact(exact_cached)
@@ -2129,7 +1979,6 @@ class SigmaPoolAnalyzer:
 
         sigma_odd = mpz(sigma_prime_power(p, exp))
         sigma_odd, _v2 = _remove_all(sigma_odd, 2)
-
         persisted = self._load_persisted(
             p,
             exp,
@@ -2145,46 +1994,63 @@ class SigmaPoolAnalyzer:
             self._cache[key] = result
             return result
 
+        if (
+            persisted is not None
+            and persisted.scanned_limit == self.prime_limit
+        ):
+            result = SigmaPoolAnalysis(
+                exact=False,
+                valuations=dict(persisted.valuations),
+                residual=mpz(persisted.residual),
+            )
+            self._record_structure(p, exp, result)
+            self._cache[key] = result
+            return result
+
+        components = _odd_cyclotomic_sigma_components(p, exp)
         if persisted is None:
-            residual = mpz(sigma_odd)
+            component_residuals = components
             inside: Dict[int, int] = {}
             lower_limit = None
         else:
-            residual = mpz(persisted.residual)
-            inside = dict(persisted.valuations)
-            lower_limit = persisted.scanned_limit
+            restored = self._restore_component_residuals(
+                components,
+                persisted,
+            )
+            if restored is None:
+                component_residuals = components
+                inside = {}
+                lower_limit = None
+            else:
+                component_residuals = restored
+                inside = dict(persisted.valuations)
+                lower_limit = persisted.scanned_limit
 
-            if lower_limit == self.prime_limit:
-                result = SigmaPoolAnalysis(
-                    exact=False,
-                    valuations=inside,
-                    residual=residual,
-                )
-                self._record_structure(p, exp, result)
-                self._cache[key] = result
-                return result
-
-        plan = self.plan_for_exp(
+        plans = self._plans_for_exp(
             exp,
             lower_limit=lower_limit,
         )
-        start_leaf = self._scan_start_leaf(
-            plan,
-            exp,
-            lower_limit,
-        )
-        self._perf.candidate_leaf_blocks += (
-            self._candidate_leaf_count(plan, start_leaf)
-        )
-
+        final_residual = mpz(1)
         scan_started = time.perf_counter_ns()
-        residual = self._scan(
-            residual,
-            inside,
-            plan,
-            self._perf,
-            start_leaf=start_leaf,
-        )
+        for order, component_residual in component_residuals:
+            if component_residual == 1:
+                continue
+            plan = plans[order]
+            start_leaf = self._component_scan_start_leaf(
+                plan,
+                lower_limit,
+            )
+            self._perf.candidate_leaf_blocks += (
+                self._candidate_leaf_count(plan, start_leaf)
+            )
+            remaining = self._scan(
+                component_residual,
+                inside,
+                plan,
+                self._perf,
+                start_leaf=start_leaf,
+            )
+            final_residual *= remaining
         scan_elapsed = time.perf_counter_ns() - scan_started
         self._perf.cold_scan_ns += scan_elapsed
         self._perf.cold_scans += 1
@@ -2192,12 +2058,32 @@ class SigmaPoolAnalyzer:
             self._perf.cold_scans_by_exp[exp] += 1
             self._perf.cold_scan_ns_by_exp[exp] += scan_elapsed
 
-        if residual == 1:
-            result = SigmaPoolAnalysis(exact=True, valuations=inside, residual=mpz(1))
+        # Component traversal order is not prime order.  Canonicalise the map
+        # before factor-chain propagation so FIFO search remains bit-for-bit
+        # identical to canonical ascending-prime pool order.
+        inside = dict(sorted(inside.items()))
+        if final_residual == 1:
+            result = SigmaPoolAnalysis(
+                exact=True,
+                valuations=inside,
+                residual=mpz(1),
+            )
             _SIG_VALUATIONS[key] = inside
             _SIG_FACTORS[key] = set(inside)
         else:
-            result = SigmaPoolAnalysis(exact=False, valuations=inside, residual=residual)
+            result = SigmaPoolAnalysis(
+                exact=False,
+                valuations=inside,
+                residual=final_residual,
+            )
+
+        reconstructed = mpz(final_residual)
+        for q, exponent in inside.items():
+            reconstructed *= mpz(q) ** exponent
+        if reconstructed != sigma_odd:
+            raise ArithmeticError(
+                "cyclotomic scan failed to reconstruct odd sigma"
+            )
 
         self._store_persisted(
             p,
@@ -2207,13 +2093,15 @@ class SigmaPoolAnalyzer:
             exact_valuations=inside if result.exact else None,
         )
         self._record_structure(p, exp, result)
-
         elapsed = time.perf_counter() - started
         self._perf.analysis_ns += int(elapsed * 1_000_000_000)
         self._perf.record_slow_analysis(
-            elapsed, p, exp, int(residual).bit_length(), result.exact,
+            elapsed,
+            p,
+            exp,
+            int(final_residual).bit_length(),
+            result.exact,
         )
-
         self._cache[key] = result
         return result
 

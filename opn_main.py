@@ -7,7 +7,7 @@ candidates of the form  N = q^{4k+1} × ∏ p_i^{2a_i}.
 Usage
 -----
     python opn_main.py            # run the configured finite search box
-    # edit PROPAGATE              # switch spoof/true-OPN mode
+    # edit PROPAGATE              # switch spoof/Euler-form OPN mode
     # edit MAX_PRIME / MAX_EXP    # adjust search scope
 """
 
@@ -17,8 +17,8 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
+import opn_core
 from opn_core import (
     CHECKPOINT_INTERVAL_SECONDS,
     CHECKPOINT_FILE,
@@ -43,7 +43,6 @@ from opn_core import (
     generate_odd_primes,
     valid_euler_exponents,
     valid_even_exponents,
-    _SIG_FACTORS,
 )
 from opn_io import (
     display_solution,
@@ -87,10 +86,17 @@ def _make_run_id(max_prime: int, max_factors: int, max_exp: int) -> str:
 # ── main ──────────────────────────────────────────────────────
 def main() -> None:
     """Parse checkpoint (if any), run search, display results."""
+    checkpoint_present = os.path.exists(CHECKPOINT_FILE)
     chk = load_checkpoint()
+    if checkpoint_present and chk is None:
+        print(
+            "检查点存在但无法安全恢复；"
+            "本次不会启动新搜索或覆盖原文件。"
+        )
+        return
     prev_solutions: list = []
 
-    if chk is not None and chk.get("format_version") == 4:
+    if chk is not None:
         print("=" * 60)
         print("发现已有检查点 (v4)，将从中断处继续 ...")
         print(f"  已完成状态: {chk['total_states']:,}")
@@ -116,11 +122,6 @@ def main() -> None:
             "use_heap":     chk.get("use_heap", PROPAGATE),
             "snapshot_id":  chk.get("snapshot_id", 0),
         } if chk.get("heap") else None
-
-    elif chk is not None:
-        print("警告: 检查点格式过旧 (v3 或更早)，本次无法恢复。")
-        print("请删除 checkpoint_merged.pkl 后重新开始，或切回旧分支完成当前运行。")
-        return
 
     else:
         metrics = RunMetrics()
@@ -194,8 +195,11 @@ def main() -> None:
     solutions    = list(prev_solutions)
     state_holder: dict = {}
     t0           = time.time()
-    found_true   = 0
-    found_spoof = 0
+    found_true = sum(
+        1 for _assigned, _euler_prime, spoof in prev_solutions
+        if not spoof
+    )
+    found_spoof = len(prev_solutions) - found_true
     stop_requested = False
     interrupt_count = 0
 
@@ -295,15 +299,11 @@ def main() -> None:
         sampler.set_phase("report_write")
         sampler.stop()
 
-        elapsed = time.time() - t0
+        elapsed = elapsed_offset + time.time() - t0
 
         metrics.performance.cache_sizes = {
-            "SIGMA_CACHE": len(
-                __import__("opn_core").SIGMA_CACHE
-            ),
-            "_SIG_VALUATIONS": len(
-                __import__("opn_core")._SIG_VALUATIONS
-            ),
+            "SIGMA_CACHE": len(opn_core.SIGMA_CACHE),
+            "_SIG_VALUATIONS": len(opn_core._SIG_VALUATIONS),
         }
         metrics.performance.memory_phases["at_report"] = (
             sampler.capture_memory()
@@ -348,7 +348,7 @@ def main() -> None:
             sampled_peak_rss=sampler.sampled_peak_rss,
             pruning_policy=PRUNING_POLICY,
             telemetry_schema_version=TELEMETRY_SCHEMA_VERSION,
-            _sig_factors=__import__("opn_core")._SIG_FACTORS,
+            _sig_factors=opn_core._SIG_FACTORS,
         )
 
         if status == "STOPPED":

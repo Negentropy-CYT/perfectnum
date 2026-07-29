@@ -1,5 +1,9 @@
 # Security Policy
 
+This repository processes only trusted local research data. Persistent files
+include integrity checks for accidental corruption, but they are not
+authenticated against a malicious source.
+
 ## Checkpoint files
 
 Checkpoint files (`checkpoint_merged.pkl`) use Python's `pickle` format
@@ -37,3 +41,5 @@ mathematical results.
 ## Supported versions
 
 Only the latest commit on the `main` branch is actively maintained.
+Operational deletion and recovery procedures are documented in
+[`docs/OUTPUTS_AND_RECOVERY.md`](docs/OUTPUTS_AND_RECOVERY.md).

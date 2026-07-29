@@ -1,15 +1,9 @@
 """
 opn_state — polymorphic search states and constraint propagation.
 
-Defines two state classes:
-  - DFSState   — minimal (5 fields) for Descartes-spoof DFS
-  - ChainState — full (14 fields, 6 collections cloned) for factor-chain best-first search
-
-Key improvements over v1 unified State:
-  - DFSState.clone() copies 2 collections vs 7 → ~60% less overhead
-  - Separate assign_prime_dfs / assign_prime_chain functions
-  - Touchard congruence pruning integrated into both paths
-  - Additive q-adic valuation contradiction detection (chain mode)
+Defines a compact DFS state for Descartes-spoof search and a full chain
+state for best-first OPN propagation. Assignment functions enforce Euler,
+Touchard, ratio, and additive q-adic valuation constraints.
 """
 import math
 from collections import deque
@@ -36,7 +30,6 @@ from opn_core import (
     sigma_valuation_map,
     sigma_valuation_from_order,
     sigma_prime_power,
-    touchard_force_3,
     valid_euler_exponents,
     valid_even_exponents,
 )
@@ -48,7 +41,6 @@ from opn_metrics import (
     VALUATION_EXCLUDED,
     VALUATION_OVERRUN,
     VALUATION_BUDGET,
-    VALUATION_KIND_COUNT,
 )
 
 
@@ -158,7 +150,6 @@ class DFSState:
     """Minimal state for DFS Descartes-spoof search (propagate=False).
 
     Omits: required_v, current_v, pending, pending_set, resonance, priority.
-    Saves 5 collection deep-copies per clone vs the old unified State.
     """
 
     assigned:    Dict[int, int] = field(default_factory=dict)
@@ -716,7 +707,6 @@ def assign_prime_chain(
         return ns
 
     # factor-chain propagation (additive valuation)
-    cascade_steps = 0
     post_vals = pre_vals if pre_vals is not None else {}
     for q, incoming in post_vals.items():
         if q == 2:
@@ -782,7 +772,6 @@ def assign_prime_chain(
             > ns.current_v.get(q, 0)
         ):
             _enqueue_pending(ns, q)
-            cascade_steps += 1
 
     metrics.structure.record_productive(
         depth=ns.depth,

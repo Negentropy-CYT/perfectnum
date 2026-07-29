@@ -21,8 +21,8 @@ from gmpy2 import mpz
 import numpy as np
 
 
-PLAN_CACHE_SCHEMA_VERSION = 1
-PLAN_CACHE_SEMANTICS_VERSION = 1
+PLAN_CACHE_SCHEMA_VERSION = 3
+PLAN_CACHE_SEMANTICS_VERSION = 3
 _MANIFEST_FILE = "manifest.json"
 _PRIMES_FILE = "primes.bin"
 _PRODUCTS_FILE = "products.bin"
@@ -49,7 +49,8 @@ class PlanCacheKey:
     prime_limit: int
     source_start: int
     source_count: int
-    radical: int
+    filter_kind: str
+    filter_order: int
     dtype: str
     block_size: int
     superblock_fanout: int
@@ -186,7 +187,7 @@ class PlanCacheBuild:
         self,
         prime_count: int,
     ) -> np.ndarray | np.memmap:
-        if self.key.radical == 0:
+        if self.key.filter_order == 2:
             raise PlanCacheError(
                 "unfiltered plans do not own a prime-array file"
             )
@@ -244,7 +245,7 @@ class PlanCacheBuild:
 
         primes_size = 0
         primes_sha256 = None
-        if self.key.radical != 0:
+        if self.key.filter_order != 2:
             primes_size = prime_count * dtype.itemsize
             if (
                 not self.primes_path.is_file()
@@ -318,7 +319,7 @@ class PlanCacheBuild:
             shutil.rmtree(quarantine, ignore_errors=True)
         self.lock.release()
 
-        if self.key.radical == 0:
+        if self.key.filter_order == 2:
             return None
         if prime_count == 0:
             return np.empty(0, dtype=dtype)
@@ -421,6 +422,10 @@ class PersistentPlanCache:
         entry: Path,
         manifest: dict,
     ) -> None:
+        if key.filter_kind != "component":
+            raise ValueError("unsupported plan filter kind")
+        if key.filter_order < 2:
+            raise ValueError("invalid cyclotomic component order")
         if manifest["schema_version"] != PLAN_CACHE_SCHEMA_VERSION:
             raise ValueError("unsupported plan cache schema")
         if (
@@ -479,7 +484,7 @@ class PersistentPlanCache:
         ):
             raise ValueError("plan cache products file is oversized")
 
-        if key.radical == 0:
+        if key.filter_order == 2:
             if (
                 int(manifest["primes_size"]) != 0
                 or manifest["primes_sha256"] is not None
@@ -545,7 +550,7 @@ class PersistentPlanCache:
         manifest: dict,
     ) -> np.ndarray | np.memmap | None:
         key = manifest["key"]
-        if int(key["radical"]) == 0:
+        if int(key["filter_order"]) == 2:
             return None
         path = entry / _PRIMES_FILE
         if _sha256_file(path) != manifest["primes_sha256"]:

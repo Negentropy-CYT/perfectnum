@@ -23,15 +23,12 @@ from opn_core import (
     DOMAIN_RATIO_MODE,
     ENABLE_FERMAT_DEBT,
     EXCLUDE_EXP_4,
-    EXP4_FILTER_HITS,
     POOL_GCD_MODE,
     POOL_PLAN_DISK_MIN_FREE_BYTES,
     POOL_PLAN_CHUNK_PRIMES,
     POOL_SUPERBLOCK_FANOUT,
     SEARCH_MODE,
     SigmaPoolAnalyzer,
-    TOXIC_SKIP,
-    _sigma_map_perf,
     check_touchard,
     euler_max_exp_capacity,
     even_max_exp_capacity,
@@ -249,7 +246,6 @@ from opn_state import (
     DFSState,
     _compute_priority,
     _enqueue_pending,
-    _max_possible_valuation,
     _target_valuation_offset,
     assign_prime_chain,
     assign_prime_dfs,
@@ -425,9 +421,13 @@ def search_opn(
                 observer.set_phase("plan_prebuild")
 
             plan_started = time.perf_counter()
-            sigma_pool_analyzer.configure_plan_build(
-                required_exponents
-            )
+            try:
+                sigma_pool_analyzer.configure_plan_build(
+                    required_exponents
+                )
+            except BaseException:
+                sigma_pool_analyzer.close()
+                raise
             plan_elapsed = time.perf_counter() - plan_started
 
             if observer is not None:
@@ -445,9 +445,13 @@ def search_opn(
                 flush=True,
             )
         else:
-            sigma_pool_analyzer.configure_plan_build(
-                required_exponents
-            )
+            try:
+                sigma_pool_analyzer.configure_plan_build(
+                    required_exponents
+                )
+            except BaseException:
+                sigma_pool_analyzer.close()
+                raise
             print(
                 "[init] sigma-pool plans deferred "
                 f"(policy={pool_plan_build_policy})",
@@ -521,8 +525,13 @@ def search_opn(
         """Expose a coherent frontier while the search loop is paused."""
         nonlocal snapshot_id, last_checkpoint
         if state_holder is None:
-            if sigma_pool_analyzer is not None:
-                sigma_pool_analyzer.flush()
+            try:
+                if sigma_pool_analyzer is not None:
+                    sigma_pool_analyzer.flush()
+            except BaseException:
+                if sigma_pool_analyzer is not None:
+                    sigma_pool_analyzer.close()
+                raise
             last_checkpoint = time.monotonic()
             return
         snapshot_id += 1
@@ -542,10 +551,15 @@ def search_opn(
             "live_total_states": total_states,
             "live_elapsed": snapshot_elapsed,
         })
-        if sigma_pool_analyzer is not None:
-            sigma_pool_analyzer.flush()
-        if checkpoint_callback is not None:
-            checkpoint_callback(state_holder, reason)
+        try:
+            if sigma_pool_analyzer is not None:
+                sigma_pool_analyzer.flush()
+            if checkpoint_callback is not None:
+                checkpoint_callback(state_holder, reason)
+        except BaseException:
+            if sigma_pool_analyzer is not None:
+                sigma_pool_analyzer.close()
+            raise
         last_checkpoint = time.monotonic()
 
     _publish_frontier("initial")
@@ -557,6 +571,8 @@ def search_opn(
     while heap:
         if stop_requested is not None and stop_requested():
             _publish_frontier("stop")
+            if sigma_pool_analyzer is not None:
+                sigma_pool_analyzer.close()
             raise SearchStopped("search stopped at a stable frontier boundary")
 
         if (
@@ -607,9 +623,7 @@ def search_opn(
 
             # ── spoof check ──
             if _check_spoof(st):
-                if use_heap:
-                    pass
-                else:
+                if not use_heap:
                     _publish_frontier("solution")
                 yield st
                 if not use_heap:
@@ -758,7 +772,8 @@ def search_opn(
                         mechanism=PruneMechanism.INTERVAL_BOUND,
                         clone_effect=CloneEffect.AVOIDED,
                     )
-                    idx += 1; continue
+                    idx += 1
+                    continue
                 if use_heap:
                     hi = next_prime_upper_bound(
                         st.ratio_num, st.ratio_den, idx, k_remain,
@@ -774,14 +789,15 @@ def search_opn(
                         break
 
                 capacity_enabled = (
-                    SEARCH_MODE.require_euler
+                    use_heap
+                    and SEARCH_MODE.require_euler
                     and SEARCH_MODE.target_num == 2
                     and SEARCH_MODE.target_den == 1
                 )
                 is_max_candidate = (
                     capacity_enabled
                     and k_remain == 1
-                    and (not use_heap or not st.pending)
+                    and not st.pending
                     and all(p >= q for q in st.assigned)
                 )
                 if is_max_candidate:
@@ -868,6 +884,10 @@ def search_opn(
                         _push(heap, ns)
 
                 break
+        except BaseException:
+            if sigma_pool_analyzer is not None:
+                sigma_pool_analyzer.close()
+            raise
         finally:
             states_completed += 1
             if observer is not None:
@@ -882,6 +902,8 @@ def search_opn(
     print()  # end inline progress line cleanly
     print(f"搜索完成: {total_states:,} states, {elapsed:.1f}s")
     _publish_frontier("complete")
+    if sigma_pool_analyzer is not None:
+        sigma_pool_analyzer.close()
 
 
 # ── terminal-slot pruning ─────────────────────────────────────

@@ -1,9 +1,4 @@
-"""
-opn_reports — structure / performance / summary report writers.
-
-Replaces the monolithic ``write_telemetry_report()`` with separate
-semantically-clean output files.
-"""
+"""Structure, performance, manifest, and summary report writers."""
 
 from __future__ import annotations
 

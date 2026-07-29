@@ -240,9 +240,7 @@ def _numpy_prime_view(
 ) -> Tuple[np.ndarray, np.dtype]:
     """Return a zero-copy NumPy view when the pool is array('I'/'Q').
 
-    A normal Python raverse the complete
-    input.  Converting the scalar to the array's exact dtype preserves the
-    intended O(log n) binary search.sequence is converted to one compact NumPy array.
+    A normal Python sequence is converted to one compact NumPy array.
     """
     if isinstance(primes, array):
         if primes.typecode == "I" and primes.itemsize == 4:
@@ -275,7 +273,9 @@ def _typed_searchsorted_right(
     """Return a right insertion point without whole-array dtype promotion.
 
     On very large unsigned arrays, passing a Python ``int`` directly to
-    NumPy's ``searchsorted`` can make dtype resolution t
+    NumPy's ``searchsorted`` can make dtype resolution traverse the complete
+    input.  Converting the scalar to the array's exact dtype preserves the
+    intended O(log n) binary search.
     """
     if sorted_values.ndim != 1:
         raise ValueError("searchsorted input must be one-dimensional")

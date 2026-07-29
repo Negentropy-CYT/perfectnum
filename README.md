@@ -307,6 +307,8 @@ POOL_PLAN_DISK_CACHE_DIR = "plan_cache"
 POOL_PLAN_DISK_MIN_FREE_BYTES = 2 * 1024**3
 ENABLE_FERMAT_DEBT = False      # conservative debt-capacity bound (off)
 CHECKPOINT_INTERVAL_SECONDS = 300.0
+PRUNING_POLICY = "baseline-v0"  # identity tag in manifest.json
+TELEMETRY_SCHEMA_VERSION = 3    # per-exponent breakdowns active
 ```
 
 In `hierarchical` mode, plans retain only exact superblock products.  Leaf
@@ -429,9 +431,9 @@ Output is written to a timestamped `runs/<run_id>/` directory:
 | File | Content |
 |---|---|
 | `summary.txt` | Run identity, configuration, result, report index |
-| `manifest.json` | Machine-readable config + version |
-| `structure.txt` / `.json` | Mathematical results: prune reasons, depth histogram, ratio headroom, propagation edges, sigma classifications, contradiction attribution, pending-prime frequency. The text report also includes a concise clone summary; the JSON remains structural. |
-| `performance.txt` / `.json` | Engineering metrics: phase timings, clone payload, pool cache, GCD workload, plan build timing, prune mechanisms, core timings, slowest analyses, memory snapshots |
+| `manifest.json` | Machine-readable config + `telemetry_schema_version` + `pruning_policy` |
+| `structure.txt` / `.json` | Mathematical results: prune reasons, depth histogram, ratio headroom, propagation edges, sigma classifications, contradiction attribution, pending-prime frequency, **sigma classifications by exponent**, **valuation contradictions by source exponent** |
+| `performance.txt` / `.json` | Engineering metrics: phase timings, clone payload, pool cache, GCD workload, plan build timing, prune mechanisms, core timings, slowest analyses, memory snapshots, **sigma-pool workload by exponent** |
 | `performance_samples.csv` | Time-series: RSS, CPU, rate, frontier size (2 s interval) |
 
 Prune counters are recorded in two orthogonal dimensions:
@@ -441,7 +443,10 @@ Prune counters are recorded in two orthogonal dimensions:
 
 This separation keeps the mathematical report deterministic across
 hardware while surfacing cache and implementation bottlenecks in the
-performance report.
+performance report.  Per-exponent breakdowns are pre-allocated via
+`metrics.configure_exponent_telemetry(max_exp)` at search start and
+persist through checkpoint cycles; missing fields in old checkpoints
+are filled with zero defaults.
 
 ### Checkpoint / Resume
 

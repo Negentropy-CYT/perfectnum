@@ -61,6 +61,21 @@ def write_manifest(
             "pool_plan_disk_cache_enabled": config.get(
                 "pool_plan_disk_cache_enabled"
             ),
+            "abundancy_gap_capture_enabled": config.get(
+                "abundancy_gap_capture_enabled"
+            ),
+            "abundancy_gap_max_num": config.get(
+                "abundancy_gap_max_num"
+            ),
+            "abundancy_gap_max_den": config.get(
+                "abundancy_gap_max_den"
+            ),
+            "abundancy_gap_max_records": config.get(
+                "abundancy_gap_max_records"
+            ),
+            "abundancy_gap_text_limit": config.get(
+                "abundancy_gap_text_limit"
+            ),
         },
     }
     with (run_dir / "manifest.json").open("w", encoding="utf-8") as f:
@@ -84,6 +99,7 @@ def write_summary(
     solutions_found: int,
     elapsed_seconds: float,
     metrics: RunMetrics,
+    abundancy_capture_summary: dict | None = None,
 ) -> None:
     """Write run_summary.txt — index of the run and its reports."""
     lines: List[str] = []
@@ -124,6 +140,27 @@ def write_summary(
     w("  structure:    structure.txt / structure.json")
     w("  performance:  performance.txt / performance.json")
     w("  samples:      performance_samples.csv")
+    if (
+        abundancy_capture_summary is not None
+        and abundancy_capture_summary.get("configuration", {}).get(
+            "enabled",
+            False,
+        )
+    ):
+        w(
+            "  abundancy:   abundancy_gap_states.jsonl / "
+            "abundancy_gap_index.csv"
+        )
+        w(
+            "                abundancy_gap_top.txt / "
+            "abundancy_sigma_maps.json"
+        )
+        w("                abundancy_gap_summary.json")
+        w(
+            "  captured:    "
+            f"{abundancy_capture_summary.get('records_written', 0):,} "
+            "productive partial states"
+        )
     w("")
 
     with (run_dir / "summary.txt").open("w", encoding="utf-8") as f:
@@ -759,6 +796,7 @@ def write_all_reports(
     pruning_policy: str = "",
     telemetry_schema_version: int = 0,
     _sig_factors: dict | None = None,
+    abundancy_capture_summary: dict | None = None,
 ) -> None:
     """Write all output files for a completed run."""
     write_manifest(
@@ -787,6 +825,7 @@ def write_all_reports(
         solutions_found=solutions_found,
         elapsed_seconds=elapsed_seconds,
         metrics=metrics,
+        abundancy_capture_summary=abundancy_capture_summary,
     )
     write_structure_text(
         run_dir,

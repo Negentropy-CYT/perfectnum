@@ -195,6 +195,11 @@ Every run creates `runs/<run_id>/` containing:
 - `performance.txt` and `performance.json`: timing, cache, GCD, and memory data;
 - `performance_samples.csv`: sampled progress and process resources.
 
+True-OPN factor-chain runs also record productive partial states satisfying
+$0 < 2-\sigma(S)/S \le 10^{-2}$ in a streamed JSONL file, with a compact CSV
+index and a detailed text report for the 100 smallest positive gaps. These
+records are observability output and do not participate in pruning.
+
 Long-running state is saved atomically in `checkpoint_merged.pkl`. One
 `Ctrl+C` requests a stable stop and checkpoint; a second interrupt stops
 immediately and retains the most recent complete checkpoint when one exists.
@@ -215,6 +220,7 @@ opn_metrics.py     structural and performance data models
 opn_io.py          checkpoints, solutions, and factor-graph export
 opn_reports.py     text, JSON, and CSV report writers
 opn_runtime.py     background process-resource sampler
+opn_abundancy_capture.py  small positive abundancy-gap state capture
 opn_sigma_db.py    validated persistent sigma-analysis cache
 opn_plan_cache.py  validated persistent hierarchical-plan cache
 test_opn.py        mathematical, recovery, cache, and search regression tests

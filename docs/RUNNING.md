@@ -127,11 +127,23 @@ POOL_PLAN_BUILD_POLICY = "adaptive"
 POOL_PLAN_DISK_CACHE_ENABLED = True
 POOL_PLAN_DISK_CACHE_DIR = "plan_cache"
 POOL_PLAN_DISK_MIN_FREE_BYTES = 2 * 1024**3
+CAPTURE_ABUNDANCY_GAP_STATES = True
+ABUNDANCY_GAP_MAX_NUM = 1
+ABUNDANCY_GAP_MAX_DEN = 100
+ABUNDANCY_GAP_MAX_RECORDS = 50_000
+ABUNDANCY_GAP_TEXT_LIMIT = 100
 ```
 
 These controls change resource use and execution paths, not the intended
 mathematical search set. `hierarchical` is the production GCD mode. `flat`
 retains leaf products and is primarily a correctness oracle.
+
+The abundancy-gap controls affect observability output only. In the default
+true-OPN mode they save productive partial states satisfying
+$0<2-\sigma(S)/S\le1/100$ whose already-required, unassigned primes do not
+force the standard mandatory-pending lower bound above 2. The record limit
+and text limit bound output volume; reaching either limit never changes the
+search frontier.
 
 `adaptive` plan construction starts on demand and begins batched construction
 after repeated distinct plan misses. This avoids unnecessary plans on a warm

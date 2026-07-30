@@ -3817,3 +3817,423 @@ class TestDomainAwareRatio:
                             for actual_num, actual_den
                             in legal_completions
                         )
+
+
+class TestAbundancyGapCapture:
+    @staticmethod
+    def _near_state() -> ChainState:
+        """Return a mathematically consistent small-gap partial integer."""
+        st = ChainState()
+        st.assigned = {3: 2, 5: 2, 11: 2, 67: 2}
+        st.current_v = {3: 2, 5: 2, 11: 2, 67: 2}
+        st.required_v = {3: 1, 7: 3, 13: 1, 19: 1, 31: 2, 10009: 1}
+        st.pending.append(10009)
+        st.pending_set.update(st.pending)
+        st.depth = 4
+        st.next_idx = 9
+        st.excluded.update({17, 23})
+        ratio = Fraction(1, 1)
+        for prime, exponent in st.assigned.items():
+            ratio *= Fraction(
+                int(sigma_prime_power(prime, exponent)),
+                prime ** exponent,
+            )
+        st.ratio_num = mpz(ratio.numerator)
+        st.ratio_den = mpz(ratio.denominator)
+        return st
+
+    @staticmethod
+    def _database(path, state: ChainState) -> None:
+        database = SigmaAnalysisDatabase(path)
+        try:
+            for prime, exponent in state.assigned.items():
+                sigma_value = mpz(sigma_prime_power(prime, exponent))
+                odd_sigma, _v2 = _remove_all(sigma_value, 2)
+                valuations = {
+                    q: e
+                    for q, e in factorize(int(odd_sigma))
+                    if q != 2
+                }
+                database.store(
+                    p=prime,
+                    exp=exponent,
+                    exact=True,
+                    scanned_limit=0,
+                    pool_digest=b"",
+                    valuations=valuations,
+                    residual=mpz(1),
+                    sigma_odd=odd_sigma,
+                )
+            database.flush()
+        finally:
+            database.close()
+
+    def test_exact_gap_boundaries(self):
+        from opn_metrics import (
+            StructureMetrics,
+            exact_headroom_bucket,
+        )
+
+        boundaries = [
+            (100, "1e-3-1e-2", ">1e-2"),
+            (1_000, "1e-4-1e-3", "1e-3-1e-2"),
+            (10_000, "1e-5-1e-4", "1e-4-1e-3"),
+            (100_000, "1e-6-1e-5", "1e-5-1e-4"),
+            (1_000_000, "<1e-6", "1e-6-1e-5"),
+        ]
+        scale = 1_000
+        for denominator, at_or_below, above in boundaries:
+            cases = (
+                (scale - 1, scale * denominator, at_or_below),
+                (1, denominator, at_or_below),
+                (scale + 1, scale * denominator, above),
+            )
+            for gap_num, gap_den, expected in cases:
+                assert exact_headroom_bucket(
+                    ratio_num=2 * gap_den - gap_num,
+                    ratio_den=gap_den,
+                    target_num=2,
+                    target_den=1,
+                ) == expected
+
+        # The capture interval includes 10^-2 exactly and excludes the
+        # immediately larger rational value.
+        assert exact_headroom_bucket(
+            ratio_num=199,
+            ratio_den=100,
+            target_num=2,
+            target_den=1,
+        ) == "1e-3-1e-2"
+        assert exact_headroom_bucket(
+            ratio_num=198_999_999,
+            ratio_den=100_000_000,
+            target_num=2,
+            target_den=1,
+        ) == ">1e-2"
+
+        for gap_num, gap_den in (
+            (1, 100),
+            (999, 100_000),
+        ):
+            assert exact_headroom_bucket(
+                ratio_num=2 * gap_den - gap_num,
+                ratio_den=gap_den,
+                target_num=2,
+                target_den=1,
+            ) == "1e-3-1e-2"
+
+        metrics = StructureMetrics()
+        metrics.record_productive(
+            depth=1,
+            assigned_count=1,
+            pending=(),
+            ratio_num=199,
+            ratio_den=100,
+            target_num=2,
+            target_den=1,
+        )
+        assert metrics.ratio_headroom["1e-3-1e-2"] == 1
+
+    def test_capture_and_human_report(self, tmp_path):
+        from opn_abundancy_capture import (
+            AbundancyCaptureConfig,
+            AbundancyGapRecorder,
+        )
+
+        state = self._near_state()
+        database_path = tmp_path / "sigma.sqlite3"
+        self._database(database_path, state)
+        recorder = AbundancyGapRecorder(
+            tmp_path,
+            run_id="capture-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=0,
+            config=AbundancyCaptureConfig(),
+        )
+        recorder.capture(state, 1)
+        recorder.commit(1)
+        summary = recorder.finalize(
+            status="COMPLETE",
+            sigma_database_path=database_path,
+        )
+
+        assert summary["qualifying_states"] == 1
+        assert summary["records_written"] == 1
+        record = json.loads(
+            (tmp_path / "abundancy_gap_states.jsonl")
+            .read_text(encoding="utf-8")
+        )
+        ratio = Fraction(
+            int(record["ratio_num"]),
+            int(record["ratio_den"]),
+        )
+        assert ratio == Fraction(81416881, 40737675)
+        assert Fraction(
+            int(record["gap_num"]),
+            int(record["gap_den"]),
+        ) == 2 - ratio
+        assert record["assigned"] == [[3, 2], [5, 2], [11, 2], [67, 2]]
+
+        sigma_doc = json.loads(
+            (tmp_path / "abundancy_sigma_maps.json")
+            .read_text(encoding="utf-8")
+        )
+        assert set(sigma_doc["records"]) == {"3:2", "5:2", "11:2", "67:2"}
+        for mapping in sigma_doc["records"].values():
+            reconstructed = mpz(2) ** mapping["v2"]
+            for prime, exponent in mapping["odd_valuations"]:
+                reconstructed *= mpz(prime) ** exponent
+            assert reconstructed == mpz(mapping["sigma"])
+
+        text = (tmp_path / "abundancy_gap_top.txt").read_text(
+            encoding="utf-8"
+        )
+        assert "I(S) = sigma(S) / S" in text
+        assert "Euler component" in text
+        assert "Sigma-factor relations" in text
+        assert "q-adic valuations" in text
+        assert "pending-prime lower bound" in text
+        assert "not odd-perfect-number solutions" in text
+
+    def test_pending_lower_bound_overshoot_is_not_recorded(self, tmp_path):
+        from opn_abundancy_capture import (
+            AbundancyCaptureConfig,
+            AbundancyGapRecorder,
+        )
+
+        state = self._near_state()
+        state.pending.clear()
+        state.pending.append(7)
+        state.pending_set.clear()
+        state.pending_set.add(7)
+        recorder = AbundancyGapRecorder(
+            tmp_path,
+            run_id="pending-overshoot-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=0,
+            config=AbundancyCaptureConfig(),
+        )
+        recorder.capture(state, 1)
+        recorder.commit(1)
+        summary = recorder.finalize(
+            status="COMPLETE",
+            sigma_database_path=None,
+        )
+
+        assert summary["small_gap_states_seen"] == 1
+        assert summary["pending_lower_bound_rejections"] == 1
+        assert summary["qualifying_states"] == 0
+        assert summary["records_written"] == 0
+        assert (
+            tmp_path / "abundancy_gap_states.jsonl"
+        ).read_text(encoding="utf-8") == ""
+
+        boundary_dir = tmp_path / "boundary"
+        boundary_state = self._near_state()
+        boundary_state.pending.clear()
+        boundary_state.pending.append(1009)
+        boundary_state.pending_set.clear()
+        boundary_state.pending_set.add(1009)
+        # (1009 / 505) * (1010 / 1009) = 2 exactly.
+        boundary_state.ratio_num = mpz(1009)
+        boundary_state.ratio_den = mpz(505)
+        boundary = AbundancyGapRecorder(
+            boundary_dir,
+            run_id="pending-boundary-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=0,
+            config=AbundancyCaptureConfig(),
+        )
+        boundary.capture(boundary_state, 1)
+        boundary.commit(1)
+        boundary_summary = boundary.finalize(
+            status="COMPLETE",
+            sigma_database_path=None,
+        )
+        assert boundary_summary["small_gap_states_seen"] == 1
+        assert boundary_summary["pending_lower_bound_rejections"] == 0
+        assert boundary_summary["records_written"] == 1
+
+        rollback_dir = tmp_path / "rollback"
+        rollback = AbundancyGapRecorder(
+            rollback_dir,
+            run_id="pending-rollback-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=0,
+            config=AbundancyCaptureConfig(),
+        )
+        rollback.capture(boundary_state, 1)
+        rollback.commit(1)
+        rollback.capture(state, 2)
+        rollback_summary = rollback.finalize(
+            status="INTERRUPTED",
+            sigma_database_path=None,
+        )
+        assert rollback_summary["small_gap_states_seen"] == 1
+        assert rollback_summary["pending_lower_bound_rejections"] == 0
+        assert rollback_summary["records_written"] == 1
+
+    def test_uncommitted_tail_is_replayed_without_duplicates(self, tmp_path):
+        from opn_abundancy_capture import (
+            AbundancyCaptureConfig,
+            AbundancyGapRecorder,
+        )
+
+        state = self._near_state()
+        config = AbundancyCaptureConfig()
+        first = AbundancyGapRecorder(
+            tmp_path,
+            run_id="resume-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=0,
+            config=config,
+        )
+        first.capture(state, 10)
+        first.commit(10)
+        first.capture(state, 20)
+        interrupted = first.finalize(
+            status="INTERRUPTED",
+            sigma_database_path=None,
+        )
+        assert interrupted["records_written"] == 1
+
+        resumed = AbundancyGapRecorder(
+            tmp_path,
+            run_id="resume-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=10,
+            config=config,
+        )
+        resumed.capture(state, 20)
+        resumed.commit(20)
+        final = resumed.finalize(
+            status="COMPLETE",
+            sigma_database_path=None,
+        )
+        assert final["records_written"] == 2
+        records = [
+            json.loads(line)
+            for line in (
+                tmp_path / "abundancy_gap_states.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+        ]
+        assert [r["productive_ordinal"] for r in records] == [10, 20]
+
+    def test_partial_tail_is_repaired_but_middle_damage_is_preserved(
+        self,
+        tmp_path,
+    ):
+        from opn_abundancy_capture import (
+            AbundancyCaptureConfig,
+            AbundancyGapRecorder,
+        )
+
+        state = self._near_state()
+        config = AbundancyCaptureConfig()
+        recorder = AbundancyGapRecorder(
+            tmp_path,
+            run_id="repair-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=0,
+            config=config,
+        )
+        recorder.capture(state, 1)
+        recorder.commit(1)
+        recorder._close()
+        raw_path = tmp_path / "abundancy_gap_states.jsonl"
+        with raw_path.open("ab") as handle:
+            handle.write(b'{"incomplete":')
+
+        repaired = AbundancyGapRecorder(
+            tmp_path,
+            run_id="repair-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=1,
+            config=config,
+        )
+        assert repaired.active
+        assert repaired.tail_repairs == 1
+        repaired.finalize(status="COMPLETE", sigma_database_path=None)
+
+        original = raw_path.read_bytes()
+        raw_path.write_bytes(original + b"{not-json}\n")
+        damaged_bytes = raw_path.read_bytes()
+        damaged = AbundancyGapRecorder(
+            tmp_path,
+            run_id="repair-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=2,
+            config=config,
+        )
+        assert not damaged.active
+        assert raw_path.read_bytes() == damaged_bytes
+        assert any("invalid complete line" in error for error in damaged.errors)
+
+    def test_record_limit_and_database_unavailable(self, tmp_path):
+        from opn_abundancy_capture import (
+            AbundancyCaptureConfig,
+            AbundancyGapRecorder,
+        )
+
+        state = self._near_state()
+        recorder = AbundancyGapRecorder(
+            tmp_path,
+            run_id="limit-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=0,
+            config=AbundancyCaptureConfig(
+                max_records=1,
+                text_limit=1,
+            ),
+        )
+        recorder.capture(state, 1)
+        recorder.capture(state, 2)
+        recorder.commit(2)
+        summary = recorder.finalize(
+            status="COMPLETE",
+            sigma_database_path=tmp_path / "missing.sqlite3",
+        )
+        assert summary["qualifying_states"] == 2
+        assert summary["records_written"] == 1
+        assert summary["dropped_due_to_limit"] == 1
+        assert summary["truncated"]
+        sigma_status = summary["derived_outputs"]["sigma_maps"]
+        assert not sigma_status["database_available"]
+        assert "unavailable" in sigma_status["error"]
+
+    def test_capture_write_failure_is_contained(self, tmp_path):
+        from opn_abundancy_capture import (
+            AbundancyCaptureConfig,
+            AbundancyGapRecorder,
+        )
+
+        class FailingHandle:
+            def write(self, _value):
+                raise OSError("simulated disk failure")
+
+            def close(self):
+                pass
+
+        recorder = AbundancyGapRecorder(
+            tmp_path,
+            run_id="failure-test",
+            target_num=2,
+            target_den=1,
+            resume_productive_ordinal=0,
+            config=AbundancyCaptureConfig(),
+        )
+        recorder._handle.close()
+        recorder._handle = FailingHandle()
+        recorder.capture(self._near_state(), 1)
+        assert not recorder.active
+        assert any("simulated disk failure" in error for error in recorder.errors)

@@ -39,14 +39,21 @@ if TYPE_CHECKING:
 CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 
-MAX_PRIME         = 20_000_000_000  # largest odd prime considered
-MAX_FACTORS       = 61          # max distinct prime factors in N
-MAX_EXP           = 35          # max exponent
+MAX_PRIME         = 22_000_000_000  # largest odd prime considered
+MAX_FACTORS       = 65          # max distinct prime factors in N
+MAX_EXP           = 40          # max exponent
 PROPAGATE  = True     # False = Descartes-spoof DFS; True = true OPN chain
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
 ENABLE_FERMAT_DEBT = False
 POOL_GCD_MODE = "hierarchical"          # "flat" or "hierarchical"
 POOL_SUPERBLOCK_FANOUT = 16
+
+# Productive partial states with 0 < 2 - sigma(S) / S <= 1/100.
+CAPTURE_ABUNDANCY_GAP_STATES = True
+ABUNDANCY_GAP_MAX_NUM = 1
+ABUNDANCY_GAP_MAX_DEN = 100
+ABUNDANCY_GAP_MAX_RECORDS = 50_000
+ABUNDANCY_GAP_TEXT_LIMIT = 100
 
 # Persistent sigma analysis and plan-build policy.
 SIGMA_DATABASE_ENABLED = True
@@ -56,7 +63,7 @@ POOL_PLAN_DISK_CACHE_ENABLED = True
 POOL_PLAN_DISK_CACHE_DIR = "plan_cache"
 POOL_PLAN_DISK_MIN_FREE_BYTES = 2 * 1024**3
 
-TELEMETRY_SCHEMA_VERSION = 3
+TELEMETRY_SCHEMA_VERSION = 4
 
 Q3_PREPOOL_MODE = "enforce"
 DOMAIN_RATIO_MODE = "off"

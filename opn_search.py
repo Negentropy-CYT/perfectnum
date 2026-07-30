@@ -335,6 +335,7 @@ def search_opn(
     state_holder: Optional[dict] = None,
     resume_state: Optional[dict] = None,
     observer = None,
+    productive_observer=None,
     progress_callback=None,
     checkpoint_callback=None,
     checkpoint_interval_seconds: Optional[float] = CHECKPOINT_INTERVAL_SECONDS,
@@ -350,6 +351,8 @@ def search_opn(
 
     *metrics* is the single RunMetrics sink for all observability data.
     *observer* is an optional RuntimeSampler for periodic RSS/rate CSV.
+    *productive_observer* receives accepted ChainState objects after all
+    factor-chain propagation has completed.  It is observability-only.
     """
     n = len(primes)
     seen_states = set() if use_cache else None
@@ -752,6 +755,7 @@ def search_opn(
                     st, heap, primes, max_exp, _push, k_remain,
                     sigma_pool_analyzer=sigma_pool_analyzer,
                     metrics=metrics,
+                    productive_observer=productive_observer,
                 ):
                     continue
 
@@ -846,6 +850,11 @@ def search_opn(
                                        metrics=metrics)
                         if ns is not None:
                             ns.next_idx = idx + 1
+                            _notify_productive(
+                                productive_observer,
+                                ns,
+                                metrics,
+                            )
                             _push(heap, ns)
 
                 # non-Euler include
@@ -881,6 +890,11 @@ def search_opn(
                                    metrics=metrics)
                     if ns is not None:
                         ns.next_idx = idx + 1
+                        _notify_productive(
+                            productive_observer,
+                            ns,
+                            metrics,
+                        )
                         _push(heap, ns)
 
                 break
@@ -969,6 +983,7 @@ def _drain_and_process_pending(
     *,
     sigma_pool_analyzer=None,
     metrics: RunMetrics,
+    productive_observer=None,
 ) -> bool:
     if not st.pending:
         return False
@@ -1031,6 +1046,7 @@ def _drain_and_process_pending(
             sigma_pool_analyzer=sigma_pool_analyzer,
         )
         if ns is not None:
+            _notify_productive(productive_observer, ns, metrics)
             _push(heap, ns)
 
     for e in reversed(domain.even_exponents):
@@ -1052,6 +1068,21 @@ def _drain_and_process_pending(
             sigma_pool_analyzer=sigma_pool_analyzer,
         )
         if ns is not None:
+            _notify_productive(productive_observer, ns, metrics)
             _push(heap, ns)
 
     return True
+
+
+def _notify_productive(
+    productive_observer,
+    state: State,
+    metrics: RunMetrics,
+) -> None:
+    """Send one accepted chain state to an optional telemetry observer."""
+    if productive_observer is None or not isinstance(state, ChainState):
+        return
+    productive_observer(
+        state,
+        metrics.structure.productive_states,
+    )

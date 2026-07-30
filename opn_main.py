@@ -20,6 +20,11 @@ from datetime import datetime, timezone
 
 import opn_core
 from opn_core import (
+    ABUNDANCY_GAP_MAX_DEN,
+    ABUNDANCY_GAP_MAX_NUM,
+    ABUNDANCY_GAP_MAX_RECORDS,
+    ABUNDANCY_GAP_TEXT_LIMIT,
+    CAPTURE_ABUNDANCY_GAP_STATES,
     CHECKPOINT_INTERVAL_SECONDS,
     CHECKPOINT_FILE,
     MAX_PRIME,
@@ -43,6 +48,10 @@ from opn_core import (
     generate_odd_primes,
     valid_euler_exponents,
     valid_even_exponents,
+)
+from opn_abundancy_capture import (
+    AbundancyCaptureConfig,
+    AbundancyGapRecorder,
 )
 from opn_io import (
     display_solution,
@@ -133,6 +142,27 @@ def main() -> None:
     git_commit = _git_commit()
     git_dirty = _git_dirty()
     run_dir = prepare_run_directory(run_id)
+    abundancy_capture_config = AbundancyCaptureConfig(
+        enabled=(
+            CAPTURE_ABUNDANCY_GAP_STATES
+            and PROPAGATE
+            and SEARCH_MODE.target_num == 2
+            and SEARCH_MODE.target_den == 1
+            and SEARCH_MODE.require_euler
+        ),
+        max_gap_num=ABUNDANCY_GAP_MAX_NUM,
+        max_gap_den=ABUNDANCY_GAP_MAX_DEN,
+        max_records=ABUNDANCY_GAP_MAX_RECORDS,
+        text_limit=ABUNDANCY_GAP_TEXT_LIMIT,
+    )
+    abundancy_recorder = AbundancyGapRecorder(
+        run_dir,
+        run_id=run_id,
+        target_num=SEARCH_MODE.target_num,
+        target_den=SEARCH_MODE.target_den,
+        resume_productive_ordinal=metrics.structure.productive_states,
+        config=abundancy_capture_config,
+    )
 
     # Create sampler before prime generation so the phase is recorded
     sampler = RuntimeSampler(
@@ -218,6 +248,9 @@ def main() -> None:
         sys.stdout.flush()
 
     def _save_stable_boundary(holder: dict, reason: str) -> None:
+        abundancy_recorder.commit(
+            metrics.structure.productive_states
+        )
         if reason in {"initial", "periodic"}:
             save_checkpoint(holder, solutions, run_id=run_id, metrics=metrics)
 
@@ -248,6 +281,7 @@ def main() -> None:
             state_holder=state_holder,
             resume_state=resume_state,
             observer=sampler,
+            productive_observer=abundancy_recorder.capture,
             progress_callback=_show_progress,
             checkpoint_callback=_save_stable_boundary,
             checkpoint_interval_seconds=CHECKPOINT_INTERVAL_SECONDS,
@@ -309,6 +343,15 @@ def main() -> None:
             sampler.capture_memory()
         )
 
+        abundancy_summary = abundancy_recorder.finalize(
+            status=status,
+            sigma_database_path=(
+                SIGMA_DATABASE_FILE
+                if SIGMA_DATABASE_ENABLED
+                else None
+            ),
+        )
+
         config = {
             "max_prime": int(primes[-1]) if len(primes) > 0 else MAX_PRIME,
             "max_factors": max_factors,
@@ -332,6 +375,21 @@ def main() -> None:
             "q3_prepool_mode": Q3_PREPOOL_MODE,
             "domain_ratio_mode": DOMAIN_RATIO_MODE,
             "pending_selection": PENDING_SELECTION,
+            "abundancy_gap_capture_enabled": (
+                abundancy_capture_config.enabled
+            ),
+            "abundancy_gap_max_num": (
+                abundancy_capture_config.max_gap_num
+            ),
+            "abundancy_gap_max_den": (
+                abundancy_capture_config.max_gap_den
+            ),
+            "abundancy_gap_max_records": (
+                abundancy_capture_config.max_records
+            ),
+            "abundancy_gap_text_limit": (
+                abundancy_capture_config.text_limit
+            ),
             "git_dirty": git_dirty,
         }
         write_all_reports(
@@ -349,6 +407,7 @@ def main() -> None:
             pruning_policy=PRUNING_POLICY,
             telemetry_schema_version=TELEMETRY_SCHEMA_VERSION,
             _sig_factors=opn_core._SIG_FACTORS,
+            abundancy_capture_summary=abundancy_summary,
         )
 
         if status == "STOPPED":

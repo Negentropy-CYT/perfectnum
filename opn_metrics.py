@@ -83,17 +83,43 @@ _HEADROOM_BUCKETS = (
 )
 
 
-def headroom_bucket(value: float) -> str:
-    """Classify a ratio headroom value into a bucket string."""
-    if value <= 1e-6:
+def exact_headroom(
+    *,
+    ratio_num: int,
+    ratio_den: int,
+    target_num: int,
+    target_den: int,
+) -> tuple[int, int]:
+    """Return the exact positive-or-negative gap ``target - ratio``."""
+    return (
+        target_num * ratio_den - target_den * ratio_num,
+        target_den * ratio_den,
+    )
+
+
+def exact_headroom_bucket(
+    *,
+    ratio_num: int,
+    ratio_den: int,
+    target_num: int,
+    target_den: int,
+) -> str:
+    """Classify ``target - ratio`` by exact integer comparisons."""
+    numerator, denominator = exact_headroom(
+        ratio_num=ratio_num,
+        ratio_den=ratio_den,
+        target_num=target_num,
+        target_den=target_den,
+    )
+    if numerator * 1_000_000 <= denominator:
         return "<1e-6"
-    if value <= 1e-5:
+    if numerator * 100_000 <= denominator:
         return "1e-6-1e-5"
-    if value <= 1e-4:
+    if numerator * 10_000 <= denominator:
         return "1e-5-1e-4"
-    if value <= 1e-3:
+    if numerator * 1_000 <= denominator:
         return "1e-4-1e-3"
-    if value <= 1e-2:
+    if numerator * 100 <= denominator:
         return "1e-3-1e-2"
     return ">1e-2"
 
@@ -204,9 +230,12 @@ class StructureMetrics:
         target_den: int,
     ) -> None:
         """Record one productive clone's structural statistics."""
-        ratio = ratio_num / ratio_den
-        headroom = target_num / target_den - ratio
-        bucket = headroom_bucket(headroom)
+        bucket = exact_headroom_bucket(
+            ratio_num=ratio_num,
+            ratio_den=ratio_den,
+            target_num=target_num,
+            target_den=target_den,
+        )
 
         self.productive_states += 1
         self.depth_histogram[depth] += 1

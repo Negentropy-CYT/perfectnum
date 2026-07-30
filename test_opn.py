@@ -1723,7 +1723,7 @@ class TestCheckpoint:
 
         monkeypatch.setattr(
             opn_main,
-            "generate_odd_primes",
+            "open_or_extend_prime_pool",
             unexpected_prime_generation,
         )
 
@@ -1815,7 +1815,7 @@ class TestCheckpoint:
         captured_report = {}
         monkeypatch.setattr(
             opn_main,
-            "generate_odd_primes",
+            "open_or_extend_prime_pool",
             lambda _limit: small_primes,
         )
         monkeypatch.setattr(opn_main, "RuntimeSampler", FakeSampler)

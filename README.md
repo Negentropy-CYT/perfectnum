@@ -83,7 +83,7 @@ where $22021$ is treated as if it were prime.
 
 Requirements:
 
-- Python 3.10 or newer;
+- Python 3.11 or newer;
 - `gmpy2`;
 - NumPy;
 - `psutil`.
@@ -245,7 +245,7 @@ python -m pip install "pytest>=7"
 python -m pytest -q
 ```
 
-The repository CI runs the non-slow suite on Python 3.10, 3.11, and 3.12.
+The repository CI runs the non-slow suite on Python 3.11 and 3.12.
 Correctness tests include independent arithmetic oracles, sigma-component
 identities, filter completeness, cache corruption fallback, checkpoint
 continuity, and deterministic search-structure comparisons.

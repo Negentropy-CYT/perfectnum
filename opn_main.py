@@ -45,10 +45,11 @@ from opn_core import (
     TELEMETRY_SCHEMA_VERSION,
     SIGMA_DATABASE_ENABLED,
     SIGMA_DATABASE_FILE,
-    generate_odd_primes,
+    prime_pool_typecode,
     valid_euler_exponents,
     valid_even_exponents,
 )
+from opn_prime_pool import open_or_extend_prime_pool
 from opn_abundancy_capture import (
     AbundancyCaptureConfig,
     AbundancyGapRecorder,
@@ -174,17 +175,18 @@ def main() -> None:
 
     if chk is not None:
         sampler.set_phase("prime_generation")
-        primes = generate_odd_primes(chk["prime_limit"])
+        primes = open_or_extend_prime_pool(chk["prime_limit"])
         # strict fingerprint verification — any mismatch aborts
         if len(primes) != chk["prime_count"]:
             raise RuntimeError(
                 f"checkpoint prime_count mismatch: "
                 f"expected {chk['prime_count']}, got {len(primes)}"
             )
-        if primes.typecode != chk["prime_typecode"]:
+        if prime_pool_typecode(primes) != chk["prime_typecode"]:
             raise RuntimeError(
                 f"checkpoint prime_typecode mismatch: "
-                f"expected {chk['prime_typecode']!r}, got {primes.typecode!r}"
+                f"expected {chk['prime_typecode']!r}, "
+                f"got {prime_pool_typecode(primes)!r}"
             )
         if int(primes[0]) != chk["first_prime"]:
             raise RuntimeError(
@@ -201,7 +203,7 @@ def main() -> None:
         )
     else:
         sampler.set_phase("prime_generation")
-        primes = generate_odd_primes(MAX_PRIME)
+        primes = open_or_extend_prime_pool(MAX_PRIME)
         max_factors = MAX_FACTORS
         max_exp = MAX_EXP
         sampler.capture_memory_phase(

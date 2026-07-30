@@ -24,6 +24,7 @@ from opn_core import (
     MAX_EXP,
     factorize,
     power_pa,
+    prime_pool_typecode,
     sigma_prime_power,
 )
 from opn_state import ChainState, validate_chain_state
@@ -153,7 +154,7 @@ def save_checkpoint(
         },
         "prime_limit":   int(primes[-1]) if len(primes) > 0 else 0,
         "prime_count":   len(primes),
-        "prime_typecode":getattr(primes, "typecode", "I"),
+        "prime_typecode": prime_pool_typecode(primes) if len(primes) > 0 else "I",
         "first_prime":   int(primes[0]) if len(primes) > 0 else 0,
         "last_prime":    int(primes[-1]) if len(primes) > 0 else 0,
         "max_factors":   state_holder.get("max_factors", MAX_FACTORS),

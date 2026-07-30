@@ -428,6 +428,7 @@ def assign_prime_dfs(
     max_exp: int = MAX_EXP,
 ) -> Optional[DFSState]:
     """Assign p^exp to a DFSState.  No factor-chain propagation."""
+    p = int(p)  # normalise numpy unsigned → Python int
     if p in st.excluded or p in st.assigned:
         return _reject(
             metrics,
@@ -499,6 +500,7 @@ def assign_prime_chain(
     valuation contradictions avoid both unnecessary clones and global eager
     factorisation of unreachable (p, a) pairs.
     """
+    p = int(p)  # normalise numpy unsigned → Python int (metrics keys, gmpy2)
     if p in st.excluded or p in st.assigned:
         return _reject(
             metrics,

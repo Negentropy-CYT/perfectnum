@@ -31,6 +31,7 @@ from opn_plan_cache import (
     PlanCacheKey,
     PlanCacheValidationError,
 )
+from opn_prime_pool import iter_odd_prime_chunks
 from opn_sigma_db import PersistedSigmaRecord, SigmaAnalysisDatabase
 if TYPE_CHECKING:
     from opn_metrics import PerformanceMetrics, StructureMetrics
@@ -39,9 +40,9 @@ if TYPE_CHECKING:
 CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 
-MAX_PRIME         = 22_000_000_000  # largest odd prime considered
+MAX_PRIME         = 32_000_000_000  # largest odd prime considered
 MAX_FACTORS       = 65          # max distinct prime factors in N
-MAX_EXP           = 40          # max exponent
+MAX_EXP           = 35          # max exponent
 PROPAGATE  = True     # False = Descartes-spoof DFS; True = true OPN chain
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
 ENABLE_FERMAT_DEBT = False
@@ -352,10 +353,22 @@ def component_filter_accepts(q: int, order: int) -> bool:
 def _numpy_prime_view(
     primes: Sequence[int],
 ) -> Tuple[np.ndarray, np.dtype]:
-    """Return a zero-copy NumPy view when the pool is array('I'/'Q').
+    """Return a zero-copy NumPy view of the prime pool.
 
-    A normal Python sequence is converted to one compact NumPy array.
+    ``np.ndarray`` (including ``np.memmap``) is returned as-is.
+    ``array('I'/'Q')`` is mapped via ``np.frombuffer``.
+    Other sequences are converted to a single compact array.
     """
+    # NumPy path — memmap is an ndarray subclass, so this is zero-copy.
+    if isinstance(primes, np.ndarray):
+        if primes.ndim != 1:
+            raise ValueError("prime pool must be one-dimensional")
+        if primes.dtype.itemsize not in {4, 8}:
+            raise TypeError("prime pool must use uint32 or uint64")
+        if not np.issubdtype(primes.dtype, np.unsignedinteger):
+            raise TypeError("prime pool must use unsigned integers")
+        return primes, primes.dtype
+
     if isinstance(primes, array):
         if primes.typecode == "I" and primes.itemsize == 4:
             dtype = np.dtype("=u4")
@@ -378,6 +391,22 @@ def _numpy_prime_view(
     )
 
     return np.asarray(primes, dtype=dtype), dtype
+
+
+def prime_pool_typecode(primes) -> str:
+    """Return ``'I'`` or ``'Q'`` for the storage width of a prime pool.
+
+    Works for ``array('I'/'Q')``, ``np.ndarray`` (including ``np.memmap``),
+    and any other pool that passes ``_numpy_prime_view``.
+    """
+    if isinstance(primes, array):
+        return primes.typecode
+    if isinstance(primes, np.ndarray):
+        if primes.dtype.itemsize == 8:
+            return "Q"
+        if primes.dtype.itemsize == 4:
+            return "I"
+    raise TypeError("unsupported prime-pool storage")
 
 
 def _typed_searchsorted_right(
@@ -2123,6 +2152,9 @@ def generate_odd_primes(limit: int, *, segment_odds: int = 2_000_000) -> array:
     Uses ``array('I')`` (32-bit) when *limit* ≤ 2³²-1, otherwise
     ``array('Q')`` (64-bit).  The sieve is segmented: working memory
     is O(segment_odds) instead of O(limit).
+
+    The segment sieve itself lives in ``opn_prime_pool.iter_odd_prime_chunks``
+    so there is exactly one implementation shared by the RAM and disk paths.
     """
     if limit < 3:
         return array("I")
@@ -2131,37 +2163,13 @@ def generate_odd_primes(limit: int, *, segment_odds: int = 2_000_000) -> array:
 
     use_32bit = limit <= 0xFFFFFFFF
     array_code = "I" if use_32bit else "Q"
-    np_uint = np.uint32 if use_32bit else np.uint64
-
-    root = math.isqrt(limit)
-    base_sieve = np.ones(root + 1, dtype=np.bool_)
-    base_sieve[:2] = False
-    for p in range(2, math.isqrt(root) + 1):
-        if base_sieve[p]:
-            base_sieve[p * p: root + 1: p] = False
-    base_primes = np.flatnonzero(base_sieve)
-    odd_base = base_primes[base_primes >= 3]
 
     result = array(array_code)
-    segment_span = 2 * segment_odds
-    for low in range(3, limit + 1, segment_span):
-        high = min(limit, low + segment_span - 2)
-        if high % 2 == 0:
-            high -= 1
-        count = ((high - low) // 2) + 1
-        segment = np.ones(count, dtype=np.bool_)
-        for p_val in odd_base:
-            p = int(p_val)
-            p_sq = p * p
-            if p_sq > high:
-                break
-            start = max(p_sq, ((low + p - 1) // p) * p)
-            if start % 2 == 0:
-                start += p
-            first = (start - low) // 2
-            segment[first::p] = False
-        indices = np.flatnonzero(segment)
-        values = (low + 2 * indices).astype(np_uint, copy=False)
+    for chunk in iter_odd_prime_chunks(3, limit, segment_odds=segment_odds):
+        if use_32bit:
+            values = np.asarray(chunk, dtype=np.dtype("=u4"))
+        else:
+            values = chunk  # already uint64
         result.frombytes(values.tobytes())
     return result
 
@@ -2231,6 +2239,7 @@ def factorize(n: int) -> List[Tuple[int, int]]:
 # ── sigma & power (cached) ────────────────────────────────────
 def sigma_prime_power(p: int, a: int) -> mpz:
     """σ(p^a) = (p^(a+1)-1) / (p-1)."""
+    p = int(p)  # normalise numpy unsigned → Python int (gmpy2 // np.uint64 → float)
     key = (p, a)
     if key in SIGMA_CACHE:
         return SIGMA_CACHE[key]
@@ -2426,6 +2435,7 @@ def even_max_exp_capacity(capacity: int) -> int:
 
 def power_pa(p: int, a: int) -> int:
     """p^a (as Python int; fits the search range)."""
+    p = int(p)  # normalise numpy unsigned → Python int (cache-key consistency)
     key = (p, a)
     if key in POWER_CACHE:
         return POWER_CACHE[key]

@@ -15,6 +15,7 @@ solutions*.txt
 sigma_pool*.sqlite3
 sigma_pool*.sqlite3-*
 plan_cache/
+prime_pool/
 *.tmp
 
 # Per-run output directory

@@ -1565,11 +1565,9 @@ class SigmaPoolAnalyzer:
             return
         self._structure.sigma_classified_keys.add(key)
         if result.exact:
-            self._structure.sigma_exact += 1
             if exp < len(self._structure.sigma_exact_by_exp):
                 self._structure.sigma_exact_by_exp[exp] += 1
         else:
-            self._structure.sigma_outside += 1
             if exp < len(self._structure.sigma_outside_by_exp):
                 self._structure.sigma_outside_by_exp[exp] += 1
             residual_bits = int(result.residual).bit_length()

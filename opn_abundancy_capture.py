@@ -1020,7 +1020,11 @@ def _write_text_report(
     *,
     records: list[dict[str, Any]],
     sigma_maps: dict[str, dict[str, Any]],
+    target_num: int,
+    target_den: int,
 ) -> None:
+    _tgt = str(target_num) if target_den == 1 else f"{target_num}/{target_den}"
+    _tgt_gap = f"{_tgt} - I(S)"
     target = run_dir / TEXT_FILENAME
     temporary = target.with_suffix(target.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="\n") as handle:
@@ -1029,14 +1033,14 @@ def _write_text_report(
         w("=" * 72 + "\n\n")
         w("For each recorded partial factorization S:\n")
         w("  I(S) = sigma(S) / S\n")
-        w("  0 < 2 - I(S) <= 10^-2\n\n")
+        w(f"  0 < {_tgt_gap} <= 10^-2\n\n")
         w(
             "States for which the mandatory pending-prime lower bound "
-            "already exceeds 2 are excluded.\n\n"
+            f"already exceeds {_tgt} are excluded.\n\n"
         )
         w(
-            "These are productive partial search states, not odd-perfect-"
-            "number solutions or complete candidates.\n"
+            "These are productive partial search states, not complete "
+            "solutions or complete candidates.\n"
         )
         w(
             "The q-adic difference is "
@@ -1091,9 +1095,9 @@ def _write_text_report(
                 "  I(S) decimal:    "
                 f"{_decimal_ratio(ratio.numerator, ratio.denominator)}\n"
             )
-            w(f"  2 - I(S) exact:  {gap.numerator} / {gap.denominator}\n")
+            w(f"  {_tgt_gap} exact:  {gap.numerator} / {gap.denominator}\n")
             w(
-                "  2 - I(S) decimal:"
+                f"  {_tgt_gap} decimal:"
                 f"  {_decimal_ratio(gap.numerator, gap.denominator)}\n"
             )
 
@@ -1197,6 +1201,8 @@ def _write_derived_outputs(
         run_dir,
         records=top_records,
         sigma_maps=sigma_maps,
+        target_num=target_num,
+        target_den=target_den,
     )
     return {
         "complete": True,

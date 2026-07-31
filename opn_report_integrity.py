@@ -141,23 +141,15 @@ def check_structure_json_roundtrip(
     derived_depth: Counter[int] = Counter()
     for (d, _nf), c in s.depth_factor_map.items():
         derived_depth[d] += c
-    json_depth = doc.get("depth_histogram", {})
-    depth_ok = (
-        sum(json_depth.values()) == sum(derived_depth.values())
-        if json_depth or derived_depth
-        else True
-    )
+    json_depth = Counter({int(k): int(v) for k, v in doc.get("depth_histogram", {}).items()})
+    depth_ok = json_depth == derived_depth
 
     # ratio_headroom derived from headroom_by_factor
     derived_rh: Counter[str] = Counter()
     for (_nf, b), c in s.headroom_by_factor.items():
         derived_rh[b] += c
-    json_rh = doc.get("ratio_headroom", {})
-    rh_ok = (
-        sum(json_rh.values()) == sum(derived_rh.values())
-        if json_rh or derived_rh
-        else True
-    )
+    json_rh = Counter({str(k): int(v) for k, v in doc.get("ratio_headroom", {}).items()})
+    rh_ok = json_rh == derived_rh
 
     return {"structure_json_roundtrip": {
         "passed": (prop_mismatch == 0 and sigma_ok and depth_ok and rh_ok),

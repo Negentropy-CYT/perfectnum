@@ -3998,7 +3998,7 @@ class TestAbundancyGapCapture:
         assert "Sigma-factor relations" in text
         assert "q-adic valuations" in text
         assert "pending-prime lower bound" in text
-        assert "not odd-perfect-number solutions" in text
+        assert "not complete solutions or complete candidates" in text
 
     def test_pending_lower_bound_overshoot_is_not_recorded(self, tmp_path):
         from opn_abundancy_capture import (

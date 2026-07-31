@@ -10,6 +10,7 @@ from opn_metrics import (
     RunMetrics,
     _HEADROOM_BUCKETS,
 )
+from opn_report_integrity import write_integrity_json
 
 
 def prepare_run_directory(run_id: str) -> Path:
@@ -287,6 +288,74 @@ def _structure_lines(
         for (p_edge, e, q), count in s.propagation_exp_edges.most_common(10):
             w(f"  {p_edge:>4}^{e} → {q:<8}  {count:>10,}")
 
+    # ── propagation concentration (B1) ──
+    if s.propagation_exp_edges:
+        from collections import defaultdict
+
+        _unique_primes = len({p for (p, _, _) in s.propagation_exp_edges})
+        _unique_components = len(
+            {(p, exp) for (p, exp, _) in s.propagation_exp_edges}
+        )
+        _unique_edges = len(s.propagation_exp_edges)
+        _total_events = sum(s.propagation_exp_edges.values())
+        _sorted = sorted(s.propagation_exp_edges.values(), reverse=True)
+
+        _groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+        _comp_counts: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for (p, exp, q), c in s.propagation_exp_edges.items():
+            _groups[(p, exp)].append((q, c))
+            _comp_counts[(p, exp)].append(c)
+        _sync = sum(
+            1 for cs in _comp_counts.values() if all(c == cs[0] for c in cs)
+        )
+        _nonsync = len(_comp_counts) - _sync
+
+        _avg_tgt = _unique_edges / _unique_components if _unique_components else 0
+        _avg_prod = (
+            _total_events / s.productive_states if s.productive_states else 0
+        )
+
+        # Aggregate (p→q) edge count for comparison
+        _agg_edges = len(s.propagation_edges)
+
+        w("\n## Propagation concentration")
+        w(f"  unique source primes:         {_unique_primes:>8,}")
+        w(f"  unique source components:     {_unique_components:>8,}")
+        w(f"  unique aggregate edges (p→q): {_agg_edges:>8,}")
+        w(f"  unique exponent edges (p^a→q):{_unique_edges:>8,}")
+        w(f"  total edge events:            {_total_events:>8,}")
+        for _k in [1, 10, 100]:
+            if len(_sorted) >= _k:
+                _share = sum(_sorted[:_k]) / _total_events * 100
+                w(f"  top-{_k} exponent-edge event share: {_share:>6.1f}%")
+        w(f"  synchronized components:      {_sync:>8,}")
+        if _nonsync:
+            w(f"  NON-synchronized components:  {_nonsync:>8,}")
+        w(f"  avg targets per source component:   {_avg_tgt:>5.1f}")
+        w(f"  avg odd propagation edge events per productive:"
+          f" {_avg_prod:>5.1f}")
+
+        # ── propagation source components (B0) ──
+        _ranked = []
+        for (_p, _exp), _targets in _groups.items():
+            _total = sum(c for _, c in _targets)
+            _ranked.append((_total, _p, _exp, _targets))
+        _ranked.sort(reverse=True)
+
+        w("\n## Propagation source components (top-15)")
+        for _total, _p, _exp, _targets in _ranked[:15]:
+            _n_qt = len(_targets)
+            _common = _targets[0][1]
+            _all_eq = all(c == _common for _, c in _targets)
+            w(f"\nsource: {_p}^{_exp}")
+            w(f"  target count: {_n_qt}")
+            w(f"  common target count: {_common:,}")
+            w(f"  total edge events: {_total:,}")
+            if not _all_eq:
+                w(f"  synchronized: NO")
+            for _q, _c in sorted(_targets, key=lambda x: x[1], reverse=True):
+                w(f"    {_q:>8}  {_c:>14,}")
+
     # ── depth × |f| ──
     if s.depth_factor_map:
         w("\n## Depth × |f| (top-15)")
@@ -450,6 +519,51 @@ def write_structure_json(run_dir: Path, metrics: RunMetrics) -> None:
         ],
         "pending_prime_frequency": dict(s.pending_prime_frequency),
     }
+
+    # ── propagation concentration (B1) ──
+    if s.propagation_exp_edges:
+        from collections import defaultdict
+
+        _u_primes = len({p for (p, _, _) in s.propagation_exp_edges})
+        _u_comp = len({(p, exp) for (p, exp, _) in s.propagation_exp_edges})
+        _u_edges = len(s.propagation_exp_edges)
+        _agg_edges = len(s.propagation_edges)
+        _tot_ev = sum(s.propagation_exp_edges.values())
+        _sorted = sorted(s.propagation_exp_edges.values(), reverse=True)
+
+        _comp_cs: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for (p, exp, q), c in s.propagation_exp_edges.items():
+            _comp_cs[(p, exp)].append(c)
+        _sync = sum(
+            1 for cs in _comp_cs.values() if all(c == cs[0] for c in cs)
+        )
+
+        conc: dict[str, Any] = {
+            "unique_source_primes": _u_primes,
+            "unique_source_components": _u_comp,
+            "unique_aggregate_edges": _agg_edges,
+            "unique_exponent_edges": _u_edges,
+            "total_edge_events": _tot_ev,
+            "synchronized_source_components": _sync,
+            "non_synchronized_source_components": _u_comp - _sync,
+            "avg_targets_per_source_component": round(_u_edges / _u_comp, 2)
+            if _u_comp
+            else 0,
+            "avg_exponent_edge_events_per_productive": round(
+                _tot_ev / s.productive_states, 2
+            )
+            if s.productive_states
+            else 0,
+        }
+        if _sorted:
+            for _k in [1, 10, 100]:
+                if len(_sorted) >= _k:
+                    conc[f"top_{_k}_exponent_edge_event_share"] = round(
+                        sum(_sorted[:_k]) / _tot_ev, 6
+                    )
+        doc["propagation_concentration"] = conc
+    else:
+        doc["propagation_concentration"] = None
 
     with (run_dir / "structure.json").open("w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2)
@@ -777,6 +891,51 @@ def _pending_source_lines(s, _sig_factors, max_prime) -> List[str]:
     return lines
 
 
+# ── conclusions ────────────────────────────────────────────────
+
+
+def write_conclusions_json(
+    run_dir: Path,
+    *,
+    metrics: RunMetrics,
+    status: str,
+    solutions_found: int,
+    configured_max_factors: int,
+) -> None:
+    """Write conclusions.json — only strictly provable facts from this run."""
+    s = metrics.structure
+
+    observed_max = max(
+        (k[1] for k in s.depth_factor_map), default=0
+    )
+
+    doc = {
+        "schema_version": 1,
+        "finite_box": {
+            "exhausted": status == "COMPLETE",
+            "solutions_found": solutions_found,
+            # ponytail: always false — a finite search box can never prove
+            # global non-existence of odd perfect numbers.
+            "global_nonexistence_proved": False,
+        },
+        "effective_limits": {
+            "configured_max_factors": configured_max_factors,
+            "observed_max_assigned": observed_max,
+            "factor_limit_reached": observed_max >= configured_max_factors,
+        },
+        "window_pressure": {
+            "outside_window_prune_events": s.prune_reasons.get(
+                "outside_window", 0
+            ),
+            "unique_sigma_exact": s.sigma_exact,
+            "unique_sigma_outside": s.sigma_outside,
+        },
+    }
+
+    with (run_dir / "conclusions.json").open("w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+
+
 # ── master entry point ────────────────────────────────────────
 
 
@@ -853,4 +1012,16 @@ def write_all_reports(
         metrics,
         elapsed=elapsed_seconds,
         sampled_peak_rss=sampled_peak_rss,
+    )
+    write_integrity_json(
+        run_dir,
+        metrics,
+        abundancy_capture_summary=abundancy_capture_summary,
+    )
+    write_conclusions_json(
+        run_dir,
+        metrics=metrics,
+        status=status,
+        solutions_found=solutions_found,
+        configured_max_factors=config["max_factors"],
     )

@@ -689,11 +689,24 @@ class AbundancyGapRecorder:
                 "error": str(exc),
             }
 
+        funnel: dict[str, Any] | None = None
+        try:
+            funnel = _compute_funnel_statistics(
+                self.raw_path,
+                target_num=self.target_num,
+                target_den=self.target_den,
+            )
+        except Exception as exc:
+            self.errors.append(f"funnel statistics failed: {exc}")
+            funnel = {"error": str(exc)}
+
         document = self._progress_summary(
             status=status,
             committed_productive_ordinal=self.last_committed_ordinal,
             derived=derived,
         )
+        if funnel is not None:
+            document["funnel"] = funnel
         try:
             _atomic_json(self.summary_path, document)
         except Exception as exc:
@@ -1117,3 +1130,149 @@ def _write_derived_outputs(
             SUMMARY_FILENAME,
         ],
     }
+
+
+# ── B3: gap-state funnel and population statistics ────────────
+
+
+def _compute_funnel_statistics(
+    raw_path: Path,
+    *,
+    target_num: int,
+    target_den: int,
+) -> dict[str, Any]:
+    """Post-hoc scan of JSONL for population-level gap state statistics.
+
+    Reads records that have already passed validation; never modifies them.
+    """
+    from collections import Counter as _Counter
+
+    euler_dist: _Counter[int | str] = _Counter()
+    assigned_dist: _Counter[int] = _Counter()
+    pending_dist: _Counter[int] = _Counter()
+    debt_dist: _Counter[int] = _Counter()
+
+    unique_assigned: set[tuple[tuple[int, int], ...]] = set()
+    unique_states: set[tuple] = set()
+
+    min_raw_num: int | None = None
+    min_raw_den: int | None = None
+    min_adj_num: int | None = None
+    min_adj_den: int | None = None
+
+    line_count = 0
+
+    with raw_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            line_count += 1
+
+            # Euler prime distribution
+            ep = rec.get("euler_prime")
+            euler_dist[ep if ep is not None else "none"] += 1
+
+            # Assigned / pending counts
+            assigned = rec["assigned"]
+            pending = rec["pending"]
+            assigned_dist[len(assigned)] += 1
+            pending_dist[len(pending)] += 1
+
+            # Valuation debt
+            req_v: dict[int, int] = {
+                int(p): int(v) for p, v in rec.get("required_v", [])
+            }
+            cur_v: dict[int, int] = {
+                int(p): int(v) for p, v in rec.get("current_v", [])
+            }
+            debt = 0
+            for q, req in req_v.items():
+                cur = cur_v.get(q, 0)
+                if req > cur:
+                    debt += req - cur
+            debt_dist[debt] += 1
+
+            # Canonical dedup (compare by value, not just hash)
+            canonical_assigned = tuple(
+                sorted((int(p), int(e)) for p, e in assigned)
+            )
+            unique_assigned.add(canonical_assigned)
+
+            canonical_state = (
+                canonical_assigned,
+                ep,
+                tuple(sorted(pending)),
+                tuple(
+                    sorted(
+                        (int(p), int(v))
+                        for p, v in rec.get("required_v", [])
+                    )
+                ),
+                tuple(
+                    sorted(
+                        (int(p), int(v))
+                        for p, v in rec.get("current_v", [])
+                    )
+                ),
+            )
+            unique_states.add(canonical_state)
+
+            # Min raw gap
+            gap_num = int(rec["gap_num"])
+            gap_den = int(rec["gap_den"])
+            if (
+                min_raw_num is None
+                or gap_num * min_raw_den < min_raw_num * gap_den
+            ):
+                min_raw_num = gap_num
+                min_raw_den = gap_den
+
+            # Min pending-adjusted gap
+            num = mpz(rec["ratio_num"])
+            den = mpz(rec["ratio_den"])
+            for q in pending:
+                num *= q + 1
+                den *= q
+            adj_num = target_num * den - target_den * num
+            adj_den = target_den * int(den)
+            if (
+                min_adj_num is None
+                or adj_num * min_adj_den < min_adj_num * adj_den
+            ):
+                min_adj_num = int(adj_num)
+                min_adj_den = adj_den
+
+    result: dict[str, Any] = {
+        "records_scanned": line_count,
+        "unique_assigned_factorizations": len(unique_assigned),
+        "unique_complete_states": len(unique_states),
+    }
+
+    if min_raw_num is not None:
+        result["min_raw_gap"] = {"num": min_raw_num, "den": min_raw_den}
+    if min_adj_num is not None:
+        result["min_pending_adjusted_gap"] = {
+            "num": min_adj_num,
+            "den": min_adj_den,
+        }
+
+    if euler_dist:
+        result["euler_prime_distribution"] = dict(
+            sorted(euler_dist.items())
+        )
+    if assigned_dist:
+        result["assigned_count_distribution"] = dict(
+            sorted(assigned_dist.items())
+        )
+    if pending_dist:
+        result["pending_count_distribution"] = dict(
+            sorted(pending_dist.items())
+        )
+    if debt_dist:
+        result["valuation_debt_distribution"] = dict(
+            sorted(debt_dist.items())
+        )
+
+    return result

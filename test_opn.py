@@ -4237,3 +4237,263 @@ class TestAbundancyGapCapture:
         recorder.capture(self._near_state(), 1)
         assert not recorder.active
         assert any("simulated disk failure" in error for error in recorder.errors)
+
+
+# ── report integrity checker ──────────────────────────────────
+
+
+class TestReportIntegrity:
+    """Verify the read-only integrity checker catches all invariant violations.
+
+    Uses synthetic RunMetrics objects so the tests are deterministic and fast;
+    no actual search run is required.
+    """
+
+    @staticmethod
+    def _synth_metrics() -> object:
+        """Build a minimal RunMetrics with known-consistent counters."""
+        from opn_metrics import (
+            RunMetrics,
+            PruneReason,
+            PruneMechanism,
+        )
+
+        m = RunMetrics()
+        m.configure_exponent_telemetry(max_exp=3)
+
+        s = m.structure
+
+        # 5 productive states
+        s.productive_states = 5
+        s.depth_histogram[1] = 2
+        s.depth_histogram[2] = 3
+        s.depth_factor_map[(1, 2)] = 2
+        s.depth_factor_map[(2, 3)] = 3
+        s.headroom_by_factor[(2, "<1e-3")] = 2
+        s.headroom_by_factor[(3, "<1e-4")] = 3
+        s.ratio_headroom["<1e-3"] = 2
+        s.ratio_headroom["<1e-4"] = 3
+
+        # 3 propagation events: p=3, exp=1/2, q=5/7
+        s.propagation_edges[(3, 5)] = 2
+        s.propagation_edges[(3, 7)] = 1
+        s.propagation_exp_edges[(3, 1, 5)] = 1
+        s.propagation_exp_edges[(3, 2, 5)] = 1
+        s.propagation_exp_edges[(3, 1, 7)] = 1
+
+        # sigma: 10 exact (2+3+5), 3 outside (1+1+1)
+        s.sigma_exact = 10
+        s.sigma_outside = 3
+        s.sigma_exact_by_exp[0] = 2
+        s.sigma_exact_by_exp[1] = 3
+        s.sigma_exact_by_exp[2] = 5
+        s.sigma_outside_by_exp[0] = 1
+        s.sigma_outside_by_exp[1] = 1
+        s.sigma_outside_by_exp[2] = 1
+
+        # 7 prunes total, 3 reasons, 2 mechanisms
+        for _ in range(4):
+            m.record_prune(
+                reason=PruneReason.RATIO_OVERSHOOT,
+                mechanism=PruneMechanism.PRECLONE_VALUATION,
+            )
+        for _ in range(2):
+            m.record_prune(
+                reason=PruneReason.OUTSIDE_WINDOW,
+                mechanism=PruneMechanism.KNOWN_OUTSIDE_CACHE,
+            )
+        m.record_prune(
+            reason=PruneReason.EULER_FORM,
+            mechanism=PruneMechanism.PRECLONE_VALUATION,
+        )
+
+        return m
+
+    def test_all_invariants_pass_on_consistent_metrics(self):
+        from opn_report_integrity import run_all_checks
+
+        m = self._synth_metrics()
+        result = run_all_checks(m)
+        assert result["status"] == "PASS"
+        for name, check in result["checks"].items():
+            assert check["passed"], f"{name} should pass on consistent data"
+
+    def test_productive_depth_total_detects_mismatch(self):
+        from opn_report_integrity import check_structure_invariants
+
+        m = self._synth_metrics()
+        m.structure.productive_states += 1  # inject drift
+        checks = check_structure_invariants(m)
+        assert not checks["productive_depth_total"]["passed"]
+
+    def test_productive_headroom_total_detects_mismatch(self):
+        from opn_report_integrity import check_structure_invariants
+
+        m = self._synth_metrics()
+        m.structure.headroom_by_factor[(99, "<1e-6")] = 1
+        checks = check_structure_invariants(m)
+        assert not checks["productive_headroom_total"]["passed"]
+
+    def test_propagation_aggregation_detects_mismatch(self):
+        from opn_report_integrity import check_structure_invariants
+
+        m = self._synth_metrics()
+        m.structure.propagation_edges[(3, 5)] += 1
+        checks = check_structure_invariants(m)
+        assert not checks["propagation_aggregation"]["passed"]
+
+    def test_sigma_exact_total_detects_mismatch(self):
+        from opn_report_integrity import check_structure_invariants
+
+        m = self._synth_metrics()
+        m.structure.sigma_exact += 1
+        checks = check_structure_invariants(m)
+        assert not checks["sigma_exact_total"]["passed"]
+
+    def test_sigma_outside_total_detects_mismatch(self):
+        from opn_report_integrity import check_structure_invariants
+
+        m = self._synth_metrics()
+        m.structure.sigma_outside += 1
+        checks = check_structure_invariants(m)
+        assert not checks["sigma_outside_total"]["passed"]
+
+    def test_prune_dimension_consistency_detects_mismatch(self):
+        from opn_report_integrity import check_prune_consistency
+
+        m = self._synth_metrics()
+        m.structure.prune_reasons["bogus_extra"] = 1
+        checks = check_prune_consistency(m)
+        assert not checks["prune_dimension_consistency"]["passed"]
+
+    def test_gap_summary_invariants_pass_on_consistent_data(self):
+        from opn_report_integrity import check_gap_summary_invariants
+
+        summary = {
+            "configuration": {"enabled": True},
+            "small_gap_states_seen": 10,
+            "qualifying_states": 7,
+            "pending_lower_bound_rejections": 3,
+            "records_written": 5,
+            "dropped_due_to_limit": 2,
+        }
+        checks = check_gap_summary_invariants(summary)
+        assert checks["gap_small_gap"]["passed"]
+        assert checks["gap_qualifying"]["passed"]
+
+    def test_gap_summary_detects_small_gap_violation(self):
+        from opn_report_integrity import check_gap_summary_invariants
+
+        summary = {
+            "configuration": {"enabled": True},
+            "small_gap_states_seen": 10,
+            "qualifying_states": 4,
+            "pending_lower_bound_rejections": 3,
+            "records_written": 4,
+            "dropped_due_to_limit": 0,
+        }
+        checks = check_gap_summary_invariants(summary)
+        assert not checks["gap_small_gap"]["passed"]
+
+    def test_gap_summary_detects_qualifying_violation(self):
+        from opn_report_integrity import check_gap_summary_invariants
+
+        summary = {
+            "configuration": {"enabled": True},
+            "small_gap_states_seen": 10,
+            "qualifying_states": 7,
+            "pending_lower_bound_rejections": 3,
+            "records_written": 7,
+            "dropped_due_to_limit": 1,
+        }
+        checks = check_gap_summary_invariants(summary)
+        assert not checks["gap_qualifying"]["passed"]
+
+    def test_gap_checks_skip_when_disabled(self):
+        from opn_report_integrity import check_gap_summary_invariants
+
+        summary = {"configuration": {"enabled": False}}
+        checks = check_gap_summary_invariants(summary)
+        assert checks["gap_small_gap"]["passed"]
+        assert "skipped" in checks["gap_small_gap"]
+
+    def test_jsonl_gap_reconstruction_succeeds(self, tmp_path):
+        from opn_report_integrity import check_gap_jsonl
+
+        (tmp_path / "abundancy_gap_states.jsonl").write_text(
+            (
+                '{"productive_ordinal":1,"ratio_num":"3","ratio_den":"2",'
+                '"gap_num":"1","gap_den":"2"}\n'
+                '{"productive_ordinal":2,"ratio_num":"7","ratio_den":"4",'
+                '"gap_num":"1","gap_den":"4"}\n'
+            ),
+            encoding="utf-8",
+        )
+        summary = {
+            "configuration": {
+                "enabled": True,
+                "target_num": 2,
+                "target_den": 1,
+            },
+        }
+        checks = check_gap_jsonl(tmp_path, summary)
+        assert checks["jsonl_ordinal_monotonic"]["passed"]
+        assert checks["jsonl_gap_reconstruction"]["passed"]
+        assert checks["jsonl_line_count"]["lines"] == 2
+
+    def test_jsonl_detects_ordinal_regression(self, tmp_path):
+        from opn_report_integrity import check_gap_jsonl
+
+        (tmp_path / "abundancy_gap_states.jsonl").write_text(
+            (
+                '{"productive_ordinal":5,"ratio_num":"3","ratio_den":"2",'
+                '"gap_num":"1","gap_den":"2"}\n'
+                '{"productive_ordinal":3,"ratio_num":"3","ratio_den":"2",'
+                '"gap_num":"1","gap_den":"2"}\n'
+            ),
+            encoding="utf-8",
+        )
+        summary = {
+            "configuration": {
+                "enabled": True,
+                "target_num": 2,
+                "target_den": 1,
+            },
+        }
+        checks = check_gap_jsonl(tmp_path, summary)
+        assert not checks["jsonl_ordinal_monotonic"]["passed"]
+
+    def test_jsonl_detects_gap_mismatch(self, tmp_path):
+        from opn_report_integrity import check_gap_jsonl
+
+        (tmp_path / "abundancy_gap_states.jsonl").write_text(
+            '{"productive_ordinal":1,"ratio_num":"3","ratio_den":"2",'
+            '"gap_num":"999","gap_den":"2"}\n',
+            encoding="utf-8",
+        )
+        summary = {
+            "configuration": {
+                "enabled": True,
+                "target_num": 2,
+                "target_den": 1,
+            },
+        }
+        checks = check_gap_jsonl(tmp_path, summary)
+        assert not checks["jsonl_gap_reconstruction"]["passed"]
+
+    def test_write_integrity_json_produces_valid_output(self, tmp_path):
+        from opn_report_integrity import write_integrity_json
+
+        m = self._synth_metrics()
+        gap_summary = {
+            "configuration": {"enabled": False},
+        }
+        out = write_integrity_json(
+            tmp_path, m, abundancy_capture_summary=gap_summary
+        )
+        assert out.exists()
+        doc = json.loads(out.read_text(encoding="utf-8"))
+        assert doc["schema_version"] == 1
+        assert doc["status"] == "PASS"
+        assert "productive_depth_total" in doc["checks"]
+        assert "prune_dimension_consistency" in doc["checks"]

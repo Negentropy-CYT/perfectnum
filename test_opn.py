@@ -4358,16 +4358,25 @@ class TestReportIntegrity:
         from opn_report_integrity import check_structure_json_roundtrip
 
         m = self._synth_metrics()
+        s = m.structure
         derived = Counter()
-        for (p, _e, q), c in m.structure.propagation_exp_edges.items():
+        for (p, _e, q), c in s.propagation_exp_edges.items():
             derived[(p, q)] += c
+        _d_hist = Counter[int]()
+        for (d, _nf), c in s.depth_factor_map.items():
+            _d_hist[d] += c
+        _r_h = Counter[str]()
+        for (_nf, b), c in s.headroom_by_factor.items():
+            _r_h[b] += c
         (tmp_path / "structure.json").write_text(json.dumps({
             "propagation_edges": [
                 {"first": k[0], "second": k[1], "count": v}
                 for k, v in sorted(derived.items())
             ],
-            "sigma_exact": sum(m.structure.sigma_exact_by_exp),
-            "sigma_outside": sum(m.structure.sigma_outside_by_exp),
+            "sigma_exact": sum(s.sigma_exact_by_exp),
+            "sigma_outside": sum(s.sigma_outside_by_exp),
+            "depth_histogram": dict(_d_hist),
+            "ratio_headroom": dict(_r_h),
         }))
         checks = check_structure_json_roundtrip(m, tmp_path)
         assert checks["structure_json_roundtrip"]["passed"]

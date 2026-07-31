@@ -234,9 +234,7 @@ def _structure_lines(
 
     # ── depth histogram (derived from depth_factor_map) ──
     if s.depth_factor_map:
-        _d_hist: dict[int, int] = {}
-        for (d, _nf), c in s.depth_factor_map.items():
-            _d_hist[d] = _d_hist.get(d, 0) + c
+        _d_hist = _derive_depth_histogram(s.depth_factor_map)
         dt = sum(_d_hist.values())
         w("\n## Depth histogram")
         for d in sorted(_d_hist):
@@ -253,9 +251,7 @@ def _structure_lines(
 
     # ── ratio headroom (derived from headroom_by_factor) ──
     if s.headroom_by_factor:
-        _r_h: dict[str, int] = {}
-        for (_nf, b), c in s.headroom_by_factor.items():
-            _r_h[b] = _r_h.get(b, 0) + c
+        _r_h = _derive_ratio_headroom(s.headroom_by_factor)
         rt = sum(_r_h.values())
         w("\n## Ratio headroom")
         for b in _HEADROOM_BUCKETS:
@@ -286,11 +282,7 @@ def _structure_lines(
 
     # ── propagation edges (derived from canonical exp edges) ──
     if s.propagation_exp_edges:
-        from collections import defaultdict as _defaultdict
-
-        _derived: dict[tuple[int, int], int] = _defaultdict(int)
-        for (p, exp, q), count in s.propagation_exp_edges.items():
-            _derived[(p, q)] += count
+        _derived = _derive_prop_edges(s.propagation_exp_edges)
         _prop_edges = sorted(_derived.items(), key=lambda x: x[1], reverse=True)
 
         w("\n## Propagation edges (top-10)")

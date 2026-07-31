@@ -40,9 +40,9 @@ if TYPE_CHECKING:
 CHECKPOINT_FILE  = "checkpoint_merged.pkl"
 SOLUTIONS_FILE   = "solutions_merged.txt"
 
-MAX_PRIME         = 32_000_000_000  # largest odd prime considered
+MAX_PRIME         = 10_000_000  # largest odd prime considered
 MAX_FACTORS       = 65          # max distinct prime factors in N
-MAX_EXP           = 35          # max exponent
+MAX_EXP           = 40          # max exponent
 PROPAGATE  = True     # False = Descartes-spoof DFS; True = true OPN chain
 CHECKPOINT_INTERVAL_SECONDS = 300.0  # periodic save at a stable search boundary
 ENABLE_FERMAT_DEBT = False
@@ -1564,16 +1564,18 @@ class SigmaPoolAnalyzer:
         if key in self._structure.sigma_classified_keys:
             return
         self._structure.sigma_classified_keys.add(key)
+        # Ensure both per-exp arrays stay the same length so report code
+        # can iterate either one without index errors.
+        def _ensure_size(arr: list[int], needed: int) -> None:
+            if needed >= len(arr):
+                arr.extend([0] * (needed + 1 - len(arr)))
+
+        _ensure_size(self._structure.sigma_exact_by_exp, exp)
+        _ensure_size(self._structure.sigma_outside_by_exp, exp)
         if result.exact:
-            _arr = self._structure.sigma_exact_by_exp
-            if exp >= len(_arr):
-                _arr.extend([0] * (exp + 1 - len(_arr)))
-            _arr[exp] += 1
+            self._structure.sigma_exact_by_exp[exp] += 1
         else:
-            _arr = self._structure.sigma_outside_by_exp
-            if exp >= len(_arr):
-                _arr.extend([0] * (exp + 1 - len(_arr)))
-            _arr[exp] += 1
+            self._structure.sigma_outside_by_exp[exp] += 1
             residual_bits = int(result.residual).bit_length()
             self._structure.outside_pool_sources[
                 (key[0], key[1], residual_bits)

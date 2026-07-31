@@ -677,6 +677,8 @@ class AbundancyGapRecorder:
                 text_limit=self.config.text_limit,
                 sigma_database_path=sigma_database_path,
                 record_validator=self._validate_record,
+                target_num=self.target_num,
+                target_den=self.target_den,
             )
             if derived["raw_records"] != self.records_written:
                 raise ValueError(
@@ -759,8 +761,8 @@ def _write_index_and_collect(
     raw_path: Path,
     text_limit: int,
     record_validator=None,
-    target_num: int = 2,
-    target_den: int = 1,
+    target_num: int,
+    target_den: int,
 ) -> tuple[
     int,
     list[dict[str, Any]],
@@ -1166,6 +1168,8 @@ def _write_derived_outputs(
     text_limit: int,
     sigma_database_path: str | Path | None,
     record_validator=None,
+    target_num: int,
+    target_den: int,
 ) -> dict[str, Any]:
     count, top_records, sigma_pairs, funnel = _write_index_and_collect(
         run_dir,
@@ -1173,6 +1177,8 @@ def _write_derived_outputs(
         raw_path=raw_path,
         text_limit=text_limit,
         record_validator=record_validator,
+        target_num=target_num,
+        target_den=target_den,
     )
     sigma_maps, sigma_status = _load_sigma_maps(
         sigma_pairs,

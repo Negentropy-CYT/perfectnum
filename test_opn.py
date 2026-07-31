@@ -2693,8 +2693,8 @@ class TestPersistentSigmaDatabase:
         assert warm._perf.persistent_hits == 1
         assert warm._perf.persistent_misses == 0
         assert warm._perf.plans_built == 0
-        assert warm_structure.sigma_outside == 1
-        assert warm_structure.sigma_exact == 0
+        assert sum(warm_structure.sigma_outside_by_exp) == 1
+        assert sum(warm_structure.sigma_exact_by_exp) == 0
 
     def test_aggregate_partial_expands_with_cyclotomic_components(
         self,
@@ -3932,7 +3932,11 @@ class TestAbundancyGapCapture:
             target_num=2,
             target_den=1,
         )
-        assert metrics.ratio_headroom["1e-3-1e-2"] == 1
+        # ratio_headroom derived from headroom_by_factor at report time
+        _r_h: dict[str, int] = {}
+        for (_nf, b), c in metrics.headroom_by_factor.items():
+            _r_h[b] = _r_h.get(b, 0) + c
+        assert _r_h["1e-3-1e-2"] == 1
 
     def test_capture_and_human_report(self, tmp_path):
         from opn_abundancy_capture import (
@@ -4265,25 +4269,21 @@ class TestReportIntegrity:
 
         # 5 productive states
         s.productive_states = 5
-        s.depth_histogram[1] = 2
-        s.depth_histogram[2] = 3
+        # depth_histogram derived from depth_factor_map at report time
         s.depth_factor_map[(1, 2)] = 2
         s.depth_factor_map[(2, 3)] = 3
         s.headroom_by_factor[(2, "<1e-3")] = 2
         s.headroom_by_factor[(3, "<1e-4")] = 3
-        s.ratio_headroom["<1e-3"] = 2
-        s.ratio_headroom["<1e-4"] = 3
+        # ratio_headroom derived from headroom_by_factor at report time
 
         # 3 propagation events: p=3, exp=1/2, q=5/7
-        s.propagation_edges[(3, 5)] = 2
-        s.propagation_edges[(3, 7)] = 1
+        # (propagation_edges derived from exp edges at report time)
         s.propagation_exp_edges[(3, 1, 5)] = 1
         s.propagation_exp_edges[(3, 2, 5)] = 1
         s.propagation_exp_edges[(3, 1, 7)] = 1
 
         # sigma: 10 exact (2+3+5), 3 outside (1+1+1)
-        s.sigma_exact = 10
-        s.sigma_outside = 3
+        # (totals derived from per-exp arrays at report time)
         s.sigma_exact_by_exp[0] = 2
         s.sigma_exact_by_exp[1] = 3
         s.sigma_exact_by_exp[2] = 5
@@ -4318,45 +4318,61 @@ class TestReportIntegrity:
         for name, check in result["checks"].items():
             assert check["passed"], f"{name} should pass on consistent data"
 
-    def test_productive_depth_total_detects_mismatch(self):
+    # ── parametrized structure invariant mismatch detection ──────
+
+    @pytest.mark.parametrize(
+        "check_key, inject",
+        [
+            (
+                "productive_depth_total",
+                lambda s: setattr(s, "productive_states", s.productive_states + 1),
+            ),
+            (
+                "productive_headroom_total",
+                lambda s: s.headroom_by_factor.__setitem__((99, "<1e-6"), 1),
+            ),
+        ],
+    )
+    def test_structure_invariant_detects_mismatch(self, check_key, inject):
         from opn_report_integrity import check_structure_invariants
 
         m = self._synth_metrics()
-        m.structure.productive_states += 1  # inject drift
+        inject(m.structure)
         checks = check_structure_invariants(m)
-        assert not checks["productive_depth_total"]["passed"]
+        assert not checks[check_key]["passed"]
 
-    def test_productive_headroom_total_detects_mismatch(self):
-        from opn_report_integrity import check_structure_invariants
+    # ── structure.json roundtrip ─────────────────────────────────
+
+    def test_structure_json_roundtrip_detects_mismatch(self, tmp_path):
+        from opn_report_integrity import check_structure_json_roundtrip
 
         m = self._synth_metrics()
-        m.structure.headroom_by_factor[(99, "<1e-6")] = 1
-        checks = check_structure_invariants(m)
-        assert not checks["productive_headroom_total"]["passed"]
+        (tmp_path / "structure.json").write_text(json.dumps(
+            {"propagation_edges": [{"first": 3, "second": 5, "count": 999}],
+             "sigma_exact": 999, "sigma_outside": 888}))
+        checks = check_structure_json_roundtrip(m, tmp_path)
+        assert not checks["structure_json_roundtrip"]["passed"]
 
-    def test_propagation_aggregation_detects_mismatch(self):
-        from opn_report_integrity import check_structure_invariants
-
-        m = self._synth_metrics()
-        m.structure.propagation_edges[(3, 5)] += 1
-        checks = check_structure_invariants(m)
-        assert not checks["propagation_aggregation"]["passed"]
-
-    def test_sigma_exact_total_detects_mismatch(self):
-        from opn_report_integrity import check_structure_invariants
+    def test_structure_json_roundtrip_passes(self, tmp_path):
+        from collections import Counter
+        from opn_report_integrity import check_structure_json_roundtrip
 
         m = self._synth_metrics()
-        m.structure.sigma_exact += 1
-        checks = check_structure_invariants(m)
-        assert not checks["sigma_exact_total"]["passed"]
+        derived = Counter()
+        for (p, _e, q), c in m.structure.propagation_exp_edges.items():
+            derived[(p, q)] += c
+        (tmp_path / "structure.json").write_text(json.dumps({
+            "propagation_edges": [
+                {"first": k[0], "second": k[1], "count": v}
+                for k, v in sorted(derived.items())
+            ],
+            "sigma_exact": sum(m.structure.sigma_exact_by_exp),
+            "sigma_outside": sum(m.structure.sigma_outside_by_exp),
+        }))
+        checks = check_structure_json_roundtrip(m, tmp_path)
+        assert checks["structure_json_roundtrip"]["passed"]
 
-    def test_sigma_outside_total_detects_mismatch(self):
-        from opn_report_integrity import check_structure_invariants
-
-        m = self._synth_metrics()
-        m.structure.sigma_outside += 1
-        checks = check_structure_invariants(m)
-        assert not checks["sigma_outside_total"]["passed"]
+    # ── prune consistency (unique pattern, not parametrized) ─────
 
     def test_prune_dimension_consistency_detects_mismatch(self):
         from opn_report_integrity import check_prune_consistency
@@ -4365,6 +4381,8 @@ class TestReportIntegrity:
         m.structure.prune_reasons["bogus_extra"] = 1
         checks = check_prune_consistency(m)
         assert not checks["prune_dimension_consistency"]["passed"]
+
+    # ── gap summary invariants ───────────────────────────────────
 
     def test_gap_summary_invariants_pass_on_consistent_data(self):
         from opn_report_integrity import check_gap_summary_invariants
@@ -4381,33 +4399,40 @@ class TestReportIntegrity:
         assert checks["gap_small_gap"]["passed"]
         assert checks["gap_qualifying"]["passed"]
 
-    def test_gap_summary_detects_small_gap_violation(self):
+    @pytest.mark.parametrize(
+        "check_key, summary, assertion",
+        [
+            (
+                "gap_small_gap",
+                {
+                    "configuration": {"enabled": True},
+                    "small_gap_states_seen": 10,
+                    "qualifying_states": 4,
+                    "pending_lower_bound_rejections": 3,
+                    "records_written": 4,
+                    "dropped_due_to_limit": 0,
+                },
+                False,
+            ),
+            (
+                "gap_qualifying",
+                {
+                    "configuration": {"enabled": True},
+                    "small_gap_states_seen": 10,
+                    "qualifying_states": 7,
+                    "pending_lower_bound_rejections": 3,
+                    "records_written": 7,
+                    "dropped_due_to_limit": 1,
+                },
+                False,
+            ),
+        ],
+    )
+    def test_gap_summary_detects_violation(self, check_key, summary, assertion):
         from opn_report_integrity import check_gap_summary_invariants
 
-        summary = {
-            "configuration": {"enabled": True},
-            "small_gap_states_seen": 10,
-            "qualifying_states": 4,
-            "pending_lower_bound_rejections": 3,
-            "records_written": 4,
-            "dropped_due_to_limit": 0,
-        }
         checks = check_gap_summary_invariants(summary)
-        assert not checks["gap_small_gap"]["passed"]
-
-    def test_gap_summary_detects_qualifying_violation(self):
-        from opn_report_integrity import check_gap_summary_invariants
-
-        summary = {
-            "configuration": {"enabled": True},
-            "small_gap_states_seen": 10,
-            "qualifying_states": 7,
-            "pending_lower_bound_rejections": 3,
-            "records_written": 7,
-            "dropped_due_to_limit": 1,
-        }
-        checks = check_gap_summary_invariants(summary)
-        assert not checks["gap_qualifying"]["passed"]
+        assert checks[check_key]["passed"] == assertion
 
     def test_gap_checks_skip_when_disabled(self):
         from opn_report_integrity import check_gap_summary_invariants
@@ -4416,6 +4441,8 @@ class TestReportIntegrity:
         checks = check_gap_summary_invariants(summary)
         assert checks["gap_small_gap"]["passed"]
         assert "skipped" in checks["gap_small_gap"]
+
+    # ── JSONL integrity ──────────────────────────────────────────
 
     def test_jsonl_gap_reconstruction_succeeds(self, tmp_path):
         from opn_report_integrity import check_gap_jsonl
@@ -4429,57 +4456,42 @@ class TestReportIntegrity:
             ),
             encoding="utf-8",
         )
-        summary = {
-            "configuration": {
-                "enabled": True,
-                "target_num": 2,
-                "target_den": 1,
-            },
-        }
+        summary = {"configuration": {"enabled": True, "target_num": 2, "target_den": 1}}
         checks = check_gap_jsonl(tmp_path, summary)
         assert checks["jsonl_ordinal_monotonic"]["passed"]
         assert checks["jsonl_gap_reconstruction"]["passed"]
         assert checks["jsonl_line_count"]["lines"] == 2
 
-    def test_jsonl_detects_ordinal_regression(self, tmp_path):
-        from opn_report_integrity import check_gap_jsonl
-
-        (tmp_path / "abundancy_gap_states.jsonl").write_text(
+    @pytest.mark.parametrize(
+        "jsonl_content, fail_key",
+        [
             (
-                '{"productive_ordinal":5,"ratio_num":"3","ratio_den":"2",'
-                '"gap_num":"1","gap_den":"2"}\n'
-                '{"productive_ordinal":3,"ratio_num":"3","ratio_den":"2",'
-                '"gap_num":"1","gap_den":"2"}\n'
+                (
+                    '{"productive_ordinal":5,"ratio_num":"3","ratio_den":"2",'
+                    '"gap_num":"1","gap_den":"2"}\n'
+                    '{"productive_ordinal":3,"ratio_num":"3","ratio_den":"2",'
+                    '"gap_num":"1","gap_den":"2"}\n'
+                ),
+                "jsonl_ordinal_monotonic",
             ),
-            encoding="utf-8",
-        )
-        summary = {
-            "configuration": {
-                "enabled": True,
-                "target_num": 2,
-                "target_den": 1,
-            },
-        }
-        checks = check_gap_jsonl(tmp_path, summary)
-        assert not checks["jsonl_ordinal_monotonic"]["passed"]
-
-    def test_jsonl_detects_gap_mismatch(self, tmp_path):
+            (
+                '{"productive_ordinal":1,"ratio_num":"3","ratio_den":"2",'
+                '"gap_num":"999","gap_den":"2"}\n',
+                "jsonl_gap_reconstruction",
+            ),
+        ],
+    )
+    def test_jsonl_detects_error(self, tmp_path, jsonl_content, fail_key):
         from opn_report_integrity import check_gap_jsonl
 
         (tmp_path / "abundancy_gap_states.jsonl").write_text(
-            '{"productive_ordinal":1,"ratio_num":"3","ratio_den":"2",'
-            '"gap_num":"999","gap_den":"2"}\n',
-            encoding="utf-8",
+            jsonl_content, encoding="utf-8"
         )
-        summary = {
-            "configuration": {
-                "enabled": True,
-                "target_num": 2,
-                "target_den": 1,
-            },
-        }
+        summary = {"configuration": {"enabled": True, "target_num": 2, "target_den": 1}}
         checks = check_gap_jsonl(tmp_path, summary)
-        assert not checks["jsonl_gap_reconstruction"]["passed"]
+        assert not checks[fail_key]["passed"]
+
+    # ── end-to-end output ────────────────────────────────────────
 
     def test_write_integrity_json_produces_valid_output(self, tmp_path):
         from opn_report_integrity import write_integrity_json

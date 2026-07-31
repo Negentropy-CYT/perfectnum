@@ -136,12 +136,10 @@ class StructureMetrics:
     prune_reasons: Counter[str] = field(default_factory=Counter)
 
     productive_states: int = 0
-    depth_histogram: Counter[int] = field(default_factory=Counter)
     depth_factor_map: Counter[tuple[int, int]] = field(
         default_factory=Counter
     )
 
-    ratio_headroom: Counter[str] = field(default_factory=Counter)
     headroom_by_factor: Counter[tuple[int, str]] = field(
         default_factory=Counter
     )
@@ -149,9 +147,6 @@ class StructureMetrics:
     pending_prime_frequency: Counter[int] = field(default_factory=Counter)
 
     contradiction_attribution: Counter[tuple[int, str]] = field(
-        default_factory=Counter
-    )
-    propagation_edges: Counter[tuple[int, int]] = field(
         default_factory=Counter
     )
     propagation_exp_edges: Counter[tuple[int, int, int]] = field(
@@ -164,9 +159,6 @@ class StructureMetrics:
     outside_window_sources: Counter[tuple[int, int, int]] = field(
         default_factory=Counter
     )
-
-    sigma_exact: int = 0
-    sigma_outside: int = 0
 
     sigma_exact_by_exp: list[int] = field(default_factory=list)
     sigma_outside_by_exp: list[int] = field(default_factory=list)
@@ -238,9 +230,7 @@ class StructureMetrics:
         )
 
         self.productive_states += 1
-        self.depth_histogram[depth] += 1
         self.depth_factor_map[(depth, assigned_count)] += 1
-        self.ratio_headroom[bucket] += 1
         self.headroom_by_factor[(assigned_count, bucket)] += 1
 
         for q in pending:

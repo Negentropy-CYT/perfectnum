@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from opn_metrics import (
     RunMetrics,
@@ -231,13 +232,16 @@ def _structure_lines(
         w(f"    overhead (other)  {overhead:>10,}  "
           f"({100.0*overhead/p.clones_actual:5.1f}% of actual)")
 
-    # ── depth histogram ──
-    if s.depth_histogram:
-        dt = sum(s.depth_histogram.values())
+    # ── depth histogram (derived from depth_factor_map) ──
+    if s.depth_factor_map:
+        _d_hist: dict[int, int] = {}
+        for (d, _nf), c in s.depth_factor_map.items():
+            _d_hist[d] = _d_hist.get(d, 0) + c
+        dt = sum(_d_hist.values())
         w("\n## Depth histogram")
-        for d in sorted(s.depth_histogram):
-            pct = 100.0 * s.depth_histogram[d] / dt
-            w(f"  depth {d:>2}: {s.depth_histogram[d]:>12,}  ({pct:4.1f}%)")
+        for d in sorted(_d_hist):
+            pct = 100.0 * _d_hist[d] / dt
+            w(f"  depth {d:>2}: {_d_hist[d]:>12,}  ({pct:4.1f}%)")
 
     # ── clone payload ──
     if p.clone_payload:
@@ -247,12 +251,15 @@ def _structure_lines(
             w(f"  |f|={k:>2}:   {p.clone_payload[k]:>12,}  "
               f"({100.0*p.clone_payload[k]/ct:5.1f}%)")
 
-    # ── ratio headroom ──
-    if s.ratio_headroom:
-        rt = sum(s.ratio_headroom.values())
+    # ── ratio headroom (derived from headroom_by_factor) ──
+    if s.headroom_by_factor:
+        _r_h: dict[str, int] = {}
+        for (_nf, b), c in s.headroom_by_factor.items():
+            _r_h[b] = _r_h.get(b, 0) + c
+        rt = sum(_r_h.values())
         w("\n## Ratio headroom")
         for b in _HEADROOM_BUCKETS:
-            v = s.ratio_headroom.get(b, 0)
+            v = _r_h.get(b, 0)
             if v:
                 w(f"  {b:>12}  {v:>12,}  ({100.0*v/rt:5.1f}%)")
 
@@ -277,73 +284,52 @@ def _structure_lines(
         for (q, reason), count in s.contradiction_attribution.most_common(15):
             w(f"  ({q:>4}, {reason:<14}) {count:>10,}")
 
-    # ── propagation edges ──
-    if s.propagation_edges:
+    # ── propagation edges (derived from canonical exp edges) ──
+    if s.propagation_exp_edges:
+        from collections import defaultdict as _defaultdict
+
+        _derived: dict[tuple[int, int], int] = _defaultdict(int)
+        for (p, exp, q), count in s.propagation_exp_edges.items():
+            _derived[(p, q)] += count
+        _prop_edges = sorted(_derived.items(), key=lambda x: x[1], reverse=True)
+
         w("\n## Propagation edges (top-10)")
-        for (p_edge, q), count in s.propagation_edges.most_common(10):
+        for (p_edge, q), count in _prop_edges[:10]:
             w(f"  {p_edge:>4} → {q:<8}  {count:>10,}")
 
-    if s.propagation_exp_edges:
         w("\n## Propagation edges by exponent (top-10)")
         for (p_edge, e, q), count in s.propagation_exp_edges.most_common(10):
             w(f"  {p_edge:>4}^{e} → {q:<8}  {count:>10,}")
 
     # ── propagation concentration (B1) ──
     if s.propagation_exp_edges:
-        from collections import defaultdict
-
-        _unique_primes = len({p for (p, _, _) in s.propagation_exp_edges})
-        _unique_components = len(
-            {(p, exp) for (p, exp, _) in s.propagation_exp_edges}
+        _pa = _analyze_propagation(
+            s.propagation_exp_edges, s.productive_states
         )
-        _unique_edges = len(s.propagation_exp_edges)
-        _total_events = sum(s.propagation_exp_edges.values())
-        _sorted = sorted(s.propagation_exp_edges.values(), reverse=True)
-
-        _groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
-        _comp_counts: dict[tuple[int, int], list[int]] = defaultdict(list)
-        for (p, exp, q), c in s.propagation_exp_edges.items():
-            _groups[(p, exp)].append((q, c))
-            _comp_counts[(p, exp)].append(c)
-        _sync = sum(
-            1 for cs in _comp_counts.values() if all(c == cs[0] for c in cs)
-        )
-        _nonsync = len(_comp_counts) - _sync
-
-        _avg_tgt = _unique_edges / _unique_components if _unique_components else 0
-        _avg_prod = (
-            _total_events / s.productive_states if s.productive_states else 0
-        )
-
-        # Aggregate (p→q) edge count for comparison
-        _agg_edges = len(s.propagation_edges)
+        _shares = _pa["top_k_exponent_edge_event_share"]
 
         w("\n## Propagation concentration")
-        w(f"  unique source primes:         {_unique_primes:>8,}")
-        w(f"  unique source components:     {_unique_components:>8,}")
-        w(f"  unique aggregate edges (p→q): {_agg_edges:>8,}")
-        w(f"  unique exponent edges (p^a→q):{_unique_edges:>8,}")
-        w(f"  total edge events:            {_total_events:>8,}")
+        w(f"  unique source primes:         {_pa['unique_source_primes']:>8,}")
+        w(f"  unique source components:     {_pa['unique_source_components']:>8,}")
+        w(f"  unique aggregate edges (p→q): {_pa['unique_aggregate_edges']:>8,}")
+        w(f"  unique exponent edges (p^a→q):{_pa['unique_exponent_edges']:>8,}")
+        w(f"  total edge events:            {_pa['total_edge_events']:>8,}")
         for _k in [1, 10, 100]:
-            if len(_sorted) >= _k:
-                _share = sum(_sorted[:_k]) / _total_events * 100
-                w(f"  top-{_k} exponent-edge event share: {_share:>6.1f}%")
-        w(f"  synchronized components:      {_sync:>8,}")
-        if _nonsync:
-            w(f"  NON-synchronized components:  {_nonsync:>8,}")
-        w(f"  avg targets per source component:   {_avg_tgt:>5.1f}")
+            if _k in _shares:
+                w(f"  top-{_k} exponent-edge event share:"
+                  f" {_shares[_k]*100:>6.1f}%")
+        w(f"  synchronized components:      {_pa['synchronized_components']:>8,}")
+        if _pa["non_synchronized_components"]:
+            w(f"  NON-synchronized components:  "
+              f"{_pa['non_synchronized_components']:>8,}")
+        w(f"  avg targets per source component:   "
+          f"{_pa['avg_targets_per_source_component']:>5.1f}")
         w(f"  avg odd propagation edge events per productive:"
-          f" {_avg_prod:>5.1f}")
+          f" {_pa['avg_edge_events_per_productive']:>5.1f}")
 
         # ── propagation source components (B0) ──
-        _ranked = []
-        for (_p, _exp), _targets in _groups.items():
-            _total = sum(c for _, c in _targets)
-            _ranked.append((_total, _p, _exp, _targets))
-        _ranked.sort(reverse=True)
-
         w("\n## Propagation source components (top-15)")
-        for _total, _p, _exp, _targets in _ranked[:15]:
+        for _total, _p, _exp, _targets in _pa["ranked_components"][:15]:
             _n_qt = len(_targets)
             _common = _targets[0][1]
             _all_eq = all(c == _common for _, c in _targets)
@@ -370,8 +356,10 @@ def _structure_lines(
 
     # ── sigma classifications ──
     w("\n## Sigma classifications")
-    w(f"  exact:             {s.sigma_exact:>12,}")
-    w(f"  outside-window:    {s.sigma_outside:>12,}")
+    _se = sum(s.sigma_exact_by_exp)
+    _so = sum(s.sigma_outside_by_exp)
+    w(f"  exact:             {_se:>12,}")
+    w(f"  outside-window:    {_so:>12,}")
 
     if s.sigma_exact_by_exp or s.sigma_outside_by_exp:
         w("\n## Sigma classifications by exponent")
@@ -454,6 +442,96 @@ def _counter_rows(counter, *, key_names=("first", "second")):
     ]
 
 
+def _analyze_propagation(
+    exp_edges: dict[tuple[int, int, int], int] | Counter,
+    productive_states: int,
+) -> dict[str, Any]:
+    """Compute all propagation-derived stats once for text + JSON consumers.
+
+    ponytail: single pass over exp_edges produces both the concentration
+    stats and the B0 source-component ranking, eliminating the duplicate
+    computation in _structure_lines and write_structure_json.
+    """
+    from collections import defaultdict as _dd
+
+    unique_primes = len({p for (p, _, _) in exp_edges})
+    unique_components = len({(p, exp) for (p, exp, _) in exp_edges})
+    unique_edges = len(exp_edges)
+    agg_edges = len({(p, q) for (p, _, q) in exp_edges})
+    total_events = sum(exp_edges.values())
+    sorted_counts = sorted(exp_edges.values(), reverse=True)
+
+    groups: dict[tuple[int, int], list[tuple[int, int]]] = _dd(list)
+    comp_counts: dict[tuple[int, int], list[int]] = _dd(list)
+    for (p, exp, q), c in exp_edges.items():
+        groups[(p, exp)].append((q, c))
+        comp_counts[(p, exp)].append(c)
+
+    sync = sum(1 for cs in comp_counts.values() if all(c == cs[0] for c in cs))
+
+    avg_tgt = round(unique_edges / unique_components, 2) if unique_components else 0
+    avg_prod = round(total_events / productive_states, 2) if productive_states else 0
+
+    shares: dict[int, float] = {}
+    for k in [1, 10, 100]:
+        if len(sorted_counts) >= k:
+            shares[k] = round(sum(sorted_counts[:k]) / total_events, 6)
+
+    ranked = []
+    for (p, exp), targets in groups.items():
+        total = sum(c for _, c in targets)
+        ranked.append((total, p, exp, targets))
+    ranked.sort(reverse=True)
+
+    return {
+        "unique_source_primes": unique_primes,
+        "unique_source_components": unique_components,
+        "unique_aggregate_edges": agg_edges,
+        "unique_exponent_edges": unique_edges,
+        "total_edge_events": total_events,
+        "synchronized_components": sync,
+        "non_synchronized_components": unique_components - sync,
+        "avg_targets_per_source_component": avg_tgt,
+        "avg_edge_events_per_productive": avg_prod,
+        "top_k_exponent_edge_event_share": shares,
+        "ranked_components": ranked,
+    }
+
+
+def _derive_prop_edges(
+    exp_edges: dict[tuple[int, int, int], int] | Counter,
+) -> Counter[tuple[int, int]]:
+    """Derive propagation_edges from propagation_exp_edges by summing over exp.
+
+    ponytail: single source of truth — exp edges are canonical, plain edges
+    are derived so the Counter doesn't need a hot-path update.
+    """
+    result: Counter[tuple[int, int]] = Counter()
+    for (p, _exp, q), count in exp_edges.items():
+        result[(p, q)] += count
+    return result
+
+
+def _derive_ratio_headroom(
+    headroom_by_factor: dict[tuple[int, str], int] | Counter,
+) -> Counter[str]:
+    """Derive ratio_headroom from the canonical headroom_by_factor."""
+    result: Counter[str] = Counter()
+    for (_nf, b), c in headroom_by_factor.items():
+        result[b] += c
+    return result
+
+
+def _derive_depth_histogram(
+    depth_factor_map: dict[tuple[int, int], int] | Counter,
+) -> Counter[int]:
+    """Derive depth_histogram from the canonical depth_factor_map."""
+    result: Counter[int] = Counter()
+    for (d, _nf), c in depth_factor_map.items():
+        result[d] += c
+    return result
+
+
 def _counter_rows_3(counter, *, key_names=("first", "second", "third")):
     return [
         {key_names[0]: k[0], key_names[1]: k[1], key_names[2]: k[2], "count": v}
@@ -469,9 +547,11 @@ def write_structure_json(run_dir: Path, metrics: RunMetrics) -> None:
         "schema_version": metrics.schema_version,
         "productive_states": s.productive_states,
         "prune_reasons": dict(s.prune_reasons),
-        "depth_histogram": dict(s.depth_histogram),
+        "depth_histogram": dict(
+            _derive_depth_histogram(s.depth_factor_map)
+        ),
         "depth_factor_map": _counter_rows(s.depth_factor_map),
-        "ratio_headroom": dict(s.ratio_headroom),
+        "ratio_headroom": dict(_derive_ratio_headroom(s.headroom_by_factor)),
         "headroom_by_factor": [
             {"assigned_count": k[0], "bucket": k[1], "count": v}
             for k, v in s.headroom_by_factor.items()
@@ -480,7 +560,9 @@ def write_structure_json(run_dir: Path, metrics: RunMetrics) -> None:
             {"prime": k[0], "reason": k[1], "count": v}
             for k, v in s.contradiction_attribution.items()
         ],
-        "propagation_edges": _counter_rows(s.propagation_edges),
+        "propagation_edges": _counter_rows(
+            _derive_prop_edges(s.propagation_exp_edges)
+        ),
         "propagation_exp_edges": _counter_rows_3(
             s.propagation_exp_edges,
             key_names=("source", "exp", "target"),
@@ -493,8 +575,8 @@ def write_structure_json(run_dir: Path, metrics: RunMetrics) -> None:
             s.outside_window_sources,
             key_names=("prime", "exp", "outside_prime"),
         ),
-        "sigma_exact": s.sigma_exact,
-        "sigma_outside": s.sigma_outside,
+        "sigma_exact": sum(s.sigma_exact_by_exp),
+        "sigma_outside": sum(s.sigma_outside_by_exp),
         "sigma_by_exponent": [
             {
                 "exp": exp,
@@ -522,46 +604,30 @@ def write_structure_json(run_dir: Path, metrics: RunMetrics) -> None:
 
     # ── propagation concentration (B1) ──
     if s.propagation_exp_edges:
-        from collections import defaultdict
-
-        _u_primes = len({p for (p, _, _) in s.propagation_exp_edges})
-        _u_comp = len({(p, exp) for (p, exp, _) in s.propagation_exp_edges})
-        _u_edges = len(s.propagation_exp_edges)
-        _agg_edges = len(s.propagation_edges)
-        _tot_ev = sum(s.propagation_exp_edges.values())
-        _sorted = sorted(s.propagation_exp_edges.values(), reverse=True)
-
-        _comp_cs: dict[tuple[int, int], list[int]] = defaultdict(list)
-        for (p, exp, q), c in s.propagation_exp_edges.items():
-            _comp_cs[(p, exp)].append(c)
-        _sync = sum(
-            1 for cs in _comp_cs.values() if all(c == cs[0] for c in cs)
+        _pa = _analyze_propagation(
+            s.propagation_exp_edges, s.productive_states
         )
-
-        conc: dict[str, Any] = {
-            "unique_source_primes": _u_primes,
-            "unique_source_components": _u_comp,
-            "unique_aggregate_edges": _agg_edges,
-            "unique_exponent_edges": _u_edges,
-            "total_edge_events": _tot_ev,
-            "synchronized_source_components": _sync,
-            "non_synchronized_source_components": _u_comp - _sync,
-            "avg_targets_per_source_component": round(_u_edges / _u_comp, 2)
-            if _u_comp
-            else 0,
-            "avg_exponent_edge_events_per_productive": round(
-                _tot_ev / s.productive_states, 2
-            )
-            if s.productive_states
-            else 0,
+        doc["propagation_concentration"] = {
+            "unique_source_primes": _pa["unique_source_primes"],
+            "unique_source_components": _pa["unique_source_components"],
+            "unique_aggregate_edges": _pa["unique_aggregate_edges"],
+            "unique_exponent_edges": _pa["unique_exponent_edges"],
+            "total_edge_events": _pa["total_edge_events"],
+            "synchronized_source_components": _pa["synchronized_components"],
+            "non_synchronized_source_components": _pa[
+                "non_synchronized_components"
+            ],
+            "avg_targets_per_source_component": _pa[
+                "avg_targets_per_source_component"
+            ],
+            "avg_exponent_edge_events_per_productive": _pa[
+                "avg_edge_events_per_productive"
+            ],
+            **{
+                f"top_{k}_exponent_edge_event_share": v
+                for k, v in _pa["top_k_exponent_edge_event_share"].items()
+            },
         }
-        if _sorted:
-            for _k in [1, 10, 100]:
-                if len(_sorted) >= _k:
-                    conc[f"top_{_k}_exponent_edge_event_share"] = round(
-                        sum(_sorted[:_k]) / _tot_ev, 6
-                    )
-        doc["propagation_concentration"] = conc
     else:
         doc["propagation_concentration"] = None
 
@@ -927,8 +993,8 @@ def write_conclusions_json(
             "outside_window_prune_events": s.prune_reasons.get(
                 "outside_window", 0
             ),
-            "unique_sigma_exact": s.sigma_exact,
-            "unique_sigma_outside": s.sigma_outside,
+            "unique_sigma_exact": sum(s.sigma_exact_by_exp),
+            "unique_sigma_outside": sum(s.sigma_outside_by_exp),
         },
     }
 

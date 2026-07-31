@@ -713,7 +713,6 @@ def assign_prime_chain(
     for q, incoming in post_vals.items():
         if q == 2:
             continue
-        metrics.structure.propagation_edges[(p, q)] += 1
         metrics.structure.propagation_exp_edges[(p, exp, q)] += 1
         offset = _target_valuation_offset(q)
         new_req = ns.required_v.get(q, 0) + incoming

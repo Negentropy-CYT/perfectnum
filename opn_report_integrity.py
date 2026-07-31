@@ -39,38 +39,6 @@ def check_structure_invariants(
         "observed": headroom_sum,
     }
 
-    # I3: propagation_edges(p,q) == sum_exp propagation_exp_edges(p,exp,q)
-    derived: Counter[tuple[int, int]] = Counter()
-    for (p, exp, q), count in s.propagation_exp_edges.items():
-        derived[(p, q)] += count
-
-    mismatch = 0
-    all_keys = set(s.propagation_edges.keys()) | set(derived.keys())
-    for key in all_keys:
-        if s.propagation_edges.get(key, 0) != derived.get(key, 0):
-            mismatch += 1
-
-    results["propagation_aggregation"] = {
-        "passed": mismatch == 0,
-        "mismatch_count": mismatch,
-    }
-
-    # I4: sigma_exact == sum(sigma_exact_by_exp)
-    exact_sum = sum(s.sigma_exact_by_exp)
-    results["sigma_exact_total"] = {
-        "passed": exact_sum == s.sigma_exact,
-        "expected": s.sigma_exact,
-        "observed": exact_sum,
-    }
-
-    # I5: sigma_outside == sum(sigma_outside_by_exp)
-    outside_sum = sum(s.sigma_outside_by_exp)
-    results["sigma_outside_total"] = {
-        "passed": outside_sum == s.sigma_outside,
-        "expected": s.sigma_outside,
-        "observed": outside_sum,
-    }
-
     return results
 
 
@@ -134,6 +102,46 @@ def check_gap_summary_invariants(
     }
 
     return results
+
+
+def check_structure_json_roundtrip(
+    metrics: RunMetrics,
+    run_dir: Path,
+) -> dict[str, dict[str, Any]]:
+    """Verify derived fields in structure.json match canonical in-memory data."""
+    json_path = run_dir / "structure.json"
+    if not json_path.exists():
+        return {"structure_json_roundtrip": {"passed": True, "skipped": True}}
+
+    s = metrics.structure
+    try:
+        doc = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"structure_json_roundtrip": {"passed": False, "error": "read failed"}}
+
+    # propagation_edges derived from propagation_exp_edges
+    derived: Counter[tuple[int, int]] = Counter()
+    for (p, _exp, q), c in s.propagation_exp_edges.items():
+        derived[(p, q)] += c
+    json_edges: Counter[tuple[int, int]] = Counter()
+    for item in doc.get("propagation_edges", []):
+        json_edges[(item["first"], item["second"])] = item["count"]
+    prop_mismatch = sum(
+        1 for k in set(derived) | set(json_edges)
+        if derived.get(k, 0) != json_edges.get(k, 0)
+    )
+
+    # sigma totals derived from per-exp arrays
+    sigma_ok = (
+        doc.get("sigma_exact") == sum(s.sigma_exact_by_exp)
+        and doc.get("sigma_outside") == sum(s.sigma_outside_by_exp)
+    )
+
+    return {"structure_json_roundtrip": {
+        "passed": prop_mismatch == 0 and sigma_ok,
+        "propagation_mismatch": prop_mismatch,
+        "sigma_match": sigma_ok,
+    }}
 
 
 def check_gap_jsonl(
@@ -234,6 +242,9 @@ def run_all_checks(
 
     if run_dir is not None:
         checks.update(check_gap_jsonl(run_dir, abundancy_capture_summary))
+        checks.update(
+            check_structure_json_roundtrip(metrics, run_dir)
+        )
 
     all_pass = all(c.get("passed", True) for c in checks.values())
 

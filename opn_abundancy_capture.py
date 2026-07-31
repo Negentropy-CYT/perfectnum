@@ -915,7 +915,7 @@ def _write_index_and_collect(
             "num": min_adj_num, "den": min_adj_den,
         }
     if euler_dist:
-        funnel["euler_prime_distribution"] = dict(sorted(euler_dist.items()))
+        funnel["euler_prime_distribution"] = dict(euler_dist)
     if assigned_dist:
         funnel["assigned_count_distribution"] = dict(sorted(assigned_dist.items()))
     if pending_dist:

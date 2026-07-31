@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from heapq import nlargest
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List
 
 from opn_metrics import (
     RunMetrics,
@@ -377,11 +378,18 @@ def _structure_lines(
         for (p_val, e, bits), count in s.outside_pool_sources.most_common(10):
             w(f"  {p_val:>6}^{e} → residual ({bits} bits)  x{count:>6}")
 
-    # ── outside-window sources ──
+    # ── largest outside-window sources ──
     if s.outside_window_sources:
-        w("\n## Outside-window sources (top-10)")
-        for (p_val, e, q), count in s.outside_window_sources.most_common(10):
-            w(f"  {p_val:>4}^{e} → {q:<12}  {count:>10,}")
+        w("\n## Largest outside-window sources")
+        for (p_val, exp, q), count in nlargest(
+            5,
+            s.outside_window_sources.items(),
+            key=lambda item: item[0][2],
+        ):
+            w(
+                f"  {p_val}^{exp} → {q}  "
+                f"P×{q / max_prime:.2f}  x{count:,}"
+            )
 
     # ── frequent pending-prime resolvability ──
     if s.pending_prime_frequency and _sig_factors is not None:

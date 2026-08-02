@@ -2533,7 +2533,7 @@ def _top_component_ratio(
 
     selected = 0
     for idx in range(max(start_idx, 0), len(primes)):
-        p = primes[idx]
+        p = int(primes[idx])
         if p in assigned or p in excluded or p in reserved:
             continue
         num *= p

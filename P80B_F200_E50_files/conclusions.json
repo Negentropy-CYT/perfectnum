@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "finite_box": {
+    "exhausted": true,
+    "solutions_found": 0,
+    "global_nonexistence_proved": false
+  },
+  "effective_limits": {
+    "configured_max_factors": 200,
+    "observed_max_assigned": 33,
+    "factor_limit_reached": false
+  },
+  "window_pressure": {
+    "outside_window_prune_events": 411181729,
+    "unique_sigma_exact": 1667,
+    "unique_sigma_outside": 18199
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "telemetry_schema_version": 4,
+  "pruning_policy": "q3-enforce__domain-off__pending-fifo",
+  "run_id": "(redacted)",
+  "git_commit": "(redacted)",
+  "git_dirty": null,
+  "started_at": "(redacted)",
+  "configuration": {
+    "max_prime": 79999999999,
+    "max_factors": 200,
+    "max_exp": 50,
+    "target_num": 2,
+    "target_den": 1,
+    "require_euler": true,
+    "propagate": true,
+    "pool_gcd_mode": "hierarchical",
+    "pool_fanout": 16,
+    "q3_prepool_mode": "enforce",
+    "domain_ratio_mode": "off",
+    "pending_selection": "fifo",
+    "sigma_database_enabled": true,
+    "pool_plan_build_policy": "adaptive",
+    "pool_plan_disk_cache_enabled": true,
+    "abundancy_gap_capture_enabled": true,
+    "abundancy_gap_max_num": 1,
+    "abundancy_gap_max_den": 100,
+    "abundancy_gap_max_records": 50000,
+    "abundancy_gap_text_limit": 100
+  }
+}

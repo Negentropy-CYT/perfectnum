@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "status": "PASS",
+  "checks": {
+    "productive_depth_total": {
+      "passed": true,
+      "expected": 35638533,
+      "observed": 35638533
+    },
+    "productive_headroom_total": {
+      "passed": true,
+      "expected": 35638533,
+      "observed": 35638533
+    },
+    "prune_dimension_consistency": {
+      "passed": true,
+      "reason_total": 452159965,
+      "mechanism_total": 452159965
+    },
+    "gap_small_gap": {
+      "passed": true,
+      "small_gap_states_seen": 6646,
+      "pending_rejected": 5853,
+      "qualifying": 793,
+      "computed": 6646
+    },
+    "gap_qualifying": {
+      "passed": true,
+      "qualifying_states": 793,
+      "records_written": 793,
+      "dropped": 0,
+      "computed": 793
+    },
+    "jsonl_exists": {
+      "passed": true
+    },
+    "jsonl_line_count": {
+      "passed": true,
+      "lines": 793
+    },
+    "jsonl_ordinal_monotonic": {
+      "passed": true,
+      "errors": 0
+    },
+    "jsonl_gap_reconstruction": {
+      "passed": true,
+      "errors": 0
+    },
+    "structure_json_roundtrip": {
+      "passed": true,
+      "propagation_mismatch": 0,
+      "sigma_match": true,
+      "depth_match": true,
+      "ratio_headroom_match": true
+    }
+  }
+}

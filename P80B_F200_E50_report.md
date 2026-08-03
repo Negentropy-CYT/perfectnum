@@ -10,8 +10,8 @@
 | Target abundancy | σ(N)/N = 2 |
 | Euler condition | enforced (Euler prime exponent ≡ 1 mod 4) |
 | Propagation mode | factor chain (additive valuation constraints) |
-| Admissible Euler exponents | {1, 5, 9, 13, 17, 21, 25, 29, 33, 37} |
-| Admissible non-Euler exponents | {2, 4, 6, …, 40} |
+| Admissible Euler exponents | {1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49} |
+| Admissible non-Euler exponents | {2, 4, 6, …, 50} |
 
 The search traverses all candidate odd integers N = ∏ p_i^{a_i} under the factor-chain constraint: for every assigned σ(p^a), each odd prime factor q of σ(p^a) must either satisfy q ≤ P or the branch is rejected. A branch rejection due to "q exceeded P" means the current parameter bounds are insufficient to explore the branch further; it does not assert that the branch is mathematically impossible. Only rejections due to valuation contradiction or abundancy overshoot are unconditional.
 
